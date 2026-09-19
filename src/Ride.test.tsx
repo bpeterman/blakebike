@@ -150,9 +150,13 @@ describe("Ride charts", () => {
     expect(screen.getByLabelText("Block 3 of 5, upcoming")).toHaveAttribute("data-state", "upcoming");
     expect(screen.getByText("0:20")).toBeInTheDocument();
     expect(screen.getByText("1:20")).toBeInTheDocument();
-    const controls = screen.getByRole("button", { name: "Pause" }).parentElement;
+    const timeline = screen.getByRole("button", { name: "Skip block" }).closest(".workout-timeline");
+    const controls = screen.getByText("TARGET & BIAS").closest(".workout-controls-card");
     const powerChart = screen.getAllByText("FULL SESSION")[0].closest(".live-chart");
+    expect(timeline?.nextElementSibling).toBe(controls);
     expect(controls?.nextElementSibling).toBe(powerChart);
+    expect(screen.queryByRole("button", { name: "Pause" })).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Workout bias")).toBeInTheDocument();
 
     const pausedRunner: RunnerState = {
       ...structuredRunner,
