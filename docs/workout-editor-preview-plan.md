@@ -1,5 +1,15 @@
 # Workout Editor Preview — Plan
 
+## Status
+
+Implemented on branch `worktree-workout-editor-preview` (September 2026) as
+six commits matching the phases below. Two deviations from the original
+draft: the pure model lives in `src/workoutProfileModel.ts` rather than
+`src/workoutProfile.ts`, because a name differing from `WorkoutProfile.tsx`
+only by case resolves to the wrong file on case-insensitive filesystems, and
+the live-ride `WorkoutTimeline` was moved fully onto `WorkoutProfile` instead
+of only sharing geometry, so no second renderer remains.
+
 ## Goal
 
 Show a live picture of the workout while it is being built in the workout
@@ -239,11 +249,11 @@ Move `WorkoutEditor` and `TargetInput` into their own file and export them.
 - Library cards and the ride select list use
   `<WorkoutProfile variant="compact" …/>`. `WorkoutBars` and
   `flattenSteps` are deleted. `.workout-visual` / `tone-N` backgrounds stay.
-- `WorkoutTimeline` keeps its DOM and progress overlay for now, but its
-  inline trapezoid math is replaced by `profileScale` + `profileShapes` so
-  there is no second copy of the geometry. `segmentState` on
-  `WorkoutProfile` exists so the timeline can be migrated onto the component
-  as a later, self-contained change; it is not required for this work.
+- `WorkoutTimeline` renders `WorkoutProfile` inside its existing scroll
+  track, supplying `segmentState` for completed / current / upcoming and the
+  current block's progress. Its heading, countdowns, and skip control are
+  unchanged; its inline `clip-path` trapezoids are gone, so no second copy of
+  the geometry exists anywhere.
 - `WorkoutLibrary.test.tsx` and `Ride.test.tsx` are updated where they
   assert on the old bars.
 
@@ -271,8 +281,8 @@ Each phase is a commit that leaves `pnpm check` and `pnpm test` green. Phases
    Component tests.
 5. `WorkoutEditor.tsx`: extract, stable row ids, type-safe updates, preview,
    linking, stats. Editor tests.
-6. Replace `WorkoutBars` everywhere; refactor `WorkoutTimeline` geometry;
-   delete dead code; update affected tests.
+6. Replace `WorkoutBars` everywhere; render `WorkoutTimeline` through
+   `WorkoutProfile`; delete dead code; update affected tests.
 
 ## Verification
 
@@ -302,9 +312,6 @@ Each phase is a commit that leaves `pnpm check` and `pnpm test` green. Phases
 - **Drag editing in the chart:** shapes are in pixel space with `data-path`,
   so pointer hit-testing maps directly to a step path and
   `replaceStepAtPath`.
-- **Live-ride timeline on the same component:** `segmentState` supplies
-  per-segment class and progress; the timeline's scroll/zoom track and
-  countdowns stay outside the component.
 - **Other target types (cadence, heart rate):** `profileScale` is the only
   place that knows the y-axis is watts. A second axis would add a parallel
   scale, not a new renderer.
@@ -314,8 +321,6 @@ Each phase is a commit that leaves `pnpm check` and `pnpm test` green. Phases
 - Editing repeat groups. The preview renders them correctly; editing is a
   separate feature enabled by this work.
 - Drag-to-resize blocks in the chart.
-- Migrating `WorkoutTimeline` fully onto `WorkoutProfile`. Only its geometry
-  math is shared in this change.
 - Any Rust change. The TypeScript compiler contract and its Rust mirror are
   untouched; only the TypeScript implementation is restructured.
 
