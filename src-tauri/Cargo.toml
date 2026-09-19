@@ -3,6 +3,8 @@ name = "blakebike"
 version = "0.1.0"
 description = "Local-first smart bike trainer"
 authors = ["blake.bike contributors"]
+license = "GPL-3.0-or-later"
+repository = "https://github.com/bpeterman/blakebike"
 edition = "2024"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html

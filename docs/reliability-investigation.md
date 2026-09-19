@@ -1,6 +1,6 @@
 # Ride reliability investigation
 
-Investigated September 19, 2026, against commit `de78cd473fbf39c5e2b1a381f571cf703b83d6c5`.
+Investigated September 19, 2026, against commit `eefe6366d1089ea9d7e965398f6e3ef7f70e9dcc`.
 
 The app has concrete failure paths that can interrupt trainer control or lose ride data while its window and ride timer continue working. Eight undesirable behaviors were reproduced with isolated tests. No spontaneous native-process crash was reproduced, and this investigation does not establish a failure rate during ordinary riding.
 
@@ -46,7 +46,7 @@ The probe stopped simulated notifications without changing connection state and 
 
 **Fix direction:** consume transport disconnect events, monitor connection/telemetry health using monotonic time, and route persistent transport failures through a single reconnect transition. Test an open-but-silent stream, not just EOF. Distinguish legitimate sensor silence from transport loss.
 
-Code: [notification loop](https://github.com/bpeterman/blakebike/blob/de78cd473fbf39c5e2b1a381f571cf703b83d6c5/src-tauri/src/devices/trainer.rs#L461), [reconnect gate](https://github.com/bpeterman/blakebike/blob/de78cd473fbf39c5e2b1a381f571cf703b83d6c5/src-tauri/src/devices/mod.rs#L997), [failure classification](https://github.com/bpeterman/blakebike/blob/de78cd473fbf39c5e2b1a381f571cf703b83d6c5/src-tauri/src/runner.rs#L1246). Dependency evidence: `btleplug-0.13.1/src/corebluetooth/peripheral.rs`, disconnect handler at line 189 and notifications method at line 600.
+Code: [notification loop](https://github.com/bpeterman/blakebike/blob/eefe6366d1089ea9d7e965398f6e3ef7f70e9dcc/src-tauri/src/devices/trainer.rs#L461), [reconnect gate](https://github.com/bpeterman/blakebike/blob/eefe6366d1089ea9d7e965398f6e3ef7f70e9dcc/src-tauri/src/devices/mod.rs#L997), [failure classification](https://github.com/bpeterman/blakebike/blob/eefe6366d1089ea9d7e965398f6e3ef7f70e9dcc/src-tauri/src/runner.rs#L1246). Dependency evidence: `btleplug-0.13.1/src/corebluetooth/peripheral.rs`, disconnect handler at line 189 and notifications method at line 600.
 
 ## R2 — Ride startup is not serialized
 
@@ -58,7 +58,7 @@ The probe issued two starts concurrently with a 100 ms simulated acknowledgement
 
 **Fix direction:** serialize the entire start/stop lifecycle, reserve a Starting state before awaiting, and give each ride its own controls and owned workers. Disable pending Start actions in the UI as an additional guard.
 
-Code: [startup](https://github.com/bpeterman/blakebike/blob/de78cd473fbf39c5e2b1a381f571cf703b83d6c5/src-tauri/src/runner.rs#L386), [worker replacement](https://github.com/bpeterman/blakebike/blob/de78cd473fbf39c5e2b1a381f571cf703b83d6c5/src-tauri/src/runner.rs#L540), [Start controls](https://github.com/bpeterman/blakebike/blob/de78cd473fbf39c5e2b1a381f571cf703b83d6c5/src/App.tsx#L1139).
+Code: [startup](https://github.com/bpeterman/blakebike/blob/eefe6366d1089ea9d7e965398f6e3ef7f70e9dcc/src-tauri/src/runner.rs#L386), [worker replacement](https://github.com/bpeterman/blakebike/blob/eefe6366d1089ea9d7e965398f6e3ef7f70e9dcc/src-tauri/src/runner.rs#L540), [Start controls](https://github.com/bpeterman/blakebike/blob/eefe6366d1089ea9d7e965398f6e3ef7f70e9dcc/src/App.tsx#L1139).
 
 ## R3 — Recording failures are not reflected in ride success
 
@@ -70,7 +70,7 @@ The probe installed a trigger on a disposable SQLite database that rejected all 
 
 **Fix direction:** expose recorder health and persisted progress during the ride; return a meaningful flush result; retain/recover unsaved data where possible; distinguish workout completion from successful data persistence. Count every loss path and show actionable recording warnings without unnecessarily stopping the ride.
 
-Code: [recorder startup](https://github.com/bpeterman/blakebike/blob/de78cd473fbf39c5e2b1a381f571cf703b83d6c5/src-tauri/src/runner.rs#L1283), [flush acknowledgement](https://github.com/bpeterman/blakebike/blob/de78cd473fbf39c5e2b1a381f571cf703b83d6c5/src-tauri/src/runner.rs#L1351), [unconditional Finished state](https://github.com/bpeterman/blakebike/blob/de78cd473fbf39c5e2b1a381f571cf703b83d6c5/src-tauri/src/runner.rs#L515), [saved message](https://github.com/bpeterman/blakebike/blob/de78cd473fbf39c5e2b1a381f571cf703b83d6c5/src/App.tsx#L1168).
+Code: [recorder startup](https://github.com/bpeterman/blakebike/blob/eefe6366d1089ea9d7e965398f6e3ef7f70e9dcc/src-tauri/src/runner.rs#L1283), [flush acknowledgement](https://github.com/bpeterman/blakebike/blob/eefe6366d1089ea9d7e965398f6e3ef7f70e9dcc/src-tauri/src/runner.rs#L1351), [unconditional Finished state](https://github.com/bpeterman/blakebike/blob/eefe6366d1089ea9d7e965398f6e3ef7f70e9dcc/src-tauri/src/runner.rs#L515), [saved message](https://github.com/bpeterman/blakebike/blob/eefe6366d1089ea9d7e965398f6e3ef7f70e9dcc/src/App.tsx#L1168).
 
 ## R4 — Panic handling finalizes data but omits trainer cleanup
 
@@ -82,7 +82,7 @@ A test-only panic point at timeline entry exercised the existing production erro
 
 **Fix direction:** use one cleanup path for normal finish, errors, panic, and cancellation; own and supervise child workers; attempt bounded trainer stop and recorder draining; report the actual recovery outcome.
 
-Code: [normal cleanup and panic supervisor](https://github.com/bpeterman/blakebike/blob/de78cd473fbf39c5e2b1a381f571cf703b83d6c5/src-tauri/src/runner.rs#L488).
+Code: [normal cleanup and panic supervisor](https://github.com/bpeterman/blakebike/blob/eefe6366d1089ea9d7e965398f6e3ef7f70e9dcc/src-tauri/src/runner.rs#L488).
 
 ## R5 — Pause failure is treated as already paused
 
@@ -94,7 +94,7 @@ The probe failed exactly one pause write, then allowed writes to succeed. Twenty
 
 **Fix direction:** separate desired state from acknowledged trainer state, retry failed pause with bounded attempts/backoff, and make unresolved pause status visible. Apply the same acknowledgement discipline to Stop.
 
-Code: [pause command](https://github.com/bpeterman/blakebike/blob/de78cd473fbf39c5e2b1a381f571cf703b83d6c5/src-tauri/src/runner.rs#L1130), [retry timer](https://github.com/bpeterman/blakebike/blob/de78cd473fbf39c5e2b1a381f571cf703b83d6c5/src-tauri/src/runner.rs#L1190).
+Code: [pause command](https://github.com/bpeterman/blakebike/blob/eefe6366d1089ea9d7e965398f6e3ef7f70e9dcc/src-tauri/src/runner.rs#L1130), [retry timer](https://github.com/bpeterman/blakebike/blob/eefe6366d1089ea9d7e965398f6e3ef7f70e9dcc/src-tauri/src/runner.rs#L1190).
 
 ## R6 — Flush timeout excludes a blocking operation
 
@@ -106,7 +106,7 @@ The probe filled a bounded queue and released it after approximately 300 ms. A f
 
 **Fix direction:** avoid blocking enqueue on runtime threads and enforce one deadline over enqueue, database write/drain, and acknowledgement. Make failed/unfinished finalization visible and recoverable.
 
-Code: [flush](https://github.com/bpeterman/blakebike/blob/de78cd473fbf39c5e2b1a381f571cf703b83d6c5/src-tauri/src/runner.rs#L1319).
+Code: [flush](https://github.com/bpeterman/blakebike/blob/eefe6366d1089ea9d7e965398f6e3ef7f70e9dcc/src-tauri/src/runner.rs#L1319).
 
 ## R7 — Wall-clock corrections stop fused telemetry
 
@@ -118,7 +118,7 @@ The probe moved the fuser's supplied time back by 60 seconds and delivered readi
 
 **Fix direction:** use monotonic time for throttling, freshness, and watchdogs. Preserve wall time for exported timestamps and explicitly handle discontinuities.
 
-Code: [emission throttle](https://github.com/bpeterman/blakebike/blob/de78cd473fbf39c5e2b1a381f571cf703b83d6c5/src-tauri/src/devices/fuser.rs#L224).
+Code: [emission throttle](https://github.com/bpeterman/blakebike/blob/eefe6366d1089ea9d7e965398f6e3ef7f70e9dcc/src-tauri/src/devices/fuser.rs#L224).
 
 ## R8 — Recording does not respect the paused ride state
 
@@ -130,7 +130,7 @@ The probe waited for Paused, then allowed 1.6 seconds of simulated telemetry. Th
 
 **Fix direction:** either exclude paused samples from active recording or persist explicit ride-phase events and make every statistics/export/recovery path honor them.
 
-Code: [sample handling](https://github.com/bpeterman/blakebike/blob/de78cd473fbf39c5e2b1a381f571cf703b83d6c5/src-tauri/src/runner.rs#L901), [recovery](https://github.com/bpeterman/blakebike/blob/de78cd473fbf39c5e2b1a381f571cf703b83d6c5/src-tauri/src/storage.rs#L815).
+Code: [sample handling](https://github.com/bpeterman/blakebike/blob/eefe6366d1089ea9d7e965398f6e3ef7f70e9dcc/src-tauri/src/runner.rs#L901), [recovery](https://github.com/bpeterman/blakebike/blob/eefe6366d1089ea9d7e965398f6e3ef7f70e9dcc/src-tauri/src/storage.rs#L815).
 
 ## Verification completed
 

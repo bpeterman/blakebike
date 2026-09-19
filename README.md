@@ -163,3 +163,16 @@ both target operating-system families.
 
 See [docs/releasing.md](docs/releasing.md) for the versioning scheme, how release
 notes are written, and how tagging publishes the dmg.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for how to run the checks and for the
+contributor licensing terms.
+
+## License
+
+blakebike is free software, licensed under the
+[GNU General Public License v3.0 or later](LICENSE). You may use, study, share,
+and modify it; distributed derivative works must remain under the same license.
+
+Copyright (C) 2026 Blake Peterman.
