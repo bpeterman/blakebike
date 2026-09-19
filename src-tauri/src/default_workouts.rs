@@ -262,7 +262,7 @@ mod tests {
         let mut workouts = default_workouts(Utc::now());
         assert_eq!(workouts[0].name, "FTP Test (20 min)");
         let expected: Vec<String> = workouts.iter().map(|it| it.name.clone()).collect();
-        workouts.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        workouts.sort_by_key(|it| std::cmp::Reverse(it.updated_at));
         let sorted: Vec<String> = workouts.iter().map(|it| it.name.clone()).collect();
         assert_eq!(sorted, expected);
     }
