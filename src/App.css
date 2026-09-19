@@ -556,10 +556,11 @@ textarea { min-height: 70px; resize: vertical; }
 .release-section li { color: #b9c2b3; font-size: 13px; }
 
 /* Workout profile: the one drawing of a workout (editor preview, cards, ride picker) */
-.workout-profile { display: block; width: 100%; height: var(--profile-height, 150px); margin: 0; }
+.workout-profile { display: block; width: 100%; min-width: 0; height: var(--profile-height, 150px); margin: 0; }
 .workout-profile[data-variant="compact"] { height: 100%; }
 .workout-profile-canvas { position: relative; width: 100%; height: 100%; }
-.workout-profile svg { display: block; overflow: visible; }
+/* Out of flow so the measured pixel width can never feed back into the container size. */
+.workout-profile svg { position: absolute; inset: 0; display: block; overflow: visible; }
 .workout-profile-block { opacity: .88; transition: opacity .12s ease; }
 .workout-profile[data-interactive="true"] .workout-profile-block { cursor: pointer; }
 .workout-profile-block[data-dimmed="true"] { opacity: .35; }
