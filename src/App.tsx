@@ -260,9 +260,20 @@ function App() {
         void api.sessions().then(setSessions);
       }
       if (shouldPromptForPostRide(previousState, state)) {
-        setPostRidePrompt({
-          sessionId: state.sessionId,
-          errorMessage: state.status === "error" ? state.message : null,
+        const sessionId = state.sessionId;
+        const errorMessage = state.status === "error" ? state.message : null;
+        setPostRidePrompt(null);
+        void api.session(sessionId).then((session) => {
+          if (!session) {
+            setPostRidePrompt({ sessionId, errorMessage });
+            return;
+          }
+          setSelectedSession(session);
+          setPage("history");
+        }).catch(() => {
+          // If the saved ride cannot be loaded immediately, retain the
+          // existing recovery prompt so the rider can try again.
+          setPostRidePrompt({ sessionId, errorMessage });
         });
       }
     }));
@@ -1131,8 +1142,8 @@ export function Ride({
                       : `Plan ${plannedTarget} W`}
             </span>
             {overrideActive && (
-              <button type="button" className="text-button" disabled={runner.status !== "running"} onClick={() => void backToPlan()}>
-                Back to plan
+              <button type="button" className="secondary override-reset" disabled={runner.status !== "running"} onClick={() => void backToPlan()}>
+                Reset override{plannedTarget !== null ? ` · ${plannedTarget} W` : ""}
               </button>
             )}
             <div className="bias-stepper" aria-label="Workout bias">
@@ -1536,10 +1547,10 @@ export function SettingsPage({
       <PageHeader eyebrow="LOCAL PROFILE" title="Settings" />
       <section className="card settings-card"><div><span className="label">RIDER PROFILE</span><h2>Training and distance</h2><p>Your weight and bike weight support flat-road distance estimates when the trainer does not report speed. Values are stored in kilograms regardless of display units.</p></div><form onSubmit={(event) => { event.preventDefault(); onSave(draft); }}>
         <label>Rider name<input value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })}/></label>
-        <div className="form-row"><label>FTP (watts)<input type="number" min="50" max="500" value={draft.ftpWatts} onChange={(event) => setDraft({ ...draft, ftpWatts: Number(event.target.value) })}/></label><label>Maximum heart rate (bpm)<input type="number" min="100" max="230" value={draft.maxHeartRateBpm} onChange={(event) => setDraft({ ...draft, maxHeartRateBpm: Number(event.target.value) })}/></label></div>
-        <label>Safety power limit<input type="number" min="100" max="2500" value={draft.maxPowerWatts} onChange={(event) => setDraft({ ...draft, maxPowerWatts: Number(event.target.value) })}/></label>
+        <div className="form-row"><label>FTP (watts)<EditableNumberInput min={50} max={500} value={draft.ftpWatts} onValueChange={(ftpWatts) => setDraft({ ...draft, ftpWatts })}/></label><label>Maximum heart rate (bpm)<EditableNumberInput min={100} max={230} value={draft.maxHeartRateBpm} onValueChange={(maxHeartRateBpm) => setDraft({ ...draft, maxHeartRateBpm })}/></label></div>
+        <label>Safety power limit<EditableNumberInput min={100} max={2500} value={draft.maxPowerWatts} onValueChange={(maxPowerWatts) => setDraft({ ...draft, maxPowerWatts })}/></label>
         <div className="form-row"><label>Weight unit<select value={draft.weightUnit} onChange={(event) => setDraft({ ...draft, weightUnit: event.target.value as Profile["weightUnit"] })}><option value="kg">Kilograms (kg)</option><option value="lb">Pounds (lb)</option></select></label><label>Distance unit<select value={draft.distanceUnit} onChange={(event) => setDraft({ ...draft, distanceUnit: event.target.value as Profile["distanceUnit"] })}><option value="km">Kilometers</option><option value="mi">Miles</option></select></label></div>
-        <div className="form-row"><label>Rider weight ({draft.weightUnit})<input type="number" step="0.1" min={draft.weightUnit === "lb" ? 66 : 30} max={draft.weightUnit === "lb" ? 551 : 250} value={displayedWeight(draft.riderWeightKg, draft.weightUnit)} onChange={(event) => setDraft({ ...draft, riderWeightKg: storedWeight(Number(event.target.value), draft.weightUnit) })}/></label><label>Bike weight ({draft.weightUnit})<input type="number" step="0.1" min={draft.weightUnit === "lb" ? 7 : 3} max={draft.weightUnit === "lb" ? 88 : 40} value={displayedWeight(draft.bikeWeightKg, draft.weightUnit)} onChange={(event) => setDraft({ ...draft, bikeWeightKg: storedWeight(Number(event.target.value), draft.weightUnit) })}/></label></div>
+        <div className="form-row"><label>Rider weight ({draft.weightUnit})<EditableNumberInput step={0.1} min={draft.weightUnit === "lb" ? 66 : 30} max={draft.weightUnit === "lb" ? 551 : 250} value={displayedWeight(draft.riderWeightKg, draft.weightUnit)} onValueChange={(value) => setDraft({ ...draft, riderWeightKg: storedWeight(value, draft.weightUnit) })}/></label><label>Bike weight ({draft.weightUnit})<EditableNumberInput step={0.1} min={draft.weightUnit === "lb" ? 7 : 3} max={draft.weightUnit === "lb" ? 88 : 40} value={displayedWeight(draft.bikeWeightKg, draft.weightUnit)} onValueChange={(value) => setDraft({ ...draft, bikeWeightKg: storedWeight(value, draft.weightUnit) })}/></label></div>
         <button className="primary" type="submit">Save settings</button>
       </form></section>
       <section className="card settings-card">
@@ -1872,13 +1883,12 @@ function ZoneEditor({
             ) : (
               <label>
                 up to
-                <input
+                <EditableNumberInput
                   aria-label={`${title} zone ${index + 1} upper bound`}
-                  type="number"
                   min={unit === "W" ? 1 : 30}
                   max={unit === "W" ? 3000 : 250}
                   value={zone.upperBound}
-                  onChange={(event) => update(index, { upperBound: Number(event.target.value) })}
+                  onValueChange={(upperBound) => update(index, { upperBound })}
                 />
                 {unit}
               </label>
@@ -1899,14 +1909,74 @@ function WorkoutEditor({ initial, close, save }: { initial: Workout; close: () =
     setWorkout({ ...workout, steps: [...workout.steps, step] });
   };
   return <div className="modal-backdrop dialog-enter" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) close(); }}><div ref={dialogRef} className="modal editor-modal" role="dialog" aria-modal="true" aria-labelledby="workout-builder-heading" tabIndex={-1}><button className="modal-close" onClick={close} aria-label="Close workout builder"><X /></button><span className="label">WORKOUT BUILDER</span><h2 id="workout-builder-heading" className="sr-only">Workout builder</h2><div className="editor-title"><label className="sr-only" htmlFor="workout-builder-title">Workout name</label><input id="workout-builder-title" aria-label="Workout name" value={workout.name} onChange={(event) => setWorkout({ ...workout, name: event.target.value })}/><strong>{formatDuration(workoutDuration(workout.steps))}</strong></div><textarea aria-label="Workout description" placeholder="Workout description" value={workout.description} onChange={(event) => setWorkout({ ...workout, description: event.target.value })}/>
-    <div className="step-list">{workout.steps.map((step, index) => <div className="step-editor" key={`${index}-${step.kind}`}><span className={`step-kind ${step.kind}`}>{step.kind === "freeRide" ? "FREE" : step.kind.toUpperCase()}</span><label>Duration (sec)<input type="number" min="1" value={step.kind === "repeat" ? workoutDuration(step.steps) : step.durationSeconds} disabled={step.kind === "repeat"} onChange={(event) => updateStep(index, { durationSeconds: Number(event.target.value) } as Partial<WorkoutStep>)}/></label>{step.kind === "steady" && <TargetInput label="Power (% FTP)" target={step.target} onChange={(target) => updateStep(index, { target })}/>} {step.kind === "ramp" && <><TargetInput label="Start (% FTP)" target={step.start} onChange={(start) => updateStep(index, { start })}/><TargetInput label="End (% FTP)" target={step.end} onChange={(end) => updateStep(index, { end })}/></>} {step.kind === "repeat" && <span className="repeat-summary">{step.repetitions}× repeat group</span>}<button className="icon-button danger" aria-label={`Remove block ${index + 1}`} onClick={() => setWorkout({ ...workout, steps: workout.steps.filter((_, stepIndex) => stepIndex !== index) })}><Trash2 size={16}/></button></div>)}</div>
+    <div className="step-list">{workout.steps.map((step, index) => <div className="step-editor" key={`${index}-${step.kind}`}><span className={`step-kind ${step.kind}`}>{step.kind === "freeRide" ? "FREE" : step.kind.toUpperCase()}</span><label>Duration (sec)<EditableNumberInput min={1} value={step.kind === "repeat" ? workoutDuration(step.steps) : step.durationSeconds} disabled={step.kind === "repeat"} onValueChange={(durationSeconds) => updateStep(index, { durationSeconds } as Partial<WorkoutStep>)}/></label>{step.kind === "steady" && <TargetInput label="Power (% FTP)" target={step.target} onChange={(target) => updateStep(index, { target })}/>} {step.kind === "ramp" && <><TargetInput label="Start (% FTP)" target={step.start} onChange={(start) => updateStep(index, { start })}/><TargetInput label="End (% FTP)" target={step.end} onChange={(end) => updateStep(index, { end })}/></>} {step.kind === "repeat" && <span className="repeat-summary">{step.repetitions}× repeat group</span>}<button className="icon-button danger" aria-label={`Remove block ${index + 1}`} onClick={() => setWorkout({ ...workout, steps: workout.steps.filter((_, stepIndex) => stepIndex !== index) })}><Trash2 size={16}/></button></div>)}</div>
     <div className="add-steps"><span>Add block</span><button onClick={() => addStep("steady")}><Plus/>Steady</button><button onClick={() => addStep("ramp")}><Plus/>Ramp</button><button onClick={() => addStep("freeRide")}><Plus/>Free ride</button></div>
     <div className="editor-actions"><button className="secondary" onClick={close}>Cancel</button><button className="primary" disabled={!workout.name.trim() || workout.steps.length === 0} onClick={() => save(workout)}>Save workout</button></div>
   </div></div>;
 }
 
 function TargetInput({ label, target, onChange }: { label: string; target: { unit: "watts" | "percentFtp"; value: number }; onChange: (target: { unit: "watts" | "percentFtp"; value: number }) => void }) {
-  return <label>{label}<input type="number" min="1" max="300" value={target.unit === "percentFtp" ? target.value : target.value} onChange={(event) => onChange({ unit: "percentFtp", value: Number(event.target.value) })}/></label>;
+  return <label>{label}<EditableNumberInput min={1} max={300} value={target.value} onValueChange={(value) => onChange({ unit: "percentFtp", value })}/></label>;
+}
+
+export function EditableNumberInput({
+  value,
+  onValueChange,
+  min,
+  max,
+  step,
+  disabled,
+  "aria-label": ariaLabel,
+}: {
+  value: number;
+  onValueChange: (value: number) => void;
+  min?: number;
+  max?: number;
+  step?: number;
+  disabled?: boolean;
+  "aria-label"?: string;
+}) {
+  const [text, setText] = useState(String(value));
+  const focused = useRef(false);
+
+  useEffect(() => {
+    if (!focused.current) setText(String(value));
+  }, [value]);
+
+  const commit = () => {
+    focused.current = false;
+    const parsed = Number(text);
+    if (text.trim() === "" || !Number.isFinite(parsed)) {
+      setText(String(value));
+      return;
+    }
+    onValueChange(parsed);
+    setText(String(parsed));
+  };
+
+  return (
+    <input
+      type="number"
+      min={min}
+      max={max}
+      step={step}
+      disabled={disabled}
+      aria-label={ariaLabel}
+      value={text}
+      onFocus={() => { focused.current = true; }}
+      onChange={(event) => {
+        const next = event.target.value;
+        setText(next);
+        if (next.trim() === "") return;
+        const parsed = Number(next);
+        if (Number.isFinite(parsed)) onValueChange(parsed);
+      }}
+      onBlur={commit}
+      onKeyDown={(event) => {
+        if (event.key === "Enter") event.currentTarget.blur();
+      }}
+    />
+  );
 }
 
 function WorkoutTimeline({

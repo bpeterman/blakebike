@@ -175,6 +175,9 @@ describe("Ride charts", () => {
     rerender(<Ride {...commonProps} runner={pausedRunner} />);
     expect(screen.getByText("200 W · Paused")).toBeInTheDocument();
     expect(screen.getByText("0:20")).toBeInTheDocument();
+
+    rerender(<Ride {...commonProps} runner={{ ...structuredRunner, overrideActive: true, targetPowerWatts: 225 }} />);
+    expect(screen.getByRole("button", { name: "Reset override · 200 W" })).toBeInTheDocument();
   });
 
   it("hides cards and renders visible cards in the saved order", () => {
