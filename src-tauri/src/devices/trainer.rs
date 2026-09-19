@@ -4,7 +4,7 @@
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicU16, Ordering},
+        atomic::{AtomicBool, AtomicU16, Ordering},
     },
     time::Duration,
 };
@@ -15,6 +15,7 @@ use btleplug::{
 };
 use chrono::Utc;
 use futures::StreamExt;
+use serde::Serialize;
 use tokio::sync::{Mutex, RwLock, broadcast};
 
 use super::{
@@ -26,12 +27,23 @@ use crate::{
     domain::Telemetry,
     ftms::{
         FITNESS_MACHINE_CONTROL_POINT, FITNESS_MACHINE_FEATURE, FITNESS_MACHINE_STATUS,
-        INDOOR_BIKE_DATA, SUPPORTED_POWER_RANGE, parse_control_response, parse_indoor_bike_data,
-        request_control, set_target_power, start_or_resume, stop_or_pause,
+        INDOOR_BIKE_DATA, SUPPORTED_POWER_RANGE, SpinDownStatus, parse_control_response,
+        parse_indoor_bike_data, parse_spin_down_response, parse_spin_down_status, request_control,
+        set_target_power, start_or_resume, start_spin_down, stop_or_pause, supports_spin_down,
     },
 };
 
 pub const SIMULATED_TRAINER_ID: &str = "simulated-trainer";
+const CALIBRATION_TIMEOUT: Duration = Duration::from_secs(120);
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CalibrationProgress {
+    pub phase: &'static str,
+    pub target_low_kph: Option<f32>,
+    pub target_high_kph: Option<f32>,
+    pub message: Option<String>,
+}
 
 /// Simulated devices offered at the top of every scan.
 pub fn simulated_devices() -> Vec<DeviceInfo> {
@@ -55,11 +67,17 @@ pub struct Trainer {
     max_power: AtomicU16,
     command_lock: Mutex<()>,
     control_responses: broadcast::Sender<Vec<u8>>,
+    status_responses: broadcast::Sender<Vec<u8>>,
+    calibration_cancel: broadcast::Sender<()>,
+    calibration_supported: AtomicBool,
+    calibrating: AtomicBool,
 }
 
 impl Trainer {
     pub fn new(slot: Arc<DeviceSlot>, ble: Arc<Ble>, fuser: Arc<TelemetryFuser>) -> Self {
         let (control_responses, _) = broadcast::channel(16);
+        let (status_responses, _) = broadcast::channel(16);
+        let (calibration_cancel, _) = broadcast::channel(4);
         Self {
             slot,
             ble,
@@ -71,6 +89,10 @@ impl Trainer {
             max_power: AtomicU16::new(2_000),
             command_lock: Mutex::new(()),
             control_responses,
+            status_responses,
+            calibration_cancel,
+            calibration_supported: AtomicBool::new(false),
+            calibrating: AtomicBool::new(false),
         }
     }
 
@@ -117,12 +139,16 @@ impl Trainer {
 
     async fn connect_inner(&self, device: DeviceInfo) -> Result<(), String> {
         self.disconnect().await;
+        self.calibration_supported.store(false, Ordering::Relaxed);
+        self.slot.set_calibration(Some(false), Some(false)).await;
         self.slot
             .set_state(DeviceState::Connecting {
                 name: device.name.clone(),
             })
             .await;
         if device.simulated {
+            self.calibration_supported.store(true, Ordering::Relaxed);
+            self.slot.set_calibration(Some(true), None).await;
             self.slot
                 .progress("info", "Spinning up virtual flywheel", None);
             tokio::time::sleep(Duration::from_millis(350)).await;
@@ -209,8 +235,23 @@ impl Trainer {
                 .await
                 .map_err(|error| format!("Could not read trainer capabilities: {error}"))?;
             tracing::debug!(features = ?data, "Fitness Machine Feature read");
-            self.slot
-                .progress("ok", "Read machine features", Some(hex(&data)));
+            let spin_down = supports_spin_down(&data).unwrap_or(false);
+            self.calibration_supported
+                .store(spin_down, Ordering::Relaxed);
+            self.slot.set_calibration(Some(spin_down), None).await;
+            self.slot.progress(
+                "ok",
+                "Read machine features",
+                Some(format!(
+                    "{} · spin-down {}",
+                    hex(&data),
+                    if spin_down {
+                        "supported"
+                    } else {
+                        "unavailable"
+                    }
+                )),
+            );
         } else {
             tracing::debug!("Trainer does not expose Fitness Machine Feature");
             self.slot
@@ -295,6 +336,7 @@ impl Trainer {
         let slot = self.slot.clone();
         let fuser = self.fuser.clone();
         let control_tx = self.control_responses.clone();
+        let status_tx = self.status_responses.clone();
         let reconnect_name = device.name.clone();
         let worker = tokio::spawn(async move {
             let mut notifications = match peripheral.notifications().await {
@@ -372,6 +414,7 @@ impl Trainer {
                     let _ = control_tx.send(notification.value);
                 } else if notification.uuid == bluetooth_uuid(FITNESS_MACHINE_STATUS) {
                     tracing::debug!(raw = ?notification.value, "Fitness Machine Status");
+                    let _ = status_tx.send(notification.value);
                 } else {
                     tracing::trace!(uuid = %notification.uuid, raw = ?notification.value, "Other notification");
                 }
@@ -458,7 +501,137 @@ impl Trainer {
         self.slot.set_worker(worker).await;
     }
 
+    fn emit_calibration(
+        &self,
+        phase: &'static str,
+        target: Option<(f32, f32)>,
+        message: Option<String>,
+    ) {
+        self.slot.emit(
+            "trainer://calibration",
+            CalibrationProgress {
+                phase,
+                target_low_kph: target.map(|value| value.0),
+                target_high_kph: target.map(|value| value.1),
+                message,
+            },
+        );
+    }
+
+    pub async fn calibrate(&self) -> Result<(), String> {
+        let device = match self.slot.state().await {
+            DeviceState::Ready { device } => device,
+            DeviceState::Controlling { .. } => {
+                return Err("Trainer calibration is unavailable during a workout".into());
+            }
+            _ => return Err("Connect a trainer before calibrating".into()),
+        };
+        if !self.calibration_supported.load(Ordering::Relaxed) {
+            return Err("This trainer does not advertise FTMS spin-down calibration".into());
+        }
+        if self
+            .calibrating
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
+            .is_err()
+        {
+            return Err("Trainer calibration is already running".into());
+        }
+
+        self.slot.set_calibration(None, Some(true)).await;
+        self.slot.note("info", "Calibration started", None);
+        self.emit_calibration(
+            "preparing",
+            None,
+            Some("Keep pedaling while the trainer prepares.".into()),
+        );
+
+        let result = self.calibrate_inner(device.simulated).await;
+        self.calibrating.store(false, Ordering::SeqCst);
+        self.slot.set_calibration(None, Some(false)).await;
+        match &result {
+            Ok(()) => {
+                self.slot.note("ok", "Calibration complete", None);
+                self.emit_calibration(
+                    "success",
+                    None,
+                    Some("Trainer calibration completed successfully.".into()),
+                );
+            }
+            Err(error) => {
+                self.slot
+                    .note("error", "Calibration failed", Some(error.clone()));
+                self.emit_calibration("error", None, Some(error.clone()));
+            }
+        }
+        result
+    }
+
+    async fn calibrate_inner(&self, simulated: bool) -> Result<(), String> {
+        let _guard = self.command_lock.lock().await;
+        if simulated {
+            self.emit_calibration(
+                "accelerate",
+                Some((30.0, 35.0)),
+                Some("Pedal into the target speed range.".into()),
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            self.emit_calibration(
+                "stopPedaling",
+                Some((30.0, 35.0)),
+                Some("Stop pedaling and let the flywheel coast down.".into()),
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            return Ok(());
+        }
+
+        let mut statuses = self.status_responses.subscribe();
+        let mut cancelled = self.calibration_cancel.subscribe();
+        let response = self.write_control_locked(&start_spin_down()).await?;
+        let target = parse_spin_down_response(&response).map_err(|error| error.to_string())?;
+        let target_range = (target.low_kph, target.high_kph);
+        self.emit_calibration(
+            "accelerate",
+            Some(target_range),
+            Some(format!(
+                "Pedal between {:.1} and {:.1} km/h.",
+                target.low_kph, target.high_kph
+            )),
+        );
+
+        tokio::time::timeout(CALIBRATION_TIMEOUT, async {
+            loop {
+                tokio::select! {
+                    _ = cancelled.recv() => {
+                        return Err("Trainer calibration was cancelled by disconnect".to_string());
+                    }
+                    received = statuses.recv() => {
+                        let packet = received.map_err(|error| format!("Lost calibration status: {error}"))?;
+                        match parse_spin_down_status(&packet).map_err(|error| error.to_string())? {
+                            None | Some(SpinDownStatus::Requested) | Some(SpinDownStatus::Unknown(_)) => {}
+                            Some(SpinDownStatus::StopPedaling) => {
+                                self.emit_calibration(
+                                    "stopPedaling",
+                                    Some(target_range),
+                                    Some("Stop pedaling and let the flywheel coast down.".into()),
+                                );
+                            }
+                            Some(SpinDownStatus::Success) => return Ok(()),
+                            Some(SpinDownStatus::Error) => {
+                                return Err("Trainer reported a spin-down calibration error".into());
+                            }
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(|_| "Trainer calibration timed out after 2 minutes".to_string())?
+    }
+
     pub async fn begin_control(&self) -> Result<(), String> {
+        if self.calibrating.load(Ordering::Relaxed) {
+            return Err("Wait for trainer calibration to finish".into());
+        }
         let device = match self.slot.state().await {
             DeviceState::Ready { device } | DeviceState::Controlling { device } => device,
             other => {
@@ -475,6 +648,9 @@ impl Trainer {
     }
 
     pub async fn set_target_power(&self, requested: u16, rider_max: u16) -> Result<u16, String> {
+        if self.calibrating.load(Ordering::Relaxed) {
+            return Err("Cannot change ERG power during trainer calibration".into());
+        }
         let clamped = requested.clamp(
             self.min_power.load(Ordering::Relaxed),
             self.max_power.load(Ordering::Relaxed).min(rider_max),
@@ -500,6 +676,25 @@ impl Trainer {
 
     async fn write_control(&self, payload: &[u8]) -> Result<(), String> {
         let _guard = self.command_lock.lock().await;
+        let response = self.write_control_locked(payload).await?;
+        let expected_opcode = payload[0];
+        parse_control_response(&response, expected_opcode).map_err(|error| {
+            tracing::error!(
+                opcode = format_args!("0x{expected_opcode:02x}"),
+                error = %error,
+                "Trainer refused control command"
+            );
+            self.slot.note(
+                "error",
+                "Trainer refused control command",
+                Some(format!("op 0x{expected_opcode:02x} · {error}")),
+            );
+            error.to_string()
+        })
+    }
+
+    /// Write one FTMS command while the caller holds `command_lock`.
+    async fn write_control_locked(&self, payload: &[u8]) -> Result<Vec<u8>, String> {
         let peripheral = self.peripheral.read().await.clone();
         let control = self.control_point.read().await.clone();
         if let (Some(peripheral), Some(control)) = (peripheral, control) {
@@ -532,8 +727,7 @@ impl Trainer {
                         .await
                         .map_err(|error| format!("Lost trainer response: {error}"))?;
                     if response.get(1) == Some(&expected_opcode) {
-                        return parse_control_response(&response, expected_opcode)
-                            .map_err(|error| error.to_string());
+                        return Ok(response);
                     }
                     tracing::trace!(raw = ?response, "Ignoring response for another opcode");
                 }
@@ -552,31 +746,29 @@ impl Trainer {
                 "Trainer control command timed out".to_string()
             })?;
             match &acknowledgement {
-                Ok(()) => tracing::debug!(
+                Ok(_) => tracing::debug!(
                     opcode = format_args!("0x{expected_opcode:02x}"),
                     elapsed_ms = started.elapsed().as_millis() as u64,
                     "Control command acknowledged"
                 ),
-                Err(error) => {
-                    tracing::error!(
-                        opcode = format_args!("0x{expected_opcode:02x}"),
-                        error = %error,
-                        "Trainer refused control command"
-                    );
-                    self.slot.note(
-                        "error",
-                        "Trainer refused control command",
-                        Some(format!("op 0x{expected_opcode:02x} · {error}")),
-                    );
-                }
+                Err(error) => tracing::error!(
+                    opcode = format_args!("0x{expected_opcode:02x}"),
+                    error = %error,
+                    "Trainer control response failed"
+                ),
             }
-            acknowledgement?;
+            return acknowledgement;
         }
         // Simulated trainers need no GATT write.
-        Ok(())
+        Ok(vec![
+            0x80,
+            payload.first().copied().unwrap_or_default(),
+            0x01,
+        ])
     }
 
     pub async fn disconnect(&self) {
+        let _ = self.calibration_cancel.send(());
         let had_peripheral = self.peripheral.read().await.is_some();
         if had_peripheral {
             tracing::info!("Disconnecting trainer");
@@ -594,6 +786,9 @@ impl Trainer {
             }
         }
         *self.control_point.write().await = None;
+        self.calibration_supported.store(false, Ordering::Relaxed);
+        self.calibrating.store(false, Ordering::Relaxed);
+        self.slot.set_calibration(Some(false), Some(false)).await;
         self.fuser.forget(DeviceRole::Trainer);
         let was_connected = self.slot.state().await.is_connected();
         if had_peripheral || was_connected {
@@ -675,5 +870,55 @@ mod tests {
                 .any(|line| line.step == "Simulated FTMS service online")
         );
         assert!(log.iter().any(|line| line.step == "Disconnected"));
+    }
+
+    #[tokio::test]
+    async fn simulator_calibrates_and_clears_progress_state() {
+        let hub = super::super::DeviceHub::default();
+        hub.connect(DeviceRole::Trainer, simulated_devices().remove(0))
+            .await
+            .unwrap();
+        hub.calibrate_trainer().await.unwrap();
+        let stats = hub.slot(DeviceRole::Trainer).stats();
+        assert!(stats.calibration_supported);
+        assert!(!stats.calibrating);
+        assert!(
+            hub.slot(DeviceRole::Trainer)
+                .log_lines()
+                .iter()
+                .any(|line| line.step == "Calibration complete")
+        );
+    }
+
+    #[tokio::test]
+    async fn calibration_is_blocked_during_erg_control() {
+        let hub = super::super::DeviceHub::default();
+        hub.connect(DeviceRole::Trainer, simulated_devices().remove(0))
+            .await
+            .unwrap();
+        hub.begin_control().await.unwrap();
+        assert_eq!(
+            hub.calibrate_trainer().await.unwrap_err(),
+            "Trainer calibration is unavailable during a workout"
+        );
+    }
+
+    #[tokio::test]
+    async fn calibration_rejects_disconnected_and_unsupported_trainers() {
+        let hub = super::super::DeviceHub::default();
+        assert_eq!(
+            hub.calibrate_trainer().await.unwrap_err(),
+            "Connect a trainer before calibrating"
+        );
+        hub.connect(DeviceRole::Trainer, simulated_devices().remove(0))
+            .await
+            .unwrap();
+        hub.trainer
+            .calibration_supported
+            .store(false, Ordering::Relaxed);
+        assert_eq!(
+            hub.calibrate_trainer().await.unwrap_err(),
+            "This trainer does not advertise FTMS spin-down calibration"
+        );
     }
 }

@@ -132,6 +132,10 @@ pub struct SlotStats {
     pub last_raw_hex: Option<String>,
     /// Human summary of the latest decoded reading, e.g. "215 W · 88 rpm".
     pub last_reading: Option<String>,
+    /// Whether this trainer advertises the FTMS Spin Down Control feature.
+    pub calibration_supported: bool,
+    /// Whether a trainer spin-down procedure is currently running.
+    pub calibrating: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -346,6 +350,22 @@ impl DeviceSlot {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.stats.last_reading = Some(summary);
+    }
+
+    pub async fn set_calibration(&self, supported: Option<bool>, calibrating: Option<bool>) {
+        {
+            let mut inner = self
+                .stats
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(supported) = supported {
+                inner.stats.calibration_supported = supported;
+            }
+            if let Some(calibrating) = calibrating {
+                inner.stats.calibrating = calibrating;
+            }
+        }
+        self.emit("devices://slot", self.snapshot().await);
     }
 
     pub fn record_parse_failure(&self, raw: &[u8]) -> u64 {
@@ -730,6 +750,10 @@ impl DeviceHub {
     }
 
     // Trainer control, used by the workout runner.
+
+    pub async fn calibrate_trainer(&self) -> Result<(), String> {
+        self.trainer.calibrate().await
+    }
 
     pub async fn begin_control(&self) -> Result<(), String> {
         self.trainer.begin_control().await

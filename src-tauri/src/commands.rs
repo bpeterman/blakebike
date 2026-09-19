@@ -128,6 +128,12 @@ pub async fn disconnect_device(state: State<'_, AppState>, role: DeviceRole) -> 
 }
 
 #[tauri::command]
+pub async fn calibrate_trainer(state: State<'_, AppState>) -> Result<(), String> {
+    tracing::info!("command calibrate_trainer");
+    state.devices.calibrate_trainer().await
+}
+
+#[tauri::command]
 pub fn get_source_preferences(state: State<'_, AppState>) -> Result<SourcePreferences, String> {
     Ok(state.devices.source_preferences())
 }

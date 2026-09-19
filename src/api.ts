@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import type {
+  CalibrationProgress,
   ConnectProgress,
   DeviceInfo,
   DeviceLogLine,
@@ -46,6 +47,7 @@ export const api = {
     invoke<void>("connect_device", { role, device }),
   disconnectDevice: (role: DeviceRole) =>
     invoke<void>("disconnect_device", { role }),
+  calibrateTrainer: () => invoke<void>("calibrate_trainer"),
   deviceLog: (role: DeviceRole) => invoke<DeviceLogLine[]>("device_log", { role }),
   knownDevices: () => invoke<KnownDevice[]>("known_devices"),
   forgetDevice: (id: string) => invoke<void>("forget_device", { id }),
@@ -159,6 +161,8 @@ export const api = {
     listen<Telemetry>("trainer://telemetry", ({ payload }) => handler(payload)),
   onConnectProgress: (handler: (progress: ConnectProgress) => void): Promise<UnlistenFn> =>
     listen<ConnectProgress>("trainer://connect-progress", ({ payload }) => handler(payload)),
+  onCalibrationProgress: (handler: (progress: CalibrationProgress) => void): Promise<UnlistenFn> =>
+    listen<CalibrationProgress>("trainer://calibration", ({ payload }) => handler(payload)),
   onDeviceSlot: (handler: (slot: DeviceSlot) => void): Promise<UnlistenFn> =>
     listen<DeviceSlot>("devices://slot", ({ payload }) => handler(payload)),
   onDeviceLog: (handler: (event: { role: DeviceRole; line: DeviceLogLine }) => void): Promise<UnlistenFn> =>
