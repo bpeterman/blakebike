@@ -39,20 +39,23 @@ const MESG_STARTUP: u8 = 0x6F;
 
 type OpenPort = (io::PortInfo, Box<dyn SerialPort>);
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(tag = "status", rename_all = "camelCase")]
 pub enum AdapterStatus {
+    #[default]
     NotAttached,
-    Ready { name: String },
-    PermissionDenied { message: String },
-    Busy { message: String },
-    Error { message: String },
-}
-
-impl Default for AdapterStatus {
-    fn default() -> Self {
-        Self::NotAttached
-    }
+    Ready {
+        name: String,
+    },
+    PermissionDenied {
+        message: String,
+    },
+    Busy {
+        message: String,
+    },
+    Error {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
