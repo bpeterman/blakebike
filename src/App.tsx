@@ -101,6 +101,7 @@ type Page = "home" | "workouts" | "devices" | "ride" | "history" | "settings";
 type PostRidePromptState = {
   sessionId: string;
   errorMessage: string | null;
+  saveWarning: string | null;
 };
 
 const LOG_LINES_KEPT = 200;
@@ -254,6 +255,7 @@ function App() {
         setPostRidePrompt({
           sessionId: state.sessionId,
           errorMessage: state.status === "error" ? state.message : null,
+          saveWarning: state.status === "finished" ? state.saveWarning ?? null : null,
         });
       }
     }));
@@ -566,6 +568,7 @@ function App() {
             onForgetDevices={() => perform(() => api.forgetAllDevices(), "forget all devices")}
           />
         )}
+        {page !== "ride" && riding && runner.recordingWarning && <RecordingWarning message={runner.recordingWarning} />}
       </main>
 
       {error && (
@@ -583,6 +586,7 @@ function App() {
       {postRidePrompt && (
         <PostRidePrompt
           errorMessage={postRidePrompt.errorMessage}
+          saveWarning={postRidePrompt.saveWarning}
           onView={() => void openSession(postRidePrompt.sessionId)}
           onDismiss={() => setPostRidePrompt(null)}
         />
@@ -1138,13 +1142,15 @@ export function Ride({
   return (
     <>
       {!active && <PageHeader eyebrow="TRAINING ROOM" title="Start a ride" />}
+      {riding && runner.recordingWarning && <RecordingWarning message={runner.recordingWarning} />}
+      {runner.status === "finished" && runner.saveWarning && <RecordingWarning message={runner.saveWarning} />}
       {!connected && <div className="notice"><Bluetooth /><div><strong>No trainer connected</strong><p>Connect a trainer or the simulator to begin.</p></div><button className="primary" onClick={onConnect}>Connect</button></div>}
       {riding && runner.control === "lost" && (
         <div className="notice" role="status">
           <Bluetooth />
           <div>
             <strong>Trainer link lost</strong>
-            <p>Reconnecting. The clock keeps running and the target is re-applied as soon as the trainer is back.</p>
+            <p>{runner.status === "paused" ? "Reconnecting. The ride clock is paused; trainer pause will be confirmed when the connection returns." : "Reconnecting. The clock keeps running and the target is re-applied as soon as the trainer is back."}</p>
           </div>
         </div>
       )}
@@ -1152,8 +1158,8 @@ export function Ride({
         <div className="notice" role="status">
           <Bluetooth />
           <div>
-            <strong>Trainer not acknowledging targets</strong>
-            <p>Retrying. The workout continues.</p>
+            <strong>{runner.status === "paused" ? "Trainer pause not confirmed" : "Trainer not acknowledging targets"}</strong>
+            <p>{runner.status === "paused" ? "Retrying pause. The ride clock is paused, but the trainer may still be applying resistance." : "Retrying. The workout continues."}</p>
           </div>
         </div>
       )}
@@ -1213,7 +1219,7 @@ function HistoryPage({ sessions, selected, profile, trainingZones, onSelect, onC
       {sessions.length === 0 ? <div className="empty-state"><History /><h2>No rides yet</h2><p>Completed and stopped workouts appear here automatically.</p></div> :
       <div className="history-list">{sessions.map((session) => <button key={session.id} className="history-row" onClick={() => onSelect(session)}>
         <span className={session.completed ? "completion complete" : "completion"}>{session.completed ? "✓" : "–"}</span>
-        <div className="history-title"><strong>{session.workoutName}</strong><span>{new Date(session.startedAt).toLocaleString()}</span></div>
+        <div className="history-title"><strong>{session.workoutName}</strong>{session.recordingWarning && <span>Recording warning</span>}<span>{new Date(session.startedAt).toLocaleString()}</span></div>
         <Metric value={formatDuration(session.elapsedSeconds)} unit="duration" /><Metric value={`${session.averagePowerWatts}`} unit="W avg" /><DistanceMetric meters={session.estimatedDistanceMeters} unit={profile.distanceUnit} /><ChevronRight />
       </button>)}</div>}
       {selected && (
@@ -1231,15 +1237,20 @@ function HistoryPage({ sessions, selected, profile, trainingZones, onSelect, onC
   );
 }
 
-export function PostRidePrompt({ errorMessage, onView, onDismiss }: { errorMessage: string | null; onView: () => void; onDismiss: () => void }) {
+function RecordingWarning({ message }: { message: string }) {
+  return <div className="notice" role="alert"><div><strong>Ride data needs attention</strong><p>{message}</p></div></div>;
+}
+
+export function PostRidePrompt({ errorMessage, saveWarning = null, onView, onDismiss }: { errorMessage: string | null; saveWarning?: string | null; onView: () => void; onDismiss: () => void }) {
+  const warning = saveWarning ?? errorMessage;
   return (
-    <div className={errorMessage ? "toast post-ride-prompt error-toast" : "toast post-ride-prompt success-toast"} role={errorMessage ? "alert" : "status"}>
+    <div className={warning ? "toast post-ride-prompt error-toast" : "toast post-ride-prompt success-toast"} role={warning ? "alert" : "status"}>
       <div className="post-ride-copy">
-        <strong>{errorMessage ? "Ride ended and was saved" : "Ride saved"}</strong>
-        <span>{errorMessage ?? "Your ride metrics are ready to review."}</span>
+        <strong>{saveWarning ? "Ride ended with a save problem" : errorMessage ? "Ride ended" : "Ride saved"}</strong>
+        <span>{warning ?? "Your ride metrics are ready to review."}</span>
       </div>
       <div className="post-ride-actions">
-        <button className="primary" onClick={onView}>{errorMessage ? "View saved ride" : "View ride metrics"}</button>
+        <button className="primary" onClick={onView}>View ride metrics</button>
         <button className="icon-button" onClick={onDismiss} aria-label="Dismiss ride summary"><X size={17} /></button>
       </div>
     </div>
@@ -1286,6 +1297,7 @@ export function RideDetailModal({ session, profile, trainingZones, onClose, onEx
             <p className="handoff-note">Garmin Connect and Finder will open. Drag the selected FIT file onto Garmin’s import page, then confirm the upload.</p>
           </div>
         </div>
+        {session.summary.recordingWarning && <RecordingWarning message={session.summary.recordingWarning} />}
         <div className="detail-metrics">
           <Metric value={formatDuration(session.summary.elapsedSeconds)} unit="duration" />
           <Metric value={`${session.summary.averagePowerWatts}`} unit="W average" />

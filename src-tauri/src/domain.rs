@@ -291,6 +291,8 @@ pub struct SessionSummary {
     pub distance_source: Option<DistanceSource>,
     pub distance_weight_kg: f32,
     pub completed: bool,
+    #[serde(default)]
+    pub recording_warning: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
