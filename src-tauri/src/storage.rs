@@ -453,6 +453,26 @@ impl Storage {
         Ok(())
     }
 
+    pub fn update_session_distance(
+        &self,
+        id: Uuid,
+        estimated_distance_meters: f64,
+        source: Option<DistanceSource>,
+    ) -> Result<(), String> {
+        self.connection()?
+            .execute(
+                "UPDATE sessions SET estimated_distance_meters = ?2, distance_source = ?3
+                 WHERE id = ?1",
+                params![
+                    id.to_string(),
+                    estimated_distance_meters,
+                    source.map(distance_source_value),
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
     pub fn sessions(&self) -> Result<Vec<SessionSummary>, String> {
         let connection = self.connection()?;
         let mut statement = connection
@@ -521,7 +541,84 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionSummary> {
         max_power_watts: row.get(7)?,
         average_cadence_rpm: row.get(8)?,
         completed: row.get(9)?,
+        estimated_distance_meters: row.get(10)?,
+        distance_source: row
+            .get::<_, Option<String>>(11)?
+            .as_deref()
+            .and_then(parse_distance_source),
+        distance_weight_kg: row.get(12)?,
     })
+}
+
+fn ensure_column(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<(), String> {
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|error| error.to_string())?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    drop(statement);
+    if !columns.iter().any(|existing| existing == column) {
+        connection
+            .execute(
+                &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+                [],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn weight_unit_value(unit: WeightUnit) -> &'static str {
+    match unit {
+        WeightUnit::Kg => "kg",
+        WeightUnit::Lb => "lb",
+    }
+}
+
+fn parse_weight_unit(value: &str) -> WeightUnit {
+    match value {
+        "lb" => WeightUnit::Lb,
+        _ => WeightUnit::Kg,
+    }
+}
+
+fn distance_unit_value(unit: DistanceUnit) -> &'static str {
+    match unit {
+        DistanceUnit::Km => "km",
+        DistanceUnit::Mi => "mi",
+    }
+}
+
+fn parse_distance_unit(value: &str) -> DistanceUnit {
+    match value {
+        "mi" => DistanceUnit::Mi,
+        _ => DistanceUnit::Km,
+    }
+}
+
+fn distance_source_value(source: DistanceSource) -> &'static str {
+    match source {
+        DistanceSource::Trainer => "trainer",
+        DistanceSource::Power => "power",
+        DistanceSource::Mixed => "mixed",
+    }
+}
+
+fn parse_distance_source(value: &str) -> Option<DistanceSource> {
+    match value {
+        "trainer" => Some(DistanceSource::Trainer),
+        "power" => Some(DistanceSource::Power),
+        "mixed" => Some(DistanceSource::Mixed),
+        _ => None,
+    }
 }
 
 fn parse_uuid(value: String) -> rusqlite::Result<Uuid> {
@@ -663,10 +760,83 @@ mod tests {
     #[test]
     fn stores_free_ride_without_a_workout() {
         let storage = Storage::in_memory().unwrap();
-        let session = storage.start_session(None, "Free Ride").unwrap();
+        let mut session = storage.start_session(None, "Free Ride", 84.0).unwrap();
+        session.estimated_distance_meters = 12_345.6;
+        session.distance_source = Some(DistanceSource::Mixed);
+        storage.finish_session(&session).unwrap();
         let stored = storage.session(session.id).unwrap().unwrap().summary;
 
         assert_eq!(stored.workout_id, None);
         assert_eq!(stored.workout_name, "Free Ride");
+        assert_eq!(stored.estimated_distance_meters, 12_345.6);
+        assert_eq!(stored.distance_source, Some(DistanceSource::Mixed));
+        assert_eq!(stored.distance_weight_kg, 84.0);
+    }
+
+    #[test]
+    fn profile_units_round_trip_while_weights_remain_metric() {
+        let storage = Storage::in_memory().unwrap();
+        let mut profile = storage.profile().unwrap();
+        profile.rider_weight_kg = 81.25;
+        profile.bike_weight_kg = 10.5;
+        profile.weight_unit = WeightUnit::Lb;
+        profile.distance_unit = DistanceUnit::Mi;
+        storage.save_profile(&profile).unwrap();
+
+        let stored = storage.profile().unwrap();
+        assert_eq!(stored.rider_weight_kg, 81.25);
+        assert_eq!(stored.bike_weight_kg, 10.5);
+        assert_eq!(stored.weight_unit, WeightUnit::Lb);
+        assert_eq!(stored.distance_unit, DistanceUnit::Mi);
+    }
+
+    #[test]
+    fn migrates_existing_profile_and_session_tables() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("legacy.sqlite3");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "
+                CREATE TABLE profiles (
+                  id TEXT PRIMARY KEY, name TEXT NOT NULL, ftp_watts INTEGER NOT NULL,
+                  max_power_watts INTEGER NOT NULL, active INTEGER NOT NULL DEFAULT 1
+                );
+                CREATE TABLE sessions (
+                  id TEXT PRIMARY KEY, workout_id TEXT, workout_name TEXT NOT NULL,
+                  started_at TEXT NOT NULL, ended_at TEXT, elapsed_seconds INTEGER NOT NULL DEFAULT 0,
+                  average_power_watts INTEGER NOT NULL DEFAULT 0,
+                  max_power_watts INTEGER NOT NULL DEFAULT 0, average_cadence_rpm REAL,
+                  completed INTEGER NOT NULL DEFAULT 0
+                );
+                ",
+            )
+            .unwrap();
+        let profile_id = Uuid::new_v4();
+        connection
+            .execute(
+                "INSERT INTO profiles(id, name, ftp_watts, max_power_watts)
+                 VALUES(?1, 'Legacy', 220, 900)",
+                [profile_id.to_string()],
+            )
+            .unwrap();
+        drop(connection);
+
+        let storage = Storage::open(&path).unwrap();
+        let profile = storage.profile().unwrap();
+        assert_eq!(profile.rider_weight_kg, 75.0);
+        assert_eq!(profile.bike_weight_kg, 9.0);
+        assert_eq!(profile.weight_unit, WeightUnit::Kg);
+        assert_eq!(profile.distance_unit, DistanceUnit::Km);
+        let session = storage.start_session(None, "Migrated", 84.0).unwrap();
+        assert_eq!(
+            storage
+                .session(session.id)
+                .unwrap()
+                .unwrap()
+                .summary
+                .estimated_distance_meters,
+            0.0
+        );
     }
 }

@@ -3,6 +3,10 @@ export type Profile = {
   name: string;
   ftpWatts: number;
   maxPowerWatts: number;
+  riderWeightKg: number;
+  bikeWeightKg: number;
+  weightUnit: "kg" | "lb";
+  distanceUnit: "km" | "mi";
 };
 
 export type PowerTarget =
@@ -175,6 +179,9 @@ export type SessionSummary = {
   averagePowerWatts: number;
   maxPowerWatts: number;
   averageCadenceRpm: number | null;
+  estimatedDistanceMeters: number;
+  distanceSource: "trainer" | "power" | "mixed" | null;
+  distanceWeightKg: number;
   completed: boolean;
 };
 
@@ -199,6 +206,25 @@ export const formatDuration = (seconds: number): string => {
     ? `${hours}:${String(minutes).padStart(2, "0")}:${String(remaining).padStart(2, "0")}`
     : `${minutes}:${String(remaining).padStart(2, "0")}`;
 };
+
+export const formatDistance = (
+  meters: number,
+  unit: Profile["distanceUnit"],
+): { value: string; unit: string } => {
+  const distance = unit === "mi" ? meters / 1609.344 : meters / 1000;
+  return {
+    value: distance.toFixed(distance < 10 ? 2 : 1),
+    unit,
+  };
+};
+
+export const formatSpeed = (
+  speedKph: number,
+  unit: Profile["distanceUnit"],
+): { value: string; unit: string } => ({
+  value: (unit === "mi" ? speedKph / 1.609344 : speedKph).toFixed(1),
+  unit: unit === "mi" ? "mph" : "km/h",
+});
 
 export const manualPowerDeltaForKey = (
   key: string,

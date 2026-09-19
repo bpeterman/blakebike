@@ -4,9 +4,10 @@ use std::{
 };
 
 use chrono::{DateTime, TimeZone, Utc};
-use fit::{Encoder, Field, FieldKind, Message, Value, profile::MesgNum};
+use fit::{Decoder, Encoder, Field, FieldKind, Message, Value, profile::MesgNum};
 
 use crate::{
+    distance::{DistanceEstimate, DistancePoint, estimate_distance},
     domain::{SessionDetail, SessionSummary, Telemetry},
     storage::Storage,
 };
@@ -59,15 +60,24 @@ pub fn reconcile_ride_files(directory: &Path, storage: &Storage) -> ReconcileRep
         .filter(|summary| summary.ended_at.is_some())
     {
         let path = ride_file_path(directory, &summary);
-        if fit_file_is_compatible(&path) {
-            report.existing += 1;
-            continue;
-        }
+        let existed = fit_file_is_compatible(&path);
         let result = storage
             .session(summary.id)
             .and_then(|detail| detail.ok_or_else(|| "Ride disappeared during backfill".to_string()))
-            .and_then(|detail| ensure_ride_file(directory, &detail).map(|_| ()));
+            .and_then(|mut detail| {
+                let estimate =
+                    estimate_distance(&detail.samples, detail.summary.distance_weight_kg);
+                detail.summary.estimated_distance_meters = estimate.total_meters;
+                detail.summary.distance_source = estimate.source;
+                storage.update_session_distance(
+                    detail.summary.id,
+                    estimate.total_meters,
+                    estimate.source,
+                )?;
+                ensure_ride_file(directory, &detail).map(|_| ())
+            });
         match result {
+            Ok(()) if existed => report.existing += 1,
             Ok(()) => report.generated += 1,
             Err(error) => report.failures.push((summary.id, error)),
         }
@@ -81,7 +91,8 @@ pub fn encode_activity(detail: &SessionDetail) -> Result<Vec<u8>, String> {
     let ended_at = summary.ended_at.unwrap_or_else(|| {
         started_at + chrono::Duration::seconds(i64::from(summary.elapsed_seconds))
     });
-    let stats = RideStats::from_samples(&detail.samples);
+    let distance = estimate_distance(&detail.samples, summary.distance_weight_kg);
+    let stats = RideStats::from_samples(&detail.samples, &distance, summary.elapsed_seconds);
     let mut messages = vec![
         message(
             MesgNum::FileId,
@@ -96,13 +107,23 @@ pub fn encode_activity(detail: &SessionDetail) -> Result<Vec<u8>, String> {
         event_message(started_at, "start"),
     ];
 
-    for sample in &detail.samples {
-        messages.push(record_message(sample)?);
+    for (sample, point) in detail.samples.iter().zip(&distance.points) {
+        messages.push(record_message(sample, point)?);
     }
 
     messages.push(event_message(ended_at, "stop_all"));
-    messages.push(lap_message(summary, ended_at, &stats));
-    messages.push(session_message(summary, ended_at, &stats));
+    messages.push(lap_message(
+        summary,
+        ended_at,
+        &stats,
+        distance.total_meters,
+    ));
+    messages.push(session_message(
+        summary,
+        ended_at,
+        &stats,
+        distance.total_meters,
+    ));
     messages.push(message(
         MesgNum::Activity,
         vec![
@@ -133,6 +154,27 @@ fn fit_file_is_compatible(path: &Path) -> bool {
         return false;
     }
     matches!(normalize_definition_base_types(&mut bytes), Ok(false))
+        && fit_file_contains_distance(&bytes)
+}
+
+fn fit_file_contains_distance(bytes: &[u8]) -> bool {
+    let (messages, errors) = Decoder::new(bytes).read_all();
+    if !errors.is_empty() {
+        return false;
+    }
+    let records: Vec<_> = messages
+        .iter()
+        .filter(|message| message.global_mesg_num == MesgNum::Record as u16)
+        .collect();
+    let records_have_distance =
+        records.is_empty() || records.iter().all(|message| message.field(5).is_some());
+    records_have_distance
+        && messages.iter().any(|message| {
+            message.global_mesg_num == MesgNum::Lap as u16 && message.field(9).is_some()
+        })
+        && messages.iter().any(|message| {
+            message.global_mesg_num == MesgNum::Session as u16 && message.field(9).is_some()
+        })
 }
 
 /// fit-sdk-rust 0.2.1 emits only the low five bits of FIT base type IDs.
@@ -254,7 +296,7 @@ fn refresh_crcs(bytes: &mut [u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn record_message(sample: &Telemetry) -> Result<Message, String> {
+fn record_message(sample: &Telemetry, distance: &DistancePoint) -> Result<Message, String> {
     let timestamp = Utc
         .timestamp_millis_opt(sample.timestamp_ms)
         .single()
@@ -262,6 +304,8 @@ fn record_message(sample: &Telemetry) -> Result<Message, String> {
     let mut fields = vec![
         datetime_field(253, "timestamp", timestamp),
         uint_field(7, "power", u64::from(sample.power_watts)),
+        float_field(5, "distance", distance.distance_meters),
+        float_field(6, "speed", distance.speed_mps),
     ];
     if let Some(heart_rate) = sample.heart_rate_bpm {
         fields.push(uint_field(3, "heart_rate", u64::from(heart_rate)));
@@ -272,9 +316,6 @@ fn record_message(sample: &Telemetry) -> Result<Message, String> {
             "cadence",
             cadence.round().clamp(0.0, 254.0) as u64,
         ));
-    }
-    if let Some(speed) = sample.speed_kph {
-        fields.push(float_field(6, "speed", f64::from(speed) / 3.6));
     }
     Ok(message(MesgNum::Record, fields))
 }
@@ -290,8 +331,14 @@ fn event_message(timestamp: DateTime<Utc>, event_type: &'static str) -> Message 
     )
 }
 
-fn lap_message(summary: &SessionSummary, ended_at: DateTime<Utc>, stats: &RideStats) -> Message {
+fn lap_message(
+    summary: &SessionSummary,
+    ended_at: DateTime<Utc>,
+    stats: &RideStats,
+    total_distance_meters: f64,
+) -> Message {
     let mut fields = common_summary_fields(summary, ended_at, stats, SummaryKind::Lap);
+    fields.push(float_field(9, "total_distance", total_distance_meters));
     fields.extend([
         enum_field(23, "intensity", "active"),
         enum_field(24, "lap_trigger", "session_end"),
@@ -305,8 +352,10 @@ fn session_message(
     summary: &SessionSummary,
     ended_at: DateTime<Utc>,
     stats: &RideStats,
+    total_distance_meters: f64,
 ) -> Message {
     let mut fields = common_summary_fields(summary, ended_at, stats, SummaryKind::Session);
+    fields.push(float_field(9, "total_distance", total_distance_meters));
     fields.extend([
         enum_field(5, "sport", "cycling"),
         enum_field(6, "sub_sport", "indoor_cycling"),
@@ -388,11 +437,11 @@ struct RideStats {
 }
 
 impl RideStats {
-    fn from_samples(samples: &[Telemetry]) -> Self {
-        let speeds: Vec<f64> = samples
-            .iter()
-            .filter_map(|sample| sample.speed_kph.map(|speed| f64::from(speed) / 3.6))
-            .collect();
+    fn from_samples(
+        samples: &[Telemetry],
+        distance: &DistanceEstimate,
+        elapsed_seconds: u32,
+    ) -> Self {
         let heart_rates: Vec<u8> = samples
             .iter()
             .filter_map(|sample| sample.heart_rate_bpm)
@@ -406,9 +455,9 @@ impl RideStats {
             })
             .collect();
         Self {
-            average_speed_mps: (!speeds.is_empty())
-                .then(|| speeds.iter().sum::<f64>() / speeds.len() as f64),
-            max_speed_mps: speeds.iter().copied().reduce(f64::max),
+            average_speed_mps: (elapsed_seconds > 0)
+                .then(|| distance.total_meters / f64::from(elapsed_seconds)),
+            max_speed_mps: distance.max_speed_mps,
             average_heart_rate: (!heart_rates.is_empty()).then(|| {
                 (heart_rates
                     .iter()
@@ -490,7 +539,6 @@ fn safe_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use chrono::TimeZone;
-    use fit::Decoder;
     use tempfile::tempdir;
     use uuid::Uuid;
 
@@ -509,6 +557,9 @@ mod tests {
                 average_power_watts: 210,
                 max_power_watts: 250,
                 average_cadence_rpm: Some(91.0),
+                estimated_distance_meters: 0.0,
+                distance_source: None,
+                distance_weight_kg: 84.0,
                 completed: true,
             },
             samples: vec![
@@ -565,6 +616,13 @@ mod tests {
             .as_f64()
             .unwrap();
         assert!((speed - (30.0 / 3.6)).abs() < 0.01);
+        assert_eq!(record.field("distance").unwrap().value.as_f64(), Some(0.0));
+        let distances: Vec<f64> = messages
+            .iter()
+            .filter(|message| message.name == "record")
+            .map(|message| message.field("distance").unwrap().value.as_f64().unwrap())
+            .collect();
+        assert!(distances.windows(2).all(|pair| pair[1] >= pair[0]));
         let session = messages
             .iter()
             .find(|message| message.name == "session")
@@ -581,6 +639,14 @@ mod tests {
             session.field("sub_sport").unwrap().value.as_str(),
             Some("indoor_cycling")
         );
+        let total_distance = session
+            .field("total_distance")
+            .unwrap()
+            .value
+            .as_f64()
+            .unwrap();
+        assert!(total_distance > 8.0);
+        assert!((total_distance - distances.last().unwrap()).abs() < 0.01);
     }
 
     #[test]
@@ -636,7 +702,7 @@ mod tests {
     #[test]
     fn reconciliation_backfills_missing_files_without_changing_ride_data() {
         let storage = Storage::in_memory().unwrap();
-        let mut summary = storage.start_session(None, "Backfill Ride").unwrap();
+        let mut summary = storage.start_session(None, "Backfill Ride", 84.0).unwrap();
         let sample = detail().samples[0].clone();
         storage.record_sample(summary.id, &sample).unwrap();
         summary.ended_at = Some(summary.started_at + chrono::Duration::seconds(1));
@@ -650,16 +716,19 @@ mod tests {
         assert_eq!(report.generated, 1);
         assert!(report.failures.is_empty());
         assert!(ride_file_path(directory.path(), &summary).is_file());
+        let stored = storage.session(summary.id).unwrap().unwrap();
+        assert_eq!(stored.samples.len(), 1);
+        assert_eq!(stored.summary.estimated_distance_meters, 0.0);
         assert_eq!(
-            storage.session(summary.id).unwrap().unwrap().samples.len(),
-            1
+            stored.summary.distance_source,
+            Some(crate::domain::DistanceSource::Trainer)
         );
     }
 
     #[test]
     fn reconciliation_reports_filesystem_failures_and_preserves_the_ride() {
         let storage = Storage::in_memory().unwrap();
-        let mut summary = storage.start_session(None, "Protected Ride").unwrap();
+        let mut summary = storage.start_session(None, "Protected Ride", 84.0).unwrap();
         summary.ended_at = Some(summary.started_at);
         storage.finish_session(&summary).unwrap();
 

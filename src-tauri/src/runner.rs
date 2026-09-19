@@ -15,6 +15,7 @@ use uuid::Uuid;
 use crate::{
     AppState,
     devices::DeviceHub,
+    distance::estimate_distance,
     domain::{Interval, SessionSummary, Workout},
     fit::ensure_ride_file,
     storage::Storage,
@@ -95,12 +96,14 @@ impl WorkoutRunner {
         self.state.read().await.clone()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn start(
         &self,
         app: AppHandle,
         workout: Workout,
         ftp: u16,
         rider_max: u16,
+        distance_weight_kg: f32,
         devices: Arc<DeviceHub>,
         storage: Arc<Storage>,
     ) -> Result<Uuid, String> {
@@ -118,6 +121,7 @@ impl WorkoutRunner {
             Some(total_seconds),
             false,
             rider_max,
+            distance_weight_kg,
             devices,
             storage,
         )
@@ -128,6 +132,7 @@ impl WorkoutRunner {
         &self,
         app: AppHandle,
         rider_max: u16,
+        distance_weight_kg: f32,
         devices: Arc<DeviceHub>,
         storage: Arc<Storage>,
     ) -> Result<Uuid, String> {
@@ -144,6 +149,7 @@ impl WorkoutRunner {
             None,
             true,
             rider_max,
+            distance_weight_kg,
             devices,
             storage,
         )
@@ -160,6 +166,7 @@ impl WorkoutRunner {
         total_seconds: Option<u32>,
         standalone: bool,
         rider_max: u16,
+        distance_weight_kg: f32,
         devices: Arc<DeviceHub>,
         storage: Arc<Storage>,
     ) -> Result<Uuid, String> {
@@ -172,7 +179,7 @@ impl WorkoutRunner {
             return Err("A ride is already active".into());
         }
         devices.begin_control().await?;
-        let session = storage.start_session(workout_id, &ride_name)?;
+        let session = storage.start_session(workout_id, &ride_name, distance_weight_kg)?;
         let session_id = session.id;
         tracing::info!(
             session_id = %session_id,
@@ -559,6 +566,11 @@ async fn finish(
     summary.max_power_watts = max_power;
     summary.average_cadence_rpm =
         (cadence_samples > 0).then_some((cadence_total / f64::from(cadence_samples)) as f32);
+    if let Some(detail) = storage.session(summary.id)? {
+        let estimate = estimate_distance(&detail.samples, summary.distance_weight_kg);
+        summary.estimated_distance_meters = estimate.total_meters;
+        summary.distance_source = estimate.source;
+    }
     summary.completed = completed;
     tracing::info!(
         session_id = %summary.id,
@@ -567,6 +579,8 @@ async fn finish(
         samples,
         average_power_watts = summary.average_power_watts,
         max_power_watts = summary.max_power_watts,
+        estimated_distance_meters = summary.estimated_distance_meters,
+        distance_source = ?summary.distance_source,
         "Workout finished"
     );
     storage.finish_session(&summary).map_err(|error| {

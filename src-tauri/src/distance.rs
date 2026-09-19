@@ -76,8 +76,8 @@ pub fn speed_from_power(power_watts: u16, total_weight_kg: f64) -> f64 {
     let wheel_power = f64::from(power_watts) * DRIVETRAIN_EFFICIENCY;
     let rolling_force = ROLLING_RESISTANCE * total_weight_kg * GRAVITY_M_S2;
     let aerodynamic_factor = 0.5 * AIR_DENSITY_KG_M3 * DRAG_AREA_M2;
-    let mut low = 0.0;
-    let mut high = 40.0;
+    let mut low: f64 = 0.0;
+    let mut high: f64 = 40.0;
     for _ in 0..48 {
         let speed = (low + high) * 0.5;
         let required_power = aerodynamic_factor * speed.powi(3) + rolling_force * speed;
@@ -123,10 +123,7 @@ mod tests {
     fn power_fallback_produces_a_reasonable_flat_road_speed() {
         let speed_kph = speed_from_power(200, 84.0) * 3.6;
         assert!((28.0..=34.0).contains(&speed_kph), "{speed_kph}");
-        let estimate = estimate_distance(
-            &[sample(0, 200, None), sample(1_000, 200, None)],
-            84.0,
-        );
+        let estimate = estimate_distance(&[sample(0, 200, None), sample(1_000, 200, None)], 84.0);
         assert!(estimate.total_meters > 7.0);
         assert_eq!(estimate.source, Some(DistanceSource::Power));
     }

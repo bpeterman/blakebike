@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
+  formatDistance,
   formatDuration,
+  formatSpeed,
   manualPowerDeltaForKey,
   workoutDuration,
   type WorkoutStep,
@@ -35,5 +37,12 @@ describe("workout helpers", () => {
     expect(manualPowerDeltaForKey("ArrowDown", false)).toBe(-5);
     expect(manualPowerDeltaForKey("ArrowUp", true)).toBeNull();
     expect(manualPowerDeltaForKey("Enter", false)).toBeNull();
+  });
+
+  it("formats metric-backed distance and speed in either display unit", () => {
+    expect(formatDistance(10_000, "km")).toEqual({ value: "10.0", unit: "km" });
+    expect(formatDistance(1609.344, "mi")).toEqual({ value: "1.00", unit: "mi" });
+    expect(formatSpeed(32.18688, "mi")).toEqual({ value: "20.0", unit: "mph" });
+    expect(formatSpeed(32.18688, "km")).toEqual({ value: "32.2", unit: "km/h" });
   });
 });

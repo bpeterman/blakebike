@@ -225,6 +225,7 @@ pub async fn start_workout(
             workout,
             profile.ftp_watts,
             profile.max_power_watts,
+            profile.rider_weight_kg + profile.bike_weight_kg,
             Arc::clone(&state.devices),
             Arc::clone(&state.storage),
         )
@@ -240,6 +241,7 @@ pub async fn start_free_ride(app: AppHandle, state: State<'_, AppState>) -> Resu
         .start_free_ride(
             app,
             profile.max_power_watts,
+            profile.rider_weight_kg + profile.bike_weight_kg,
             Arc::clone(&state.devices),
             Arc::clone(&state.storage),
         )
