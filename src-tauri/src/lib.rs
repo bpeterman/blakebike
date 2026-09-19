@@ -1,4 +1,5 @@
 mod commands;
+mod default_workouts;
 mod devices;
 mod distance;
 mod domain;
