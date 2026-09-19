@@ -207,8 +207,10 @@ p { color: #8d9587; font-size: 13px; }
 .secondary-chart { padding-top: 14px; }
 .chart-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 8px; }
 .chart-heading h3 { margin: 2px 0 0; font-size: 16px; }
-.chart-toggle { display: flex; grid-template-columns: auto 1fr; align-items: center; gap: 7px; cursor: pointer; }
-.chart-toggle input { width: 16px; height: 16px; accent-color: #c8ff32; }
+.chart-collapse { display: inline-flex; align-items: center; gap: 5px; padding: 5px 7px; border: 0; border-radius: 6px; color: #8d9587; background: transparent; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .08em; }
+.chart-collapse:hover { color: #c8ff32; background: #222620; }
+.chart-collapse svg { transition: transform .16s ease; }
+.chart-collapse[aria-expanded="false"] svg { transform: rotate(-90deg); }
 .zone-chart-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 12px; }
 .zone-chart { min-width: 0; padding: 16px; }
 .target-line { display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px; color: #7f887a; font-size: 11px; }
@@ -229,6 +231,8 @@ p { color: #8d9587; font-size: 13px; }
 .bias-stepper button.secondary { min-width: 30px; height: 28px; padding: 0 8px; font-size: 15px; line-height: 1; }
 .bias-stepper strong { min-width: 46px; color: #e9eee4; font-size: 14px; text-align: center; font-variant-numeric: tabular-nums; }
 .bias-stepper strong.active { color: #c8ff32; }
+.bias-reset { width: 34px; justify-content: start; }
+.bias-reset.placeholder { visibility: hidden; }
 .metric-control { margin-left: auto; }
 .metric-control-group { display: grid; gap: 3px; }
 .smoothing-select, .source-choice-select { display: block; }

@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { save } from "@tauri-apps/plugin-dialog";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import type {
   ConnectProgress,
   DeviceInfo,
@@ -27,6 +27,11 @@ export type TrainingSyncResult = {
   zones: TrainingZoneSettings;
   powerZonesImported: boolean;
   heartRateZonesImported: boolean;
+};
+
+export type WorkoutExportResult = {
+  exportedCount: number;
+  directory: string;
 };
 
 export const api = {
@@ -77,6 +82,17 @@ export const api = {
         path,
       });
     }
+  },
+  exportAllZwo: async (): Promise<WorkoutExportResult | null> => {
+    const directory = await open({
+      directory: true,
+      multiple: false,
+      title: "Export workout library",
+    });
+    if (typeof directory !== "string") return null;
+    return invoke<WorkoutExportResult>("export_all_zwo_workouts", {
+      directory,
+    });
   },
   runnerState: () => invoke<RunnerState>("runner_state"),
   startWorkout: (workoutId: string) =>

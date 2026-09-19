@@ -145,6 +145,7 @@ pub fn run() {
             commands::delete_workout,
             commands::import_zwo_workout,
             commands::export_zwo_workout,
+            commands::export_all_zwo_workouts,
             commands::runner_state,
             commands::start_workout,
             commands::start_free_ride,
