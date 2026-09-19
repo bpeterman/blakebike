@@ -359,6 +359,8 @@ textarea { min-height: 70px; resize: vertical; }
 .loading-error h2 { margin: 0; color: #e6e9e2; }
 .loading-error p { margin: 0; color: #e07b6a; font-family: ui-monospace, monospace; font-size: 13px; word-break: break-word; }
 .loading-error button { justify-self: center; }
+.loading-error .error-boundary-note { color: #9aa394; font-size: 13px; }
+.error-boundary-actions { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; }
 
 @media (max-width: 1050px) {
   .workout-row { grid-template-columns: repeat(2, 1fr); }

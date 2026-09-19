@@ -1,5 +1,6 @@
 import {
   type ReactNode,
+  memo,
   useCallback,
   useEffect,
   useMemo,
@@ -205,9 +206,18 @@ function App() {
 
   useEffect(() => {
     void load();
-    let offTelemetry: (() => void) | undefined;
-    let offRunner: (() => void) | undefined;
-    void api.onTelemetry((sample) => {
+    // Subscriptions resolve asynchronously; if this effect is cleaned up
+    // before one resolves (StrictMode, fast unmount), unsubscribe it at once
+    // instead of leaking a duplicate handler.
+    let cancelled = false;
+    const subscriptions: Array<() => void> = [];
+    const track = (subscription: Promise<() => void>) => {
+      void subscription.then((off) => {
+        if (cancelled) off();
+        else subscriptions.push(off);
+      });
+    };
+    track(api.onTelemetry((sample) => {
       setTelemetry(sample);
       if (
         runnerRef.current.status === "running" &&
@@ -216,10 +226,8 @@ function App() {
         lastHistorySampleMsRef.current = sample.timestampMs;
         setTelemetryHistory((history) => [...history, sample]);
       }
-    }).then((off) => {
-      offTelemetry = off;
-    });
-    void api.onRunnerState((state) => {
+    }));
+    track(api.onRunnerState((state) => {
       setRunner(state);
       runnerRef.current = state;
       if (
@@ -233,23 +241,17 @@ function App() {
       if (state.status === "finished" || state.status === "error") {
         void api.sessions().then(setSessions);
       }
-    }).then((off) => {
-      offRunner = off;
-    });
+    }));
     // Devices hub: whole-slot updates on state/stats changes, plus individual
     // log lines so the per-device logs grow live between snapshots.
-    let offSlot: (() => void) | undefined;
-    let offLog: (() => void) | undefined;
-    void api.onDeviceSlot((slot) => {
+    track(api.onDeviceSlot((slot) => {
       setHub((current) =>
         current
           ? { ...current, slots: current.slots.map((existing) => (existing.role === slot.role ? slot : existing)) }
           : current,
       );
-    }).then((off) => {
-      offSlot = off;
-    });
-    void api.onDeviceLog(({ role, line }) => {
+    }));
+    track(api.onDeviceLog(({ role, line }) => {
       setHub((current) =>
         current
           ? {
@@ -262,14 +264,10 @@ function App() {
             }
           : current,
       );
-    }).then((off) => {
-      offLog = off;
-    });
+    }));
     return () => {
-      offTelemetry?.();
-      offRunner?.();
-      offSlot?.();
-      offLog?.();
+      cancelled = true;
+      subscriptions.forEach((off) => off());
     };
   }, [load]);
 
@@ -828,6 +826,14 @@ export function Ride({
     () => effectiveHeartRateZones(trainingZones, profile.maxHeartRateBpm),
     [profile.maxHeartRateBpm, trainingZones],
   );
+  const powerZoneSeconds = useMemo(
+    () => timeInZones(telemetryHistory, powerZones, "power"),
+    [powerZones, telemetryHistory],
+  );
+  const heartRateZoneSeconds = useMemo(
+    () => timeInZones(telemetryHistory, heartRateZones, "heartRate"),
+    [heartRateZones, telemetryHistory],
+  );
   const displayedPower =
     powerSmoothing === "instant"
       ? telemetry.powerWatts
@@ -1045,7 +1051,7 @@ export function Ride({
               unit="W"
               color="#c8ff32"
               name={powerSmoothing === "instant" ? "Power" : `Power (${powerSmoothingLabel[powerSmoothing]})`}
-              domain={[0, "dataMax + 50"]}
+              domain={powerDomain}
             />
             {openEnded
               ? <div className="open-ended-time"><span>Elapsed</span><strong>{formatDuration(elapsed)}</strong><span>Open ended</span></div>
@@ -1077,7 +1083,7 @@ export function Ride({
               unit="bpm"
               color="#ff6f7d"
               name="Heart rate"
-              domain={["dataMin - 10", "dataMax + 10"]}
+              domain={heartRateDomain}
             />
           </div>
         )}
@@ -1088,12 +1094,12 @@ export function Ride({
         <TimeInZoneChart
           title="Power zones"
           zones={powerZones}
-          seconds={timeInZones(telemetryHistory, powerZones, "power")}
+          seconds={powerZoneSeconds}
         />
         <TimeInZoneChart
           title="Heart-rate zones"
           zones={heartRateZones}
-          seconds={timeInZones(telemetryHistory, heartRateZones, "heartRate")}
+          seconds={heartRateZoneSeconds}
         />
       </div>
     ),
@@ -1173,8 +1179,28 @@ export function Ride({
 }
 
 function HistoryPage({ sessions, selected, profile, trainingZones, onSelect, onClose, onExport, onExportFit, onGarmin }: { sessions: SessionSummary[]; selected: SessionDetail | null; profile: Profile; trainingZones: TrainingZoneSettings; onSelect: (session: SessionSummary) => void; onClose: () => void; onExport: (session: SessionSummary) => void; onExportFit: (session: SessionSummary) => void; onGarmin: (session: SessionSummary) => void }) {
-  const powerZones = effectivePowerZones(trainingZones, profile.ftpWatts);
-  const heartRateZones = effectiveHeartRateZones(trainingZones, profile.maxHeartRateBpm);
+  const powerZones = useMemo(
+    () => effectivePowerZones(trainingZones, profile.ftpWatts),
+    [profile.ftpWatts, trainingZones],
+  );
+  const heartRateZones = useMemo(
+    () => effectiveHeartRateZones(trainingZones, profile.maxHeartRateBpm),
+    [profile.maxHeartRateBpm, trainingZones],
+  );
+  // Chart data for the open ride is computed once per selection, not on every
+  // telemetry event that re-renders the app.
+  const detailSamples = useMemo(
+    () => selected ? downsampleTelemetry(withActiveElapsed(selected.samples, selected.summary.elapsedSeconds)) : [],
+    [selected],
+  );
+  const detailPowerSeconds = useMemo(
+    () => selected ? timeInZones(selected.samples, powerZones, "power") : [],
+    [powerZones, selected],
+  );
+  const detailHeartRateSeconds = useMemo(
+    () => selected ? timeInZones(selected.samples, heartRateZones, "heartRate") : [],
+    [heartRateZones, selected],
+  );
   return (
     <>
       <PageHeader eyebrow={`${sessions.length} RECORDED RIDES`} title="Ride history" />
@@ -1184,7 +1210,7 @@ function HistoryPage({ sessions, selected, profile, trainingZones, onSelect, onC
         <div className="history-title"><strong>{session.workoutName}</strong><span>{new Date(session.startedAt).toLocaleString()}</span></div>
         <Metric value={formatDuration(session.elapsedSeconds)} unit="duration" /><Metric value={`${session.averagePowerWatts}`} unit="W avg" /><DistanceMetric meters={session.estimatedDistanceMeters} unit={profile.distanceUnit} /><ChevronRight />
       </button>)}</div>}
-      {selected && <div className="modal-backdrop"><div className="modal detail-modal"><button className="modal-close" onClick={onClose}><X /></button><span className="label">RIDE DETAIL</span><h2>{selected.summary.workoutName}</h2><p>{new Date(selected.summary.startedAt).toLocaleString()}</p><div className="detail-metrics"><Metric value={formatDuration(selected.summary.elapsedSeconds)} unit="duration" /><Metric value={`${selected.summary.averagePowerWatts}`} unit="W average" /><Metric value={`${selected.summary.maxPowerWatts}`} unit="W maximum" /><Metric value={`${Math.round(selected.summary.averageCadenceRpm ?? 0)}`} unit="rpm average" /><DistanceMetric meters={selected.summary.estimatedDistanceMeters} unit={profile.distanceUnit} /></div><p className="distance-note">Estimated distance · {distanceSourceLabel(selected.summary.distanceSource)}</p><div className="history-charts"><h3>Power</h3><SessionAreaChart samples={downsampleTelemetry(withActiveElapsed(selected.samples, selected.summary.elapsedSeconds))} dataKey="powerWatts" unit="W" color="#c8ff32" name="Power" domain={[0, "dataMax + 50"]}/><h3>Heart rate</h3><SessionAreaChart samples={downsampleTelemetry(withActiveElapsed(selected.samples, selected.summary.elapsedSeconds))} dataKey="heartRateBpm" unit="bpm" color="#ff6f7d" name="Heart rate" domain={["dataMin - 10", "dataMax + 10"]}/><div className="zone-chart-grid history-zone-charts"><TimeInZoneChart title="Power zones" zones={powerZones} seconds={timeInZones(selected.samples, powerZones, "power")}/><TimeInZoneChart title="Heart-rate zones" zones={heartRateZones} seconds={timeInZones(selected.samples, heartRateZones, "heartRate")}/></div></div><div className="detail-actions"><button className="primary" onClick={() => onGarmin(selected.summary)}><Upload size={16}/> Upload to Garmin</button><button className="secondary" onClick={() => onExportFit(selected.summary)}><Download size={16}/> Export FIT</button><button className="secondary" onClick={() => onExport(selected.summary)}><Download size={16}/> Export CSV</button></div><p className="handoff-note">Garmin Connect and Finder will open. Drag the selected FIT file onto Garmin’s import page, then confirm the upload.</p></div></div>}
+      {selected && <div className="modal-backdrop"><div className="modal detail-modal"><button className="modal-close" onClick={onClose}><X /></button><span className="label">RIDE DETAIL</span><h2>{selected.summary.workoutName}</h2><p>{new Date(selected.summary.startedAt).toLocaleString()}</p><div className="detail-metrics"><Metric value={formatDuration(selected.summary.elapsedSeconds)} unit="duration" /><Metric value={`${selected.summary.averagePowerWatts}`} unit="W average" /><Metric value={`${selected.summary.maxPowerWatts}`} unit="W maximum" /><Metric value={`${Math.round(selected.summary.averageCadenceRpm ?? 0)}`} unit="rpm average" /><DistanceMetric meters={selected.summary.estimatedDistanceMeters} unit={profile.distanceUnit} /></div><p className="distance-note">Estimated distance · {distanceSourceLabel(selected.summary.distanceSource)}</p><div className="history-charts"><h3>Power</h3><SessionAreaChart samples={detailSamples} dataKey="powerWatts" unit="W" color="#c8ff32" name="Power" domain={powerDomain}/><h3>Heart rate</h3><SessionAreaChart samples={detailSamples} dataKey="heartRateBpm" unit="bpm" color="#ff6f7d" name="Heart rate" domain={heartRateDomain}/><div className="zone-chart-grid history-zone-charts"><TimeInZoneChart title="Power zones" zones={powerZones} seconds={detailPowerSeconds}/><TimeInZoneChart title="Heart-rate zones" zones={heartRateZones} seconds={detailHeartRateSeconds}/></div></div><div className="detail-actions"><button className="primary" onClick={() => onGarmin(selected.summary)}><Upload size={16}/> Upload to Garmin</button><button className="secondary" onClick={() => onExportFit(selected.summary)}><Download size={16}/> Export FIT</button><button className="secondary" onClick={() => onExport(selected.summary)}><Download size={16}/> Export CSV</button></div><p className="handoff-note">Garmin Connect and Finder will open. Drag the selected FIT file onto Garmin’s import page, then confirm the upload.</p></div></div>}
     </>
   );
 }
@@ -1485,6 +1511,10 @@ export function SettingsPage({
   );
 }
 
+type ChartDomain = [number | string, number | string];
+const powerDomain: ChartDomain = [0, "dataMax + 50"];
+const heartRateDomain: ChartDomain = ["dataMin - 10", "dataMax + 10"];
+
 const zoneColors = [
   "#6ca8ff",
   "#63d6c6",
@@ -1498,7 +1528,7 @@ const zoneColors = [
   "#ffffff",
 ];
 
-function SessionAreaChart({
+const SessionAreaChart = memo(function SessionAreaChart({
   samples,
   dataKey,
   unit,
@@ -1511,7 +1541,7 @@ function SessionAreaChart({
   unit: string;
   color: string;
   name: string;
-  domain: [number | string, number | string];
+  domain: ChartDomain;
 }) {
   const gradientId = `fill-${dataKey}`;
   return (
@@ -1547,9 +1577,9 @@ function SessionAreaChart({
       </AreaChart>
     </ResponsiveContainer>
   );
-}
+});
 
-function TimeInZoneChart({
+const TimeInZoneChart = memo(function TimeInZoneChart({
   title,
   zones,
   seconds,
@@ -1578,7 +1608,7 @@ function TimeInZoneChart({
       </ResponsiveContainer>
     </div>
   );
-}
+});
 
 function ZoneEditor({
   title,
