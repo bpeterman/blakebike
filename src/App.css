@@ -363,6 +363,17 @@ textarea { min-height: 70px; resize: vertical; }
 .detail-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 9px; }
 .history-charts { display: grid; gap: 4px; }
 .history-charts h3 { margin: 12px 0 0; font-size: 14px; }
+
+/* Press-and-drag range selection on the ride history charts. */
+.session-chart-selectable { cursor: crosshair; user-select: none; -webkit-user-select: none; }
+/* Recharts focuses the chart on every press for keyboard support; only keyboard focus needs the ring. */
+.session-chart-selectable [tabindex]:focus:not(:focus-visible) { outline: none; }
+.range-hint { margin: 6px 0 0; color: #7f887a; font-size: 11px; }
+.range-summary { display: grid; grid-template-columns: minmax(150px, auto) repeat(6, minmax(0, 1fr)) auto; align-items: center; gap: 10px; margin: 8px 0 4px; padding: 12px 14px; border-radius: 9px; background: #222620; }
+.range-summary-span { display: grid; gap: 2px; }
+.range-summary-span strong { font-size: 13px; }
+.range-summary-span span:last-child { color: #737b6e; font-size: 9px; text-transform: uppercase; letter-spacing: .08em; }
+.range-summary .secondary { min-height: 30px; padding: 0 12px; }
 .history-zone-charts { margin: 14px 0 4px; }
 .history-zone-charts .zone-chart h3 { margin-top: 2px; }
 .handoff-note { margin: 8px 0 0; color: #7f887a; font-size: 11px; text-align: right; }
@@ -404,6 +415,8 @@ textarea { min-height: 70px; resize: vertical; }
   .timeline-heading { align-items: start; }
   .timeline-countdowns { gap: 18px; }
   .zone-chart-grid { grid-template-columns: 1fr; }
+  .range-summary { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .range-summary-span, .range-summary .secondary { grid-column: 1 / -1; justify-self: start; }
   .detail-header { grid-template-columns: 1fr; align-items: start; gap: 14px; }
   .detail-actions { justify-content: flex-start; }
   .handoff-note { text-align: left; }

@@ -12,6 +12,8 @@ FTMS smart trainers. The initial target platforms are macOS and Ubuntu/Pop!_OS
 - Structured workout editor with steady, ramp, free-ride, and imported repeat blocks
 - ZWO import/export, rider FTP and safety power limit
 - Crash-resistant SQLite ride recording, history charts, and CSV/FIT export
+- Drag across a ride history chart to see average, maximum, and minimum
+  power and heart rate for that section
 - Persistent Garmin-compatible Ride Files with a guided Garmin Connect handoff
 - Estimated indoor distance from trainer speed or a flat-road power model
 - Independent kg/lb and km/mi display preferences with metric backend storage
