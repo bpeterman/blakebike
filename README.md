@@ -16,6 +16,16 @@ FTMS smart trainers. The initial target platforms are macOS and Ubuntu/Pop!_OS
 - Estimated indoor distance from trainer speed or a flat-road power model
 - Independent kg/lb and km/mi display preferences with metric backend storage
 
+## Installing a release
+
+Downloads live on the [releases page](https://github.com/bpeterman/blakebike/releases).
+The macOS dmg is not notarized yet, so the first launch needs a nudge:
+right-click **blake.bike.app** in Applications and choose **Open**, then confirm.
+macOS only asks once.
+
+Every release is described in [CHANGELOG.md](CHANGELOG.md), and the same notes
+are visible in the app under Settings, on the About card.
+
 ## Development
 
 Requirements: Node 22 (`nvm use` reads `.nvmrc`), pnpm 12 (`corepack enable`
@@ -109,6 +119,7 @@ RUST_LOG=trace pnpm tauri dev
 ## Verification
 
 ```sh
+pnpm release:check
 pnpm check
 pnpm test
 pnpm build
@@ -126,3 +137,8 @@ is saved. Save failures do not report an unqualified successful completion.
 Hardware verification should cover discovery, control acquisition, steady and
 ramp targets, pause/resume, skip, disconnect, app quit, and ride recovery on
 both target operating-system families.
+
+## Releasing
+
+See [docs/releasing.md](docs/releasing.md) for the versioning scheme, how release
+notes are written, and how tagging publishes the dmg.

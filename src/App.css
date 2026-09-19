@@ -534,3 +534,18 @@ textarea { min-height: 70px; resize: vertical; }
 .device-make { color: #7e8778; font-size: 11px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .device-make-inline { margin-left: 8px; color: #7e8778; font-size: 11px; font-style: normal; font-weight: 500; }
 .settings-note { margin: 0; font-size: 12px; }
+
+.about-card .settings-actions { align-content: start; }
+.about-card button { display: inline-flex; align-items: center; gap: 7px; }
+.release-notes-modal { width: min(680px, 95vw); }
+.release-list { display: grid; gap: 22px; margin: 20px 0; }
+.release-entry { display: grid; gap: 10px; padding-top: 18px; border-top: 1px solid #2c322a; }
+.release-entry:first-child { padding-top: 0; border-top: 0; }
+.release-entry header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px; }
+.release-entry h3 { display: flex; align-items: center; gap: 9px; margin: 0; font-size: 19px; }
+.release-installed { padding: 3px 8px; border: 1px solid #43552f; border-radius: 999px; color: #bfd19f; background: #20291a; font-size: 10px; font-weight: 700; letter-spacing: .08em; }
+.release-date { color: #7e8778; font-size: 12px; }
+.release-summary { margin: 0; color: #c9d0c3; font-size: 13px; }
+.release-section { display: grid; gap: 6px; }
+.release-section ul { margin: 0; padding-left: 18px; display: grid; gap: 5px; }
+.release-section li { color: #b9c2b3; font-size: 13px; }
