@@ -94,6 +94,8 @@ import { isConnected as slotConnected, sourceNote } from "./devices";
 import { SourceSelect } from "./SourceSelect";
 import { defaultSourcePreferences, withSourcePreference } from "./sourcePreferences";
 import { shouldPromptForPostRide } from "./postRide";
+import { ConfirmDialog } from "./ConfirmDialog";
+import { useDialog } from "./useDialog";
 import "./App.css";
 
 type Page = "home" | "workouts" | "devices" | "ride" | "history" | "settings";
@@ -103,6 +105,9 @@ type PostRidePromptState = {
   errorMessage: string | null;
   saveWarning: string | null;
 };
+
+type UndoToastState = { message: string; action: () => Promise<void> };
+type FeedbackState = { kind: "working" | "success"; message: string };
 
 const LOG_LINES_KEPT = 200;
 
@@ -142,6 +147,10 @@ function App() {
   );
   const [postRidePrompt, setPostRidePrompt] =
     useState<PostRidePromptState | null>(null);
+  const [feedback, setFeedback] = useState<FeedbackState | null>(null);
+  const [undoToast, setUndoToast] = useState<UndoToastState | null>(null);
+  const [endRideConfirm, setEndRideConfirm] = useState(false);
+  const [endingRide, setEndingRide] = useState(false);
   const importRef = useRef<HTMLInputElement>(null);
   const runnerRef = useRef<RunnerState>(runner);
   const liveSessionRef = useRef<string | null>(null);
@@ -256,10 +265,21 @@ function App() {
         void api.sessions().then(setSessions);
       }
       if (shouldPromptForPostRide(previousState, state)) {
-        setPostRidePrompt({
-          sessionId: state.sessionId,
-          errorMessage: state.status === "error" ? state.message : null,
-          saveWarning: state.status === "finished" ? state.saveWarning ?? null : null,
+        const sessionId = state.sessionId;
+        const errorMessage = state.status === "error" ? state.message : null;
+        const saveWarning = state.status === "finished" ? state.saveWarning ?? null : null;
+        setPostRidePrompt(null);
+        void api.session(sessionId).then((session) => {
+          if (!session) {
+            setPostRidePrompt({ sessionId, errorMessage, saveWarning });
+            return;
+          }
+          setSelectedSession(session);
+          setPage("history");
+        }).catch(() => {
+          // If the saved ride cannot be loaded immediately, retain the
+          // existing recovery prompt so the rider can try again.
+          setPostRidePrompt({ sessionId, errorMessage, saveWarning });
         });
       }
     }));
@@ -305,16 +325,51 @@ function App() {
   const riding = runner.status === "running" || runner.status === "paused";
 
   const perform = useCallback(async (action: () => Promise<unknown>, label = "user action") => {
+    const visibleFeedback = !label.startsWith("load ");
     try {
       setError(null);
       setNotice(null);
-      await action();
+      if (visibleFeedback) setFeedback({ kind: "working", message: workingCopy(label) });
+      const result = await action();
+      if (visibleFeedback) {
+        setFeedback(result === false || result === null
+          ? null
+          : { kind: "success", message: successCopy(label) });
+      }
     } catch (cause) {
       const message = messageOf(cause);
+      setFeedback(null);
       setError(message);
       void api.reportError(label, message).catch(() => undefined);
+    } finally {
+      // Scan-level state (including the optional ANT adapter) is not tied to a
+      // role slot event, so refresh the compact hub snapshot after actions.
+      void api.devicesSnapshot().then(setHub).catch(() => undefined);
     }
   }, []);
+
+  useEffect(() => {
+    if (feedback?.kind !== "success") return;
+    const timer = window.setTimeout(() => setFeedback(null), 2_600);
+    return () => window.clearTimeout(timer);
+  }, [feedback]);
+
+  useEffect(() => {
+    if (!undoToast) return;
+    const timer = window.setTimeout(() => setUndoToast(null), 8_000);
+    return () => window.clearTimeout(timer);
+  }, [undoToast]);
+
+  const offerUndo = useCallback((message: string, action: () => Promise<void>) => {
+    setUndoToast({ message, action });
+  }, []);
+
+  const runUndo = async () => {
+    const pending = undoToast;
+    if (!pending) return;
+    setUndoToast(null);
+    await perform(pending.action, "restore removed item");
+  };
 
   // The smoothing choice is remembered across launches; apply it at once and
   // save in the background so the toggle never feels laggy.
@@ -413,7 +468,7 @@ function App() {
                   {runner.status === "paused" ? <Play /> : <Pause />}
                   {runner.status === "paused" ? "Resume" : "Pause"}
                 </button>
-                <button className="stop" onClick={() => void perform(() => api.stopWorkout(), "stop workout")}>
+                <button className="stop" onClick={() => setEndRideConfirm(true)}>
                   <CircleStop /> End
                 </button>
               </div>
@@ -473,6 +528,7 @@ function App() {
             onConnect={setDevicePicker}
             onCalibrate={() => setCalibrationOpen(true)}
             onSourcePreference={changeSourcePreference}
+            onOfferUndo={offerUndo}
             perform={perform}
           />
         )}
@@ -487,6 +543,10 @@ function App() {
               void perform(async () => {
                 await api.deleteWorkout(workout.id);
                 setWorkouts(await api.workouts());
+                offerUndo(`“${workout.name}” deleted.`, async () => {
+                  await api.saveWorkout(workout);
+                  setWorkouts(await api.workouts());
+                });
               }, "delete workout")
             }
             onExport={(workout) => void perform(() => api.exportZwo(workout), "export zwo")}
@@ -497,6 +557,7 @@ function App() {
                   const label = result.exportedCount === 1 ? "workout" : "workouts";
                   setNotice(`Exported ${result.exportedCount} ${label} to ${result.directory}`);
                 }
+                return false;
               }, "export workout library")
             }
             onImport={() => importRef.current?.click()}
@@ -519,6 +580,7 @@ function App() {
             profile={profile}
             trainingZones={trainingZones}
             displayPreferences={rideDisplayPreferences}
+            onBrowseWorkouts={() => setPage("workouts")}
             perform={perform}
           />
         )}
@@ -571,7 +633,13 @@ function App() {
                 setRideDisplayPreferences(normalized);
               }, "save ride layout")
             }
-            onForgetDevices={() => perform(() => api.forgetAllDevices(), "forget all devices")}
+            onForgetDevices={() => perform(async () => {
+              const remembered = await api.knownDevices();
+              await api.forgetAllDevices();
+              if (remembered.length > 0) {
+                offerUndo(`${remembered.length} remembered ${remembered.length === 1 ? "device" : "devices"} removed.`, () => api.restoreKnownDevices(remembered));
+              }
+            }, "forget all devices")}
             onDevMode={(enabled) =>
               void perform(async () => {
                 await api.saveDevMode(enabled);
@@ -583,14 +651,15 @@ function App() {
         {page !== "ride" && riding && runner.recordingWarning && <RecordingWarning message={runner.recordingWarning} />}
       </main>
 
+      <div className="toast-stack" aria-live="polite">
       {error && (
-        <div className="toast error-toast">
+        <div className="toast error-toast" role="alert">
           <span>{error}</span>
           <button onClick={() => setError(null)} aria-label="Dismiss error"><X size={17} /></button>
         </div>
       )}
       {notice && (
-        <div className="toast success-toast">
+        <div className="toast success-toast" role="status">
           <span>{notice}</span>
           <button onClick={() => setNotice(null)} aria-label="Dismiss notification"><X size={17} /></button>
         </div>
@@ -603,11 +672,43 @@ function App() {
           onDismiss={() => setPostRidePrompt(null)}
         />
       )}
+      {feedback && (
+        <div className={`toast action-toast ${feedback.kind === "working" ? "working-toast" : "success-toast"}`} role="status">
+          {feedback.kind === "working" ? <span className="mini-spinner" aria-hidden="true" /> : <span className="success-mark" aria-hidden="true">✓</span>}
+          <span>{feedback.message}</span>
+        </div>
+      )}
+      {undoToast && (
+        <div className="toast undo-toast" role="status">
+          <span>{undoToast.message}</span>
+          <button className="undo-button" onClick={() => void runUndo()}>Undo</button>
+          <button onClick={() => setUndoToast(null)} aria-label="Dismiss undo"><X size={17} /></button>
+        </div>
+      )}
+      </div>
+      {endRideConfirm && (
+        <ConfirmDialog
+          title="End this ride?"
+          description="Your progress will be saved and the trainer target will be released. You can’t resume this ride afterward."
+          confirmLabel="End and save ride"
+          busyLabel="Ending ride…"
+          busy={endingRide}
+          onClose={() => setEndRideConfirm(false)}
+          onConfirm={() => {
+            setEndingRide(true);
+            void perform(async () => { await api.stopWorkout(); return false; }, "stop workout").finally(() => {
+              setEndingRide(false);
+              setEndRideConfirm(false);
+            });
+          }}
+        />
+      )}
       {devicePicker && (
         <DevicePicker
           role={devicePicker}
           slot={hub?.slots.find((slot) => slot.role === devicePicker)}
           scanError={hub?.scanError ?? null}
+          antAdapter={hub?.antAdapter}
           close={() => setDevicePicker(null)}
           perform={perform}
         />
@@ -775,7 +876,17 @@ export function WorkoutLibrary({
         <button className="secondary" disabled={workouts.length === 0} onClick={onExportAll}><Download size={16} /> Export all ZWO</button>
         <button className="primary" onClick={onCreate}><Plus size={17} /> New workout</button>
       </>} />
-      <div className="library-grid">
+      {workouts.length === 0 ? (
+        <div className="empty-state card friendly-empty">
+          <Library size={36} />
+          <h2>Your next ride starts here</h2>
+          <p>Create a workout from scratch or import a ZWO file you already love.</p>
+          <div className="empty-actions">
+            <button className="primary" onClick={onCreate}><Plus size={17} /> Create a workout</button>
+            <button className="secondary" onClick={onImport}><Upload size={16} /> Import ZWO</button>
+          </div>
+        </div>
+      ) : <div className="library-grid">
         {workouts.map((workout, index) => (
           <article className="card library-card" key={workout.id}>
             <button className="workout-visual-button" onClick={() => onEdit(workout)}>
@@ -788,13 +899,13 @@ export function WorkoutLibrary({
               <div className="chips"><span>{workout.steps.length} blocks</span><span>{ftp} W FTP</span></div>
               <div className="card-actions">
                 <button className="primary" onClick={() => onRide(workout.id)}><Play size={15} fill="currentColor" /> Ride</button>
-                <button className="icon-button" onClick={() => onExport(workout)} title="Export ZWO"><Download size={17} /></button>
-                <button className="icon-button danger" onClick={() => onDelete(workout)} title="Delete"><Trash2 size={17} /></button>
+                <button className="icon-button" onClick={() => onExport(workout)} title="Export ZWO" aria-label={`Export ${workout.name} as ZWO`}><Download size={17} /></button>
+                <button className="icon-button danger" onClick={() => onDelete(workout)} title="Delete" aria-label={`Delete ${workout.name}`}><Trash2 size={17} /></button>
               </div>
             </div>
           </article>
         ))}
-      </div>
+      </div>}
     </>
   );
 }
@@ -815,6 +926,7 @@ export function Ride({
   profile,
   trainingZones,
   displayPreferences,
+  onBrowseWorkouts = () => undefined,
   perform,
 }: {
   workouts: Workout[];
@@ -832,6 +944,7 @@ export function Ride({
   profile: Profile;
   trainingZones: TrainingZoneSettings;
   displayPreferences: RideDisplayPreferences;
+  onBrowseWorkouts?: () => void;
   perform: (action: () => Promise<unknown>, label?: string) => Promise<void>;
 }) {
   const [targetDraft, setTargetDraft] = useState("100");
@@ -1052,8 +1165,8 @@ export function Ride({
                       : `Plan ${plannedTarget} W`}
             </span>
             {overrideActive && (
-              <button type="button" className="text-button" disabled={runner.status !== "running"} onClick={() => void backToPlan()}>
-                Back to plan
+              <button type="button" className="secondary override-reset" disabled={runner.status !== "running"} onClick={() => void backToPlan()}>
+                Reset override{plannedTarget !== null ? ` · ${plannedTarget} W` : ""}
               </button>
             )}
             <div className="bias-stepper" aria-label="Workout bias">
@@ -1191,7 +1304,13 @@ export function Ride({
             <div className="setup-divider"><span>OR CHOOSE A WORKOUT</span></div>
             <span className="label">SELECT WORKOUT</span>
             <div className="select-list">
-              {workouts.map((workout) => <button key={workout.id} className={selectedWorkout === workout.id ? "selected" : ""} onClick={() => setSelectedWorkout(workout.id)}>
+              {workouts.length === 0 ? (
+                <div className="ride-empty-workouts">
+                  <strong>No workouts saved yet</strong>
+                  <span>Create one or import a ZWO file, then come back when you’re ready.</span>
+                  <button className="secondary" onClick={onBrowseWorkouts}>Open workout library</button>
+                </div>
+              ) : workouts.map((workout) => <button key={workout.id} className={selectedWorkout === workout.id ? "selected" : ""} aria-pressed={selectedWorkout === workout.id} onClick={() => setSelectedWorkout(workout.id)}>
                 <div><strong>{workout.name}</strong><span>{formatDuration(workoutDuration(workout.steps))}</span></div><WorkoutBars steps={workout.steps} /></button>)}
             </div>
             <button className="primary start-button" disabled={!connected || !selectedWorkout} onClick={() => selectedWorkout && void perform(() => api.startWorkout(selectedWorkout), "start workout")}><Play fill="currentColor" /> Start workout</button>
@@ -1260,8 +1379,8 @@ export function PostRidePrompt({ errorMessage, saveWarning = null, onView, onDis
   return (
     <div className={warning ? "toast post-ride-prompt error-toast" : "toast post-ride-prompt success-toast"} role={warning ? "alert" : "status"}>
       <div className="post-ride-copy">
-        <strong>{saveWarning ? "Ride ended with a save problem" : errorMessage ? "Ride ended" : "Ride saved"}</strong>
-        <span>{warning ?? "Your ride metrics are ready to review."}</span>
+        <strong>{saveWarning ? "Ride ended with a save problem" : errorMessage ? "Ride ended" : "Ride saved. Nice work!"}</strong>
+        <span>{warning ?? "Your effort is safely recorded and ready to review."}</span>
       </div>
       <div className="post-ride-actions">
         <button className="primary" onClick={onView}>View ride metrics</button>
@@ -1272,6 +1391,7 @@ export function PostRidePrompt({ errorMessage, saveWarning = null, onView, onDis
 }
 
 export function RideDetailModal({ session, profile, trainingZones, onClose, onExport, onExportFit, onGarmin }: { session: SessionDetail; profile: Profile; trainingZones: TrainingZoneSettings; onClose: () => void; onExport: (session: SessionSummary) => void; onExportFit: (session: SessionSummary) => void; onGarmin: (session: SessionSummary) => void }) {
+  const dialogRef = useDialog<HTMLDivElement>(onClose);
   const powerZones = useMemo(
     () => effectivePowerZones(trainingZones, profile.ftpWatts),
     [profile.ftpWatts, trainingZones],
@@ -1293,13 +1413,15 @@ export function RideDetailModal({ session, profile, trainingZones, onClose, onEx
     [heartRateZones, session],
   );
   return (
-    <div className="modal-backdrop">
-      <div className="modal detail-modal">
+    <div className="modal-backdrop dialog-enter" role="presentation" onMouseDown={(event) => {
+      if (event.target === event.currentTarget) onClose();
+    }}>
+      <div ref={dialogRef} className="modal detail-modal" role="dialog" aria-modal="true" aria-labelledby="ride-detail-title" tabIndex={-1}>
         <button className="modal-close" onClick={onClose} aria-label="Close ride detail"><X /></button>
         <div className="detail-header">
           <div>
             <span className="label">RIDE DETAIL</span>
-            <h2>{session.summary.workoutName}</h2>
+            <h2 id="ride-detail-title">{session.summary.workoutName}</h2>
             <p>{new Date(session.summary.startedAt).toLocaleString()}</p>
           </div>
           <div className="detail-action-block">
@@ -1460,10 +1582,10 @@ export function SettingsPage({
       <PageHeader eyebrow="LOCAL PROFILE" title="Settings" />
       <section className="card settings-card"><div><span className="label">RIDER PROFILE</span><h2>Training and distance</h2><p>Your weight and bike weight support flat-road distance estimates when the trainer does not report speed. Values are stored in kilograms regardless of display units.</p></div><form onSubmit={(event) => { event.preventDefault(); onSave(draft); }}>
         <label>Rider name<input value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })}/></label>
-        <div className="form-row"><label>FTP (watts)<input type="number" min="50" max="500" value={draft.ftpWatts} onChange={(event) => setDraft({ ...draft, ftpWatts: Number(event.target.value) })}/></label><label>Maximum heart rate (bpm)<input type="number" min="100" max="230" value={draft.maxHeartRateBpm} onChange={(event) => setDraft({ ...draft, maxHeartRateBpm: Number(event.target.value) })}/></label></div>
-        <label>Safety power limit<input type="number" min="100" max="2500" value={draft.maxPowerWatts} onChange={(event) => setDraft({ ...draft, maxPowerWatts: Number(event.target.value) })}/></label>
+        <div className="form-row"><label>FTP (watts)<EditableNumberInput min={50} max={500} value={draft.ftpWatts} onValueChange={(ftpWatts) => setDraft({ ...draft, ftpWatts })}/></label><label>Maximum heart rate (bpm)<EditableNumberInput min={100} max={230} value={draft.maxHeartRateBpm} onValueChange={(maxHeartRateBpm) => setDraft({ ...draft, maxHeartRateBpm })}/></label></div>
+        <label>Safety power limit<EditableNumberInput min={100} max={2500} value={draft.maxPowerWatts} onValueChange={(maxPowerWatts) => setDraft({ ...draft, maxPowerWatts })}/></label>
         <div className="form-row"><label>Weight unit<select value={draft.weightUnit} onChange={(event) => setDraft({ ...draft, weightUnit: event.target.value as Profile["weightUnit"] })}><option value="kg">Kilograms (kg)</option><option value="lb">Pounds (lb)</option></select></label><label>Distance unit<select value={draft.distanceUnit} onChange={(event) => setDraft({ ...draft, distanceUnit: event.target.value as Profile["distanceUnit"] })}><option value="km">Kilometers</option><option value="mi">Miles</option></select></label></div>
-        <div className="form-row"><label>Rider weight ({draft.weightUnit})<input type="number" step="0.1" min={draft.weightUnit === "lb" ? 66 : 30} max={draft.weightUnit === "lb" ? 551 : 250} value={displayedWeight(draft.riderWeightKg, draft.weightUnit)} onChange={(event) => setDraft({ ...draft, riderWeightKg: storedWeight(Number(event.target.value), draft.weightUnit) })}/></label><label>Bike weight ({draft.weightUnit})<input type="number" step="0.1" min={draft.weightUnit === "lb" ? 7 : 3} max={draft.weightUnit === "lb" ? 88 : 40} value={displayedWeight(draft.bikeWeightKg, draft.weightUnit)} onChange={(event) => setDraft({ ...draft, bikeWeightKg: storedWeight(Number(event.target.value), draft.weightUnit) })}/></label></div>
+        <div className="form-row"><label>Rider weight ({draft.weightUnit})<EditableNumberInput step={0.1} min={draft.weightUnit === "lb" ? 66 : 30} max={draft.weightUnit === "lb" ? 551 : 250} value={displayedWeight(draft.riderWeightKg, draft.weightUnit)} onValueChange={(value) => setDraft({ ...draft, riderWeightKg: storedWeight(value, draft.weightUnit) })}/></label><label>Bike weight ({draft.weightUnit})<EditableNumberInput step={0.1} min={draft.weightUnit === "lb" ? 7 : 3} max={draft.weightUnit === "lb" ? 88 : 40} value={displayedWeight(draft.bikeWeightKg, draft.weightUnit)} onValueChange={(value) => setDraft({ ...draft, bikeWeightKg: storedWeight(value, draft.weightUnit) })}/></label></div>
         <button className="primary" type="submit">Save settings</button>
       </form></section>
       <section className="card settings-card">
@@ -1814,13 +1936,12 @@ function ZoneEditor({
             ) : (
               <label>
                 up to
-                <input
+                <EditableNumberInput
                   aria-label={`${title} zone ${index + 1} upper bound`}
-                  type="number"
                   min={unit === "W" ? 1 : 30}
                   max={unit === "W" ? 3000 : 250}
                   value={zone.upperBound}
-                  onChange={(event) => update(index, { upperBound: Number(event.target.value) })}
+                  onValueChange={(upperBound) => update(index, { upperBound })}
                 />
                 {unit}
               </label>
@@ -1834,20 +1955,81 @@ function ZoneEditor({
 
 function WorkoutEditor({ initial, close, save }: { initial: Workout; close: () => void; save: (workout: Workout) => void }) {
   const [workout, setWorkout] = useState(structuredClone(initial));
+  const dialogRef = useDialog<HTMLDivElement>(close);
   const updateStep = (index: number, patch: Partial<WorkoutStep>) => setWorkout({ ...workout, steps: workout.steps.map((step, stepIndex) => stepIndex === index ? { ...step, ...patch } as WorkoutStep : step) });
   const addStep = (kind: "steady" | "ramp" | "freeRide") => {
     const step: WorkoutStep = kind === "steady" ? { kind, durationSeconds: 300, target: { unit: "percentFtp", value: 75 } } : kind === "ramp" ? { kind, durationSeconds: 300, start: { unit: "percentFtp", value: 50 }, end: { unit: "percentFtp", value: 90 } } : { kind, durationSeconds: 300 };
     setWorkout({ ...workout, steps: [...workout.steps, step] });
   };
-  return <div className="modal-backdrop"><div className="modal editor-modal"><button className="modal-close" onClick={close}><X /></button><span className="label">WORKOUT BUILDER</span><div className="editor-title"><input value={workout.name} onChange={(event) => setWorkout({ ...workout, name: event.target.value })}/><strong>{formatDuration(workoutDuration(workout.steps))}</strong></div><textarea placeholder="Workout description" value={workout.description} onChange={(event) => setWorkout({ ...workout, description: event.target.value })}/>
-    <div className="step-list">{workout.steps.map((step, index) => <div className="step-editor" key={`${index}-${step.kind}`}><span className={`step-kind ${step.kind}`}>{step.kind === "freeRide" ? "FREE" : step.kind.toUpperCase()}</span><label>Duration (sec)<input type="number" min="1" value={step.kind === "repeat" ? workoutDuration(step.steps) : step.durationSeconds} disabled={step.kind === "repeat"} onChange={(event) => updateStep(index, { durationSeconds: Number(event.target.value) } as Partial<WorkoutStep>)}/></label>{step.kind === "steady" && <TargetInput label="Power (% FTP)" target={step.target} onChange={(target) => updateStep(index, { target })}/>} {step.kind === "ramp" && <><TargetInput label="Start (% FTP)" target={step.start} onChange={(start) => updateStep(index, { start })}/><TargetInput label="End (% FTP)" target={step.end} onChange={(end) => updateStep(index, { end })}/></>} {step.kind === "repeat" && <span className="repeat-summary">{step.repetitions}× repeat group</span>}<button className="icon-button danger" onClick={() => setWorkout({ ...workout, steps: workout.steps.filter((_, stepIndex) => stepIndex !== index) })}><Trash2 size={16}/></button></div>)}</div>
+  return <div className="modal-backdrop dialog-enter" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) close(); }}><div ref={dialogRef} className="modal editor-modal" role="dialog" aria-modal="true" aria-labelledby="workout-builder-heading" tabIndex={-1}><button className="modal-close" onClick={close} aria-label="Close workout builder"><X /></button><span className="label">WORKOUT BUILDER</span><h2 id="workout-builder-heading" className="sr-only">Workout builder</h2><div className="editor-title"><label className="sr-only" htmlFor="workout-builder-title">Workout name</label><input id="workout-builder-title" aria-label="Workout name" value={workout.name} onChange={(event) => setWorkout({ ...workout, name: event.target.value })}/><strong>{formatDuration(workoutDuration(workout.steps))}</strong></div><textarea aria-label="Workout description" placeholder="Workout description" value={workout.description} onChange={(event) => setWorkout({ ...workout, description: event.target.value })}/>
+    <div className="step-list">{workout.steps.map((step, index) => <div className="step-editor" key={`${index}-${step.kind}`}><span className={`step-kind ${step.kind}`}>{step.kind === "freeRide" ? "FREE" : step.kind.toUpperCase()}</span><label>Duration (sec)<EditableNumberInput min={1} value={step.kind === "repeat" ? workoutDuration(step.steps) : step.durationSeconds} disabled={step.kind === "repeat"} onValueChange={(durationSeconds) => updateStep(index, { durationSeconds } as Partial<WorkoutStep>)}/></label>{step.kind === "steady" && <TargetInput label="Power (% FTP)" target={step.target} onChange={(target) => updateStep(index, { target })}/>} {step.kind === "ramp" && <><TargetInput label="Start (% FTP)" target={step.start} onChange={(start) => updateStep(index, { start })}/><TargetInput label="End (% FTP)" target={step.end} onChange={(end) => updateStep(index, { end })}/></>} {step.kind === "repeat" && <span className="repeat-summary">{step.repetitions}× repeat group</span>}<button className="icon-button danger" aria-label={`Remove block ${index + 1}`} onClick={() => setWorkout({ ...workout, steps: workout.steps.filter((_, stepIndex) => stepIndex !== index) })}><Trash2 size={16}/></button></div>)}</div>
     <div className="add-steps"><span>Add block</span><button onClick={() => addStep("steady")}><Plus/>Steady</button><button onClick={() => addStep("ramp")}><Plus/>Ramp</button><button onClick={() => addStep("freeRide")}><Plus/>Free ride</button></div>
     <div className="editor-actions"><button className="secondary" onClick={close}>Cancel</button><button className="primary" disabled={!workout.name.trim() || workout.steps.length === 0} onClick={() => save(workout)}>Save workout</button></div>
   </div></div>;
 }
 
 function TargetInput({ label, target, onChange }: { label: string; target: { unit: "watts" | "percentFtp"; value: number }; onChange: (target: { unit: "watts" | "percentFtp"; value: number }) => void }) {
-  return <label>{label}<input type="number" min="1" max="300" value={target.unit === "percentFtp" ? target.value : target.value} onChange={(event) => onChange({ unit: "percentFtp", value: Number(event.target.value) })}/></label>;
+  return <label>{label}<EditableNumberInput min={1} max={300} value={target.value} onValueChange={(value) => onChange({ unit: "percentFtp", value })}/></label>;
+}
+
+export function EditableNumberInput({
+  value,
+  onValueChange,
+  min,
+  max,
+  step,
+  disabled,
+  "aria-label": ariaLabel,
+}: {
+  value: number;
+  onValueChange: (value: number) => void;
+  min?: number;
+  max?: number;
+  step?: number;
+  disabled?: boolean;
+  "aria-label"?: string;
+}) {
+  const [text, setText] = useState(String(value));
+  const focused = useRef(false);
+
+  useEffect(() => {
+    if (!focused.current) setText(String(value));
+  }, [value]);
+
+  const commit = () => {
+    focused.current = false;
+    const parsed = Number(text);
+    if (text.trim() === "" || !Number.isFinite(parsed)) {
+      setText(String(value));
+      return;
+    }
+    onValueChange(parsed);
+    setText(String(parsed));
+  };
+
+  return (
+    <input
+      type="number"
+      min={min}
+      max={max}
+      step={step}
+      disabled={disabled}
+      aria-label={ariaLabel}
+      value={text}
+      onFocus={() => { focused.current = true; }}
+      onChange={(event) => {
+        const next = event.target.value;
+        setText(next);
+        if (next.trim() === "") return;
+        const parsed = Number(next);
+        if (Number.isFinite(parsed)) onValueChange(parsed);
+      }}
+      onBlur={commit}
+      onKeyDown={(event) => {
+        if (event.key === "Enter") event.currentTarget.blur();
+      }}
+    />
+  );
 }
 
 function WorkoutTimeline({
@@ -1988,4 +2170,28 @@ function newWorkout(): Workout {
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function workingCopy(label: string) {
+  if (label.includes("connect")) return "Connecting…";
+  if (label.includes("scan")) return "Looking for devices…";
+  if (label.includes("export")) return "Preparing export…";
+  if (label.includes("refresh")) return "Refreshing training settings…";
+  if (label.includes("stop workout")) return "Saving your ride…";
+  if (label.includes("save")) return "Saving…";
+  if (label.includes("delete") || label.includes("forget")) return "Removing…";
+  if (label.includes("restore")) return "Restoring…";
+  return "Working…";
+}
+
+function successCopy(label: string) {
+  if (label.includes("connect")) return label.includes("disconnect") ? "Disconnected" : "Connected and ready";
+  if (label.includes("scan")) return "Scan complete";
+  if (label.includes("export")) return "Export ready";
+  if (label.includes("refresh")) return "Training settings refreshed";
+  if (label.includes("stop workout")) return "Ride saved. Nice work!";
+  if (label.includes("save")) return "Saved";
+  if (label.includes("delete") || label.includes("forget")) return "Removed";
+  if (label.includes("restore")) return "Restored";
+  return "Done";
 }

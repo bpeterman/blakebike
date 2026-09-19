@@ -28,7 +28,19 @@
     "targets": ["app", "dmg", "appimage", "deb"],
     "category": "Healthcare and Fitness",
     "shortDescription": "Local-first smart trainer workouts",
-    "longDescription": "Create and ride structured workouts with an FTMS Bluetooth smart trainer.",
+    "longDescription": "Create and ride structured workouts with an FTMS Bluetooth smart trainer and BLE or ANT+ heart-rate sensors.",
+    "linux": {
+      "deb": {
+        "files": {
+          "/lib/udev/rules.d/70-blakebike-ant.rules": "../resources/70-blakebike-ant.rules"
+        }
+      },
+      "appimage": {
+        "files": {
+          "/usr/share/blakebike/70-blakebike-ant.rules": "../resources/70-blakebike-ant.rules"
+        }
+      }
+    },
     "macOS": {
       "infoPlist": "Info.plist"
     },

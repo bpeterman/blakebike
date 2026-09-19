@@ -21,6 +21,7 @@ import {
   formatUptime,
   isConnected,
   makeAndModel,
+  transportLabel,
   metricsFedBy,
   readoutMark,
 } from "./devices";
@@ -30,6 +31,7 @@ import type {
   DeviceSlot,
   DeviceState,
   DevicesSnapshot,
+  AntAdapterStatus,
   KnownDevice,
   Metric,
   SourceChoice,
@@ -48,7 +50,7 @@ const roleIcon: Record<DeviceRole, typeof Activity> = {
 
 const roleBlurb: Record<DeviceRole, string> = {
   trainer: "FTMS smart trainer. Supplies power, cadence and speed, and takes ERG targets.",
-  heartRate: "Bluetooth heart-rate strap or optical sensor.",
+  heartRate: "Bluetooth or ANT+ heart-rate strap or optical sensor.",
   power: "Crank, pedal or hub power meter. Most also report cadence from crank data.",
   cadence: "Dedicated cadence sensor, or a power meter used for cadence only.",
 };
@@ -59,6 +61,7 @@ export function DevicesPage({
   onConnect,
   onCalibrate,
   onSourcePreference,
+  onOfferUndo = () => undefined,
   perform,
 }: {
   hub: DevicesSnapshot | null;
@@ -66,6 +69,7 @@ export function DevicesPage({
   onConnect: (role: DeviceRole) => void;
   onCalibrate: () => void;
   onSourcePreference: (metric: Metric, choice: SourceChoice) => void;
+  onOfferUndo?: (message: string, action: () => Promise<void>) => void;
   perform: (action: () => Promise<unknown>, label?: string) => Promise<void>;
 }) {
   const [known, setKnown] = useState<KnownDevice[]>([]);
@@ -92,12 +96,13 @@ export function DevicesPage({
   }, [hub]);
   const connectedCount = slots.filter((slot) => isConnected(slot.state)).length;
   const liveSources = sources ?? hub?.sources;
+  const antReady = hub?.antAdapter.status === "ready";
 
   return (
     <>
       <header className="page-header">
         <div>
-          <span>BLUETOOTH SENSORS</span>
+          <span>BIKE SENSORS</span>
           <h1>Devices</h1>
         </div>
         <div className="header-actions">
@@ -136,6 +141,7 @@ export function DevicesPage({
                     <strong>{device.name}</strong>
                     <span>
                       {deviceRoleLabel[device.role]}
+                      {!device.simulated && ` · ${transportLabel(device)}`}
                       {makeAndModel(device.manufacturer, device.model) && ` · ${makeAndModel(device.manufacturer, device.model)}`}
                       {device.simulated && " · simulated"}
                     </span>
@@ -152,6 +158,7 @@ export function DevicesPage({
                       onClick={() => void perform(() => api.connectDevice(device.role, {
                         id: device.id,
                         name: device.name,
+                        transport: device.transport,
                         simulated: device.simulated,
                         rssi: null,
                         capabilities: device.capabilities,
@@ -164,7 +171,14 @@ export function DevicesPage({
                     className="icon-button danger"
                     aria-label={`Forget ${device.name}`}
                     title="Forget this device"
-                    onClick={() => void perform(async () => { await api.forgetDevice(device.id); refreshKnown(); }, "forget device")}
+                    onClick={() => void perform(async () => {
+                      await api.forgetDevice(device.id);
+                      refreshKnown();
+                      onOfferUndo(`“${device.name}” forgotten.`, async () => {
+                        await api.restoreKnownDevices([device]);
+                        refreshKnown();
+                      });
+                    }, "forget device")}
                   >
                     <Trash2 size={16} />
                   </button>
@@ -185,6 +199,7 @@ export function DevicesPage({
             onConnect={() => onConnect(slot.role)}
             onCalibrate={onCalibrate}
             onDisconnect={() => void perform(() => api.disconnectDevice(slot.role), `disconnect ${slot.role}`)}
+            supportsAnt={slot.role === "heartRate" && antReady}
           />
         ))}
       </div>
@@ -211,6 +226,10 @@ export function DevicesPage({
           ))}
         </div>
       </section>
+
+      {hub && hub.antAdapter.status !== "notAttached" && (
+        <AntAdapterCard adapter={hub.antAdapter} />
+      )}
     </>
   );
 }
@@ -266,6 +285,7 @@ function DeviceCard({
   onConnect,
   onCalibrate,
   onDisconnect,
+  supportsAnt,
 }: {
   slot: DeviceSlot;
   now: number;
@@ -273,15 +293,23 @@ function DeviceCard({
   onConnect: () => void;
   onCalibrate: () => void;
   onDisconnect: () => void;
+  supportsAnt: boolean;
 }) {
   const [showLog, setShowLog] = useState(false);
   const Icon = roleIcon[slot.role];
   const connected = isConnected(slot.state);
+  const activeDevice = connected && (slot.state.status === "ready" || slot.state.status === "controlling")
+    ? slot.state.device
+    : null;
   const name = deviceName(slot.state);
   const { stats } = slot;
   const status = statusOf(slot.state, stats.reconnectAttempt ?? 0);
   const lastAge = stats.lastSampleMs ? now - stats.lastSampleMs : null;
   const stale = connected && lastAge !== null && lastAge > 5000;
+  const ConnectIcon = supportsAnt ? Radio : Bluetooth;
+  const battery = stats.batteryPercent !== null
+    ? `${stats.batteryPercent}%`
+    : stats.batteryStatus ?? (stats.batteryVoltage !== null ? `${stats.batteryVoltage.toFixed(2)} V` : "—");
 
   return (
     <section className={`card device-card ${status.tone}`}>
@@ -292,15 +320,18 @@ function DeviceCard({
         <div className="device-card-title">
           <span className="label">{deviceRoleLabel[slot.role].toUpperCase()}</span>
           <h3>{name ?? (slot.state.status === "connecting" || slot.state.status === "reconnecting" ? slot.state.name : "Not connected")}</h3>
-          {connected && makeAndModel(stats.manufacturer, stats.model) && (
-            <span className="device-make">{makeAndModel(stats.manufacturer, stats.model)}</span>
+          {activeDevice && (
+            <span className="device-make">
+              {activeDevice.simulated ? "Simulated" : transportLabel(activeDevice)}
+              {makeAndModel(stats.manufacturer, stats.model) && ` · ${makeAndModel(stats.manufacturer, stats.model)}`}
+            </span>
           )}
         </div>
         <span className={`status-chip ${status.tone}`}>{status.text}</span>
       </header>
 
       <div className="device-strip">
-        <Stat icon={BatteryMedium} label="Battery" value={stats.batteryPercent !== null ? `${stats.batteryPercent}%` : "—"} />
+        <Stat icon={BatteryMedium} label="Battery" value={battery} />
         <Stat icon={Radio} label="Signal" value={stats.rssi !== null ? `${stats.rssi} dBm` : "—"} />
         <Stat icon={Activity} label="Uptime" value={stats.connectedSinceMs ? formatUptime(now - stats.connectedSinceMs) : "—"} />
       </div>
@@ -356,8 +387,13 @@ function DeviceCard({
             <button className="danger-button" onClick={onDisconnect}>Disconnect</button>
           </>
         ) : (
-          <button className="primary" onClick={onConnect} disabled={slot.state.status === "connecting"}>
-            <Bluetooth size={15} /> {slot.state.status === "reconnecting" ? "Reconnect" : "Connect"}
+          <button
+            className="primary"
+            onClick={onConnect}
+            disabled={slot.state.status === "connecting"}
+            title={supportsAnt ? "Connect via Bluetooth or ANT+" : "Connect via Bluetooth"}
+          >
+            <ConnectIcon size={15} /> {slot.state.status === "reconnecting" ? "Reconnect" : "Connect"}
           </button>
         )}
         <button className="text-button log-toggle" onClick={() => setShowLog((open) => !open)}>
@@ -386,6 +422,28 @@ function DeviceCard({
           <LogReadout lines={slot.log} />
         </div>
       )}
+    </section>
+  );
+}
+
+function AntAdapterCard({ adapter }: { adapter: Exclude<AntAdapterStatus, { status: "notAttached" }> }) {
+  const ready = adapter.status === "ready";
+  const detail = ready
+    ? `${adapter.name} is ready for ANT+ heart-rate sensors.`
+    : adapter.status === "permissionDenied"
+      ? `Permission denied · ${adapter.message}. Run scripts/install-ant-udev.sh, then replug the stick.`
+      : adapter.status === "busy"
+        ? `Stick busy · ${adapter.message}. Close other fitness apps using it.`
+        : adapter.message;
+  return (
+    <section className={`card ant-adapter-card ${adapter.status}`}>
+      <span className={`card-icon ${ready ? "" : "subtle"}`}><Radio size={22} /></span>
+      <div>
+        <span className="label">ANT+ ADAPTER</span>
+        <h2>ANT+ receiver</h2>
+        <p>{detail}</p>
+      </div>
+      <span className={`status-chip ${ready ? "online" : "error"}`}>{ready ? "Ready" : "Needs attention"}</span>
     </section>
   );
 }
@@ -455,6 +513,8 @@ function emptySlot(role: DeviceRole): DeviceSlot {
       rateHz: 0,
       rssi: null,
       batteryPercent: null,
+      batteryStatus: null,
+      batteryVoltage: null,
       manufacturer: null,
       model: null,
       firmware: null,

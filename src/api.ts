@@ -52,6 +52,8 @@ export const api = {
   knownDevices: () => invoke<KnownDevice[]>("known_devices"),
   forgetDevice: (id: string) => invoke<void>("forget_device", { id }),
   forgetAllDevices: () => invoke<number>("forget_all_devices"),
+  restoreKnownDevices: (devices: KnownDevice[]) =>
+    invoke<void>("restore_known_devices", { devices }),
   sourcePreferences: () => invoke<SourcePreferences>("get_source_preferences"),
   saveSourcePreferences: (preferences: SourcePreferences) =>
     invoke<void>("set_source_preferences", { preferences }),
@@ -83,7 +85,9 @@ export const api = {
         workoutId: workout.id,
         path,
       });
+      return true;
     }
+    return false;
   },
   exportAllZwo: async (): Promise<WorkoutExportResult | null> => {
     const directory = await open({
@@ -135,7 +139,9 @@ export const api = {
         sessionId: session.id,
         path,
       });
+      return true;
     }
+    return false;
   },
   exportSessionFit: async (session: SessionSummary) => {
     const path = await save({
@@ -147,7 +153,9 @@ export const api = {
         sessionId: session.id,
         path,
       });
+      return true;
     }
+    return false;
   },
   prepareGarminUpload: (sessionId: string) =>
     invoke<string>("prepare_garmin_upload", { sessionId }),

@@ -1,0 +1,5 @@
+# BlakeBike ANT USBStick2 (Dynastream 0fcf:1008).
+# This filename must sort before systemd's 73-seat-late.rules so TAG+="uaccess"
+# is present when systemd applies the active desktop user's device ACL.
+SUBSYSTEM=="usb", ATTR{idVendor}=="0fcf", ATTR{idProduct}=="1008", TAG+="uaccess", MODE="0660"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0fcf", ATTRS{idProduct}=="1008", TAG+="uaccess", MODE="0660"

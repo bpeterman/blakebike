@@ -1,13 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Activity, Bluetooth, ChevronRight, Radio, X } from "lucide-react";
 import { api } from "./api";
-import type { DeviceInfo, DeviceLogLine, DeviceRole, DeviceSlot, KnownDevice } from "./types";
+import type { AntAdapterStatus, DeviceInfo, DeviceLogLine, DeviceRole, DeviceSlot, KnownDevice } from "./types";
 import { deviceRoleLabel } from "./types";
-import { capabilityLabel, deviceFitsRole, makeAndModel, readoutMark } from "./devices";
+import { capabilityLabel, deviceFitsRole, makeAndModel, readoutMark, transportLabel } from "./devices";
+import { useDialog } from "./useDialog";
 
 const roleHint: Record<DeviceRole, string> = {
   trainer: "Make sure your trainer is awake and not paired with another app.",
-  heartRate: "Wet the strap contacts and wear it so it starts broadcasting.",
+  heartRate: "Wet the strap contacts and wear it so it broadcasts over BLE or ANT+.",
   power: "Spin the crank to wake the power meter before scanning.",
   cadence: "Spin the crank to wake the cadence sensor before scanning.",
 };
@@ -18,12 +19,14 @@ export function DevicePicker({
   role,
   slot,
   scanError,
+  antAdapter,
   close,
   perform,
 }: {
   role: DeviceRole;
   slot: DeviceSlot | undefined;
   scanError: { message: string; guidance: string } | null;
+  antAdapter: AntAdapterStatus | undefined;
   close: () => void;
   perform: (action: () => Promise<unknown>, label?: string) => Promise<void>;
 }) {
@@ -36,6 +39,7 @@ export function DevicePicker({
   const startedAt = useRef(0);
   const scannedOnce = useRef(false);
   const label = deviceRoleLabel[role];
+  const supportsAnt = role === "heartRate" && antAdapter?.status === "ready";
 
   const scan = useCallback(async () => {
     setScanning(true);
@@ -95,18 +99,28 @@ export function DevicePicker({
   const state = slot?.state;
   const connected = state?.status === "ready" || state?.status === "controlling";
   const busy = connecting !== null && outcome === null;
+  const dialogRef = useDialog(close, !busy);
   const error =
     state?.status === "error" ? { message: state.message, guidance: state.guidance } : scanError;
+  const antError = role === "heartRate" && antAdapter && ["permissionDenied", "busy", "error"].includes(antAdapter.status)
+    ? antAdapter
+    : null;
 
   return (
-    <div className="modal-backdrop">
-      <div className="modal device-modal">
+    <div className="modal-backdrop dialog-enter" role="presentation" onMouseDown={(event) => {
+      if (event.target === event.currentTarget && !busy) close();
+    }}>
+      <section ref={dialogRef} className="modal device-modal" role="dialog" aria-modal="true" aria-labelledby="device-picker-title" tabIndex={-1}>
         <button className="modal-close" disabled={busy} onClick={close} aria-label="Close">
           <X />
         </button>
-        <div className="modal-icon">{busy ? <span className="spinner" /> : <Bluetooth />}</div>
-        <span className="label">BLUETOOTH · {label.toUpperCase()}</span>
-        <h2>
+        <div className="modal-icon">
+          {busy ? <span className="spinner" /> : supportsAnt ? <Radio /> : <Bluetooth />}
+        </div>
+        <span className="label">
+          {supportsAnt ? "BLUETOOTH + ANT+" : "BLUETOOTH"} · {label.toUpperCase()}
+        </span>
+        <h2 id="device-picker-title">
           {connecting
             ? outcome === "connected"
               ? `${label} connected`
@@ -153,6 +167,16 @@ export function DevicePicker({
                 <span>{error.guidance}</span>
               </div>
             )}
+            {antError && "message" in antError && (
+              <div className="inline-error">
+                <strong>ANT+ adapter unavailable</strong>
+                <span>
+                  {antError.message}
+                  {antError.status === "permissionDenied" && " Run scripts/install-ant-udev.sh, then replug the stick."}
+                  {antError.status === "busy" && " Close Garmin Express or another app using the stick."}
+                </span>
+              </div>
+            )}
             <div className="device-list">
               {devices.map((device) => {
                 const remembered = known.find((candidate) => candidate.id === device.id);
@@ -163,7 +187,12 @@ export function DevicePicker({
                   <span>
                     <strong>{device.name}{make && <em className="device-make-inline">{make}</em>}</strong>
                     <small>
-                      {device.simulated ? "No hardware required" : `${device.rssi ?? "—"} dBm`}
+                      {device.simulated
+                        ? "No hardware required"
+                        : device.transport === "ant"
+                          ? "ANT+ USB"
+                          : `${device.rssi ?? "—"} dBm`}
+                      {!device.simulated && ` · ${transportLabel(device)}`}
                       {remembered && !device.simulated && " · remembered"}
                       {(device.capabilities ?? []).length > 0 && (
                         <span className="capability-chips">
@@ -216,7 +245,7 @@ export function DevicePicker({
             </button>
           )}
         </div>
-      </div>
+      </section>
     </div>
   );
 }

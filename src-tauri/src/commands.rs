@@ -136,9 +136,34 @@ pub fn forget_device(state: State<'_, AppState>, id: String) -> Result<(), Strin
 
 #[tauri::command]
 pub fn forget_all_devices(state: State<'_, AppState>) -> Result<usize, String> {
-    let removed = state.storage.forget_all_devices()?;
+    // Only forget what the rider can see: with developer mode off the
+    // remembered simulators are hidden, so they must survive a "forget all"
+    // that the undo could not put back.
+    let removed = if state.storage.dev_mode()? {
+        state.storage.forget_all_devices()?
+    } else {
+        let mut removed = 0;
+        for device in state.storage.known_devices()? {
+            if !device.simulated {
+                state.storage.forget_device(&device.id)?;
+                removed += 1;
+            }
+        }
+        removed
+    };
     tracing::info!(removed, "command forget_all_devices");
     Ok(removed)
+}
+
+#[tauri::command]
+pub fn restore_known_devices(
+    state: State<'_, AppState>,
+    devices: Vec<KnownDevice>,
+) -> Result<(), String> {
+    for device in devices {
+        state.storage.remember_device(&device)?;
+    }
+    Ok(())
 }
 
 #[tauri::command]

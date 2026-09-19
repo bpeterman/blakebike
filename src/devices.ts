@@ -5,6 +5,7 @@ import type {
   DeviceRole,
   DeviceState,
   TelemetrySources,
+  DeviceTransport,
 } from "./types";
 import { deviceRoleLabel } from "./types";
 
@@ -22,6 +23,14 @@ export const capabilityLabel: Record<Capability, string> = {
   cyclingPower: "Power",
   csc: "Cadence",
 };
+
+export function deviceTransport(device: { transport?: DeviceTransport }): DeviceTransport {
+  return device.transport ?? "ble";
+}
+
+export function transportLabel(device: { transport?: DeviceTransport }): string {
+  return deviceTransport(device) === "ant" ? "ANT+" : "BLE";
+}
 
 export function deviceFitsRole(device: DeviceInfo, role: DeviceRole): boolean {
   const capabilities = device.capabilities ?? [];
