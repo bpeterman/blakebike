@@ -18,7 +18,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU16, Ordering},
         mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel},
     },
     time::Duration,
@@ -110,6 +110,8 @@ pub enum RunnerState {
         override_active: bool,
         bias_percent: u16,
         control: ControlStatus,
+        #[serde(default)]
+        recording_warning: Option<String>,
     },
     Paused {
         session_id: Uuid,
@@ -124,10 +126,14 @@ pub enum RunnerState {
         override_active: bool,
         bias_percent: u16,
         control: ControlStatus,
+        #[serde(default)]
+        recording_warning: Option<String>,
     },
     Finished {
         session_id: Uuid,
         completed: bool,
+        #[serde(default)]
+        save_warning: Option<String>,
     },
     Error {
         message: String,
@@ -490,13 +496,37 @@ impl WorkoutRunner {
             ride.controls.set_phase(Phase::Stopped);
             ride.controls.manual_active.store(false, Ordering::Relaxed);
             ride.controls.planned_active.store(false, Ordering::Relaxed);
-            ride.recorder.flush(FLUSH_GRACE).await;
+            let flush_result = ride.recorder.flush(FLUSH_GRACE).await;
+            let flushed = flush_result.is_ok();
+            let mut save_warning = flush_result.err().or_else(|| ride.recorder.warning());
             let dropped = ride.recorder.dropped();
             if dropped > 0 {
                 tracing::warn!(session_id = %session_id, dropped, "Telemetry samples were dropped during the ride");
             }
             // Whatever happened, the ride is closed out and lands in History.
-            finish(&storage, &ride_files_dir, session, &stats, completed);
+            match finish(
+                &storage,
+                &ride_files_dir,
+                session,
+                &stats,
+                completed,
+                save_warning.clone(),
+                flushed,
+            ) {
+                Ok(warning) => save_warning = warning,
+                Err(error) => {
+                    tracing::error!(%session_id, %error, "Ride finalization failed");
+                    save_warning = Some(match save_warning {
+                        Some(warning) => format!("{warning} {error}"),
+                        None => error,
+                    });
+                    if let Err(error) =
+                        storage.save_recording_warning(session_id, save_warning.as_deref())
+                    {
+                        tracing::error!(%session_id, %error, "Could not persist recording warning");
+                    }
+                }
+            }
             if tokio::time::timeout(STOP_GRACE + Duration::from_secs(1), writer)
                 .await
                 .is_err()
@@ -515,6 +545,7 @@ impl WorkoutRunner {
             *ride.state.write().await = RunnerState::Finished {
                 session_id,
                 completed,
+                save_warning,
             };
             emit_state(ride.app.as_ref(), &ride.state).await;
         });
@@ -1063,6 +1094,7 @@ async fn publish(
             override_active: !interval.free_ride && ride.controls.override_target().is_some(),
             bias_percent: ride.controls.bias(),
             control,
+            recording_warning: ride.recorder.warning(),
         }
     } else {
         RunnerState::Running {
@@ -1078,6 +1110,7 @@ async fn publish(
             override_active: !interval.free_ride && ride.controls.override_target().is_some(),
             bias_percent: ride.controls.bias(),
             control,
+            recording_warning: ride.recorder.warning(),
         }
     };
     *ride.state.write().await = next;
@@ -1098,6 +1131,7 @@ async fn target_writer(
 ) {
     // Control was acquired synchronously when the ride started.
     let mut started = true;
+    let mut pause_acknowledged = false;
     let mut failures: u8 = 0;
     let mut last_sent: Option<u16> = None;
     let mut last_attempt = Instant::now();
@@ -1120,6 +1154,7 @@ async fn target_writer(
             }
             status = ControlStatus::Lost;
             started = false;
+            pause_acknowledged = false;
             last_sent = None;
             failures = 0;
         } else {
@@ -1127,13 +1162,20 @@ async fn target_writer(
             let mut result: Result<(), ControlError> = Ok(());
             match intent.phase {
                 Phase::Paused => {
-                    if started {
+                    if !pause_acknowledged {
                         attempted = true;
-                        started = false;
+                        // Until the acknowledgement arrives, the trainer may
+                        // still be applying the previous resistance.
+                        status_tx.send_replace(ControlStatus::Degraded);
                         result = devices.pause().await;
+                        if result.is_ok() {
+                            pause_acknowledged = true;
+                            started = false;
+                        }
                     }
                 }
                 Phase::Running => {
+                    pause_acknowledged = false;
                     if !started {
                         attempted = true;
                         result = devices.begin_control().await;
@@ -1170,7 +1212,8 @@ async fn target_writer(
                         failures = failures.saturating_add(1);
                         last_sent = None;
                         tracing::warn!(error = %error, failures, "Trainer command failed; ride continues");
-                        classify_failure(&devices, error, failures, &mut started).await
+                        classify_failure(&devices, error, failures, &mut started, intent.phase)
+                            .await
                     }
                 };
             }
@@ -1187,11 +1230,11 @@ async fn target_writer(
 
         // Wait for a reason to act again: a new intent, a link state change,
         // or the retry / keepalive timer.
-        let timer = if !connected || intent.phase != Phase::Running {
+        let timer = if !connected {
             None
         } else if failures > 0 {
             Some(last_attempt + RETRY_AFTER)
-        } else if intent.target.is_some() {
+        } else if intent.phase == Phase::Running && intent.target.is_some() {
             Some(last_attempt + KEEPALIVE)
         } else {
             None
@@ -1225,16 +1268,23 @@ async fn classify_failure(
     error: ControlError,
     failures: u8,
     started: &mut bool,
+    phase: Phase,
 ) -> ControlStatus {
     match error {
         ControlError::NotConnected => {
             *started = false;
+            devices.reconnect_trainer().await;
             ControlStatus::Lost
         }
         ControlError::Refused(ResponseCode::ControlNotPermitted) => {
             tracing::warn!("Trainer says control is not permitted; re-acquiring");
-            match devices.reacquire_control().await {
-                Ok(()) => *started = true,
+            let result = if phase == Phase::Paused {
+                devices.request_control().await
+            } else {
+                devices.reacquire_control().await
+            };
+            match result {
+                Ok(()) => *started = phase == Phase::Running,
                 Err(error) => {
                     tracing::warn!(error = %error, "Could not re-acquire trainer control");
                     *started = false;
@@ -1246,6 +1296,7 @@ async fn classify_failure(
         ControlError::Timeout | ControlError::Gatt(_) => {
             if failures >= FAILURES_BEFORE_LOST {
                 *started = false;
+                devices.reconnect_trainer().await;
                 ControlStatus::Lost
             } else {
                 ControlStatus::Degraded
@@ -1268,75 +1319,145 @@ impl SampleSink for Storage {
 
 enum RecorderMessage {
     Sample(Telemetry),
-    Flush(std::sync::mpsc::Sender<()>),
+    Flush(std::sync::mpsc::Sender<Result<(), String>>),
 }
 
-/// Persists telemetry on its own thread, one transaction per second, and
-/// keeps samples in memory while the database is unwritable.
+#[derive(Default)]
+struct RecordingHealth {
+    dropped: u32,
+    write_failed: bool,
+    stopped: bool,
+}
+
+impl RecordingHealth {
+    fn warning(&self) -> Option<String> {
+        if self.stopped {
+            Some("Ride recording stopped. Some or all ride data may be missing.".into())
+        } else if self.write_failed {
+            Some("Ride data is not being saved. Retrying; check available disk space and keep the app open.".into())
+        } else if self.dropped > 0 {
+            Some(format!(
+                "Ride recording is incomplete: {} measurements could not be saved.",
+                self.dropped
+            ))
+        } else {
+            None
+        }
+    }
+}
+
+type SharedRecordingHealth = Arc<std::sync::Mutex<RecordingHealth>>;
+
+fn recording_health(health: &SharedRecordingHealth) -> std::sync::MutexGuard<'_, RecordingHealth> {
+    health
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Persists telemetry independently of the ride clock. Health is shared with
+/// the timeline so disk failures are visible even while it keeps running.
 struct Recorder {
     tx: Option<SyncSender<RecorderMessage>>,
-    dropped: Arc<AtomicU32>,
+    health: SharedRecordingHealth,
 }
 
 impl Recorder {
     fn start(sink: Arc<dyn SampleSink>, session_id: Uuid) -> Self {
         let (tx, rx) = sync_channel(256);
-        let dropped = Arc::new(AtomicU32::new(0));
+        let health = Arc::new(std::sync::Mutex::new(RecordingHealth::default()));
+        let worker_health = health.clone();
         let spawned = std::thread::Builder::new()
             .name("ride-recorder".into())
-            .spawn(move || recorder_loop(rx, sink, session_id));
+            .spawn(move || {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    recorder_loop(rx, sink, session_id, &worker_health);
+                }));
+                if outcome.is_err() {
+                    recording_health(&worker_health).stopped = true;
+                    tracing::error!(%session_id, "Ride recorder panicked");
+                }
+            });
         match spawned {
             Ok(_) => Self {
                 tx: Some(tx),
-                dropped,
+                health,
             },
             Err(error) => {
-                tracing::error!(error = %error, "Could not start the ride recorder; samples will not be saved");
-                Self { tx: None, dropped }
+                tracing::error!(error = %error, "Could not start the ride recorder");
+                recording_health(&health).stopped = true;
+                Self { tx: None, health }
             }
         }
     }
 
     fn push(&self, sample: Telemetry) {
         let Some(tx) = &self.tx else {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
+            recording_health(&self.health).dropped += 1;
             return;
         };
-        if let Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) =
-            tx.try_send(RecorderMessage::Sample(sample))
-        {
-            let dropped = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
-            if dropped == 1 || dropped.is_multiple_of(100) {
+        if let Err(error) = tx.try_send(RecorderMessage::Sample(sample)) {
+            let mut health = recording_health(&self.health);
+            health.dropped += 1;
+            health.stopped |= matches!(error, TrySendError::Disconnected(_));
+            if health.dropped == 1 || health.dropped.is_multiple_of(100) {
                 tracing::warn!(
-                    dropped,
-                    "Recorder cannot keep up; dropping telemetry samples"
+                    dropped = health.dropped,
+                    "Recorder dropped telemetry samples"
                 );
             }
         }
     }
 
-    /// Ask the thread to write everything it holds and wait (bounded) for it.
-    async fn flush(&self, grace: Duration) {
-        let Some(tx) = &self.tx else {
-            return;
-        };
-        let (ack_tx, ack_rx) = std::sync::mpsc::channel();
-        if tx.send(RecorderMessage::Flush(ack_tx)).is_err() {
-            return;
-        }
-        // Waits in real time on a real thread; unaffected by paused test time.
-        let _ = tokio::task::spawn_blocking(move || ack_rx.recv_timeout(grace)).await;
+    /// One deadline covers both queueing and acknowledgement. Neither can
+    /// block the async runtime; a failed write is never acknowledged as saved.
+    async fn flush(&self, grace: Duration) -> Result<(), String> {
+        let tx = self.tx.clone().ok_or("Ride recorder is unavailable")?;
+        tokio::task::spawn_blocking(move || {
+            let deadline = std::time::Instant::now() + grace;
+            let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+            let mut message = RecorderMessage::Flush(ack_tx);
+            loop {
+                if std::time::Instant::now() >= deadline {
+                    return Err("Timed out waiting for ride data to be saved".into());
+                }
+                match tx.try_send(message) {
+                    Ok(()) => break,
+                    Err(TrySendError::Full(returned)) => {
+                        message = returned;
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(TrySendError::Disconnected(_)) => {
+                        return Err("Ride recorder stopped".into());
+                    }
+                }
+            }
+            ack_rx
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                .map_err(|_| {
+                    "Ride data could not be confirmed saved before the deadline".to_string()
+                })?
+        })
+        .await
+        .map_err(|error| format!("Could not wait for ride recording: {error}"))?
+    }
+
+    fn warning(&self) -> Option<String> {
+        recording_health(&self.health).warning()
     }
 
     fn dropped(&self) -> u32 {
-        self.dropped.load(Ordering::Relaxed)
+        recording_health(&self.health).dropped
     }
 }
 
-fn recorder_loop(rx: Receiver<RecorderMessage>, sink: Arc<dyn SampleSink>, session_id: Uuid) {
+fn recorder_loop(
+    rx: Receiver<RecorderMessage>,
+    sink: Arc<dyn SampleSink>,
+    session_id: Uuid,
+    health: &SharedRecordingHealth,
+) {
     let mut pending: Vec<Telemetry> = Vec::new();
     let mut oldest: Option<std::time::Instant> = None;
-    let mut failures: u32 = 0;
     loop {
         match rx.recv_timeout(Duration::from_millis(250)) {
             Ok(RecorderMessage::Sample(sample)) => {
@@ -1345,43 +1466,32 @@ fn recorder_loop(rx: Receiver<RecorderMessage>, sink: Arc<dyn SampleSink>, sessi
                 if pending.len() > MAX_PENDING_SAMPLES {
                     let excess = pending.len() - MAX_PENDING_SAMPLES;
                     pending.drain(..excess);
+                    recording_health(health).dropped += excess as u32;
                     tracing::warn!(excess, "Recorder backlog full; oldest samples dropped");
                 }
             }
             Ok(RecorderMessage::Flush(ack)) => {
-                write_with_retries(&*sink, session_id, &mut pending, 8);
-                oldest = None;
-                let _ = ack.send(());
+                let result = write_with_retries(&*sink, session_id, &mut pending, 8, health);
+                // Keep retrying retained samples if the flush failed.
+                oldest = (!pending.is_empty()).then(std::time::Instant::now);
+                let _ = ack.send(result);
                 continue;
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
-                write_with_retries(&*sink, session_id, &mut pending, 8);
+                let _ = write_with_retries(&*sink, session_id, &mut pending, 8, health);
                 return;
             }
         }
         if !pending.is_empty() && oldest.is_some_and(|at| at.elapsed() >= Duration::from_secs(1)) {
-            match sink.write_samples(session_id, &pending) {
-                Ok(()) => {
-                    if failures > 0 {
-                        tracing::info!(
-                            failures,
-                            samples = pending.len(),
-                            "Telemetry writes recovered"
-                        );
-                    }
-                    failures = 0;
-                    pending.clear();
-                    oldest = None;
-                }
-                Err(error) => {
-                    failures += 1;
-                    if failures == 1 || failures.is_multiple_of(20) {
-                        tracing::error!(error = %error, failures, pending = pending.len(), "Could not write telemetry; keeping it in memory");
-                    }
-                    std::thread::sleep(Duration::from_millis(250));
-                }
-            }
+            let _ = write_with_retries(&*sink, session_id, &mut pending, 1, health);
+            // Back off without sleeping the consumer: drain the queue while
+            // waiting so a disk failure does not itself cause queue overflow.
+            oldest = if pending.is_empty() {
+                None
+            } else {
+                Some(std::time::Instant::now())
+            };
         }
     }
 }
@@ -1391,26 +1501,35 @@ fn write_with_retries(
     session_id: Uuid,
     pending: &mut Vec<Telemetry>,
     attempts: u32,
-) {
+    health: &SharedRecordingHealth,
+) -> Result<(), String> {
     for attempt in 1..=attempts {
         if pending.is_empty() {
-            return;
+            return Ok(());
         }
         match sink.write_samples(session_id, pending) {
             Ok(()) => {
+                let mut health = recording_health(health);
+                if health.write_failed {
+                    tracing::info!("Telemetry writes recovered");
+                }
+                health.write_failed = false;
                 pending.clear();
-                return;
+                return Ok(());
             }
             Err(error) => {
-                tracing::warn!(error = %error, attempt, "Final telemetry write failed");
-                std::thread::sleep(Duration::from_millis(250));
+                let mut health = recording_health(health);
+                if !health.write_failed {
+                    tracing::error!(%error, "Could not save telemetry; retaining samples for retry");
+                }
+                health.write_failed = true;
             }
         }
+        if attempt < attempts {
+            std::thread::sleep(Duration::from_millis(250));
+        }
     }
-    tracing::error!(
-        samples = pending.len(),
-        "Giving up on unwritten telemetry samples"
-    );
+    Err("Some ride measurements could not be saved. Check available disk space; the recording may be incomplete.".into())
 }
 
 fn adjusted_target(current: u16, delta: i16) -> u16 {
@@ -1460,54 +1579,43 @@ fn finish(
     mut summary: SessionSummary,
     stats: &RideStats,
     completed: bool,
-) {
+    mut warning: Option<String>,
+    flushed: bool,
+) -> Result<Option<String>, String> {
     summary.ended_at = Some(Utc::now());
     stats.apply(&mut summary);
-    match storage.session(summary.id) {
-        Ok(Some(detail)) => {
-            let estimate = estimate_distance(&detail.samples, summary.distance_weight_kg);
-            summary.estimated_distance_meters = estimate.total_meters;
-            summary.distance_source = estimate.source;
-        }
-        Ok(None) => {
-            tracing::warn!(session_id = %summary.id, "Ride disappeared before it could be finalized")
-        }
-        Err(error) => {
-            tracing::warn!(session_id = %summary.id, %error, "Could not reload ride samples for the distance estimate")
-        }
+    let detail = storage
+        .session(summary.id)
+        .map_err(|error| format!("Could not verify saved ride data: {error}"))?
+        .ok_or("The ride could not be found in History")?;
+    if detail.samples.is_empty() {
+        warning = Some(
+            "No ride measurements were saved. Check available disk space and device connections."
+                .into(),
+        );
     }
+    let estimate = estimate_distance(&detail.samples, summary.distance_weight_kg);
+    summary.estimated_distance_meters = estimate.total_meters;
+    summary.distance_source = estimate.source;
     summary.completed = completed;
-    tracing::info!(
-        session_id = %summary.id,
-        completed,
-        elapsed_seconds = stats.elapsed,
-        samples = stats.samples,
-        average_power_watts = summary.average_power_watts,
-        max_power_watts = summary.max_power_watts,
-        estimated_distance_meters = summary.estimated_distance_meters,
-        distance_source = ?summary.distance_source,
-        "Workout finished"
-    );
-    if let Err(error) = storage.finish_session(&summary) {
-        tracing::error!(session_id = %summary.id, error = %error, "Could not persist session summary; startup recovery will close it");
-        return;
+    summary.recording_warning = warning.clone();
+    storage.finish_session(&summary).map_err(|error| {
+        format!("The ride summary could not be saved; restart recovery will retry: {error}")
+    })?;
+    tracing::info!(session_id = %summary.id, completed, samples = detail.samples.len(), warning = ?warning, "Ride finalized");
+    // A timed-out recorder may still drain buffered samples. Let startup
+    // reconciliation create the FIT from the eventual recording, not a stale
+    // snapshot that would subsequently be mistaken for a complete export.
+    if flushed {
+        let detail = crate::domain::SessionDetail {
+            summary,
+            samples: detail.samples,
+        };
+        ensure_ride_file(ride_files_dir, &detail).map_err(|error| {
+            format!("Ride data is in History, but its FIT file could not be saved: {error}")
+        })?;
     }
-    match storage.session(summary.id) {
-        Ok(Some(detail)) => match ensure_ride_file(ride_files_dir, &detail) {
-            Ok(path) => {
-                tracing::info!(session_id = %summary.id, file = %path.display(), "Ride FIT file saved")
-            }
-            Err(error) => {
-                tracing::warn!(session_id = %summary.id, %error, "Could not save ride FIT file; startup will retry")
-            }
-        },
-        Ok(None) => {
-            tracing::warn!(session_id = %summary.id, "Ride disappeared before FIT generation")
-        }
-        Err(error) => {
-            tracing::warn!(session_id = %summary.id, %error, "Could not reload ride for FIT generation")
-        }
-    }
+    Ok(warning)
 }
 
 async fn emit_state(app: Option<&AppHandle>, state: &RwLock<RunnerState>) {
@@ -1577,6 +1685,7 @@ mod tests {
             override_active: false,
             bias_percent: DEFAULT_BIAS_PERCENT,
             control: ControlStatus::Lost,
+            recording_warning: None,
         };
         let json = serde_json::to_value(state).unwrap();
 
@@ -1605,6 +1714,7 @@ mod tests {
             override_active: false,
             bias_percent: DEFAULT_BIAS_PERCENT,
             control: ControlStatus::Ok,
+            recording_warning: None,
         };
         let json = serde_json::to_value(state).unwrap();
 
@@ -1772,6 +1882,7 @@ mod tests {
             state,
             RunnerState::Finished {
                 completed: true,
+                save_warning: None,
                 ..
             }
         ));
@@ -1783,6 +1894,7 @@ mod tests {
         let summary = stored.summary;
         assert!(summary.ended_at.is_some());
         assert!(summary.completed);
+        assert!(summary.recording_warning.is_none());
         assert!(summary.average_power_watts > 0);
         assert_eq!(
             std::fs::read_dir(rig._ride_files.path()).unwrap().count(),
@@ -2168,12 +2280,297 @@ mod tests {
                 ..Telemetry::default()
             });
         }
-        recorder.flush(Duration::from_secs(10)).await;
+        recorder.flush(Duration::from_secs(10)).await.unwrap();
         assert_eq!(recorder.dropped(), 0);
         assert!(*sink.calls.lock().unwrap() >= 3);
         assert_eq!(
             storage.session(session.id).unwrap().unwrap().samples.len(),
             25
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silent_link_and_repeated_write_failures_trigger_reconnect() {
+        let rig = rig().await;
+        rig.runner
+            .start_free_ride(None, 800, 84.0, rig.hub.clone(), rig.storage.clone())
+            .await
+            .unwrap();
+        wait_for(&rig.runner, |s| matches!(s, RunnerState::Running { .. })).await;
+        rig.hub.slot(DeviceRole::Trainer).abort_worker().await;
+        rig.hub
+            .simulated_faults()
+            .fail_writes
+            .store(3, Ordering::Relaxed);
+        wait_for(&rig.runner, |s| control_of(s) == Some(ControlStatus::Lost)).await;
+        wait_for(&rig.runner, |s| control_of(s) == Some(ControlStatus::Ok)).await;
+        assert!(rig.hub.slot(DeviceRole::Trainer).stats().drops >= 1);
+        assert!(rig.hub.slot(DeviceRole::Trainer).stats().samples > 0);
+        assert!(rig.hub.state().await.is_connected());
+        assert!(matches!(
+            rig.runner.state().await,
+            RunnerState::Running { .. }
+        ));
+        rig.runner.stop_and_wait(Duration::from_secs(5)).await;
+        rig.hub.disconnect().await;
+    }
+
+    async fn paused_recovery(failures: u32, refusal: u8) {
+        let rig = rig().await;
+        rig.runner
+            .start_free_ride(None, 800, 84.0, rig.hub.clone(), rig.storage.clone())
+            .await
+            .unwrap();
+        wait_for(&rig.runner, |s| matches!(s, RunnerState::Running { .. })).await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        let faults = rig.hub.simulated_faults();
+        let command_count = faults.commands.lock().unwrap().len();
+        faults.fail_writes.store(failures, Ordering::Relaxed);
+        faults.refuse_with.store(refusal, Ordering::Relaxed);
+        rig.runner.pause_or_resume().await.unwrap();
+        wait_for(&rig.runner, |s| {
+            matches!(
+                s,
+                RunnerState::Paused {
+                    control: ControlStatus::Degraded | ControlStatus::Lost,
+                    ..
+                }
+            )
+        })
+        .await;
+        wait_for(&rig.runner, |s| {
+            matches!(
+                s,
+                RunnerState::Paused {
+                    control: ControlStatus::Ok,
+                    ..
+                }
+            )
+        })
+        .await;
+        {
+            let commands = faults.commands.lock().unwrap();
+            let after_pause = &commands[command_count..];
+            assert!(
+                after_pause
+                    .iter()
+                    .filter(|(_, p)| p.as_slice() == [0x08, 0x02])
+                    .count()
+                    >= 2
+            );
+            assert!(
+                !after_pause.iter().any(|(_, p)| p.as_slice() == [0x07]),
+                "A paused ride must never be started by recovery"
+            );
+        }
+        if failures >= 3 {
+            assert!(rig.hub.slot(DeviceRole::Trainer).stats().drops > 0);
+        }
+        rig.runner.stop_and_wait(Duration::from_secs(5)).await;
+        rig.hub.disconnect().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_pause_is_retried_until_acknowledged() {
+        paused_recovery(1, 0).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_while_paused_confirms_pause_without_resuming() {
+        paused_recovery(3, 0).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pause_reacquires_permission_without_starting_trainer() {
+        paused_recovery(0, 5).await;
+    }
+
+    #[tokio::test]
+    async fn recording_failure_is_visible_and_persisted_without_stopping_ride() {
+        let mut rig = rig().await;
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("failed-recording.sqlite");
+        rig.storage = Arc::new(Storage::open(&path).unwrap());
+        let fault = rusqlite::Connection::open(&path).unwrap();
+        fault.execute_batch("CREATE TRIGGER fail_samples BEFORE INSERT ON telemetry_samples BEGIN SELECT RAISE(FAIL, 'injected write failure'); END;").unwrap();
+        let id = rig
+            .runner
+            .start_free_ride(None, 800, 84.0, rig.hub.clone(), rig.storage.clone())
+            .await
+            .unwrap();
+        wait_for(&rig.runner, |s| {
+            matches!(
+                s,
+                RunnerState::Running {
+                    recording_warning: Some(_),
+                    ..
+                }
+            )
+        })
+        .await;
+        rig.runner.stop_and_wait(Duration::from_secs(10)).await;
+        let finished = rig.runner.state().await;
+        assert!(
+            matches!(
+                finished,
+                RunnerState::Finished {
+                    save_warning: Some(_),
+                    ..
+                }
+            ),
+            "{finished:?}"
+        );
+        let reopened = Storage::open(&path).unwrap();
+        let detail = reopened.session(id).unwrap().unwrap();
+        assert!(detail.samples.is_empty());
+        assert!(
+            detail
+                .summary
+                .recording_warning
+                .as_deref()
+                .unwrap()
+                .contains("No ride measurements")
+        );
+        assert!(reopened.sessions().unwrap()[0].recording_warning.is_some());
+        // Failed flushes must not create an apparently complete, stale FIT.
+        assert_eq!(
+            std::fs::read_dir(rig._ride_files.path()).unwrap().count(),
+            0
+        );
+        fault.execute_batch("DROP TRIGGER fail_samples;").unwrap();
+        rig.hub.disconnect().await;
+    }
+
+    #[tokio::test]
+    async fn a_temporary_recording_failure_clears_after_all_samples_are_saved() {
+        let storage = Arc::new(Storage::in_memory().unwrap());
+        let session = storage.start_session(None, "Retry", 84.0).unwrap();
+        let sink = Arc::new(FlakySink {
+            inner: storage.clone(),
+            remaining_failures: std::sync::Mutex::new(100),
+            calls: std::sync::Mutex::new(0),
+        });
+        let recorder = Recorder::start(sink.clone(), session.id);
+        for i in 0..20 {
+            recorder.push(Telemetry {
+                timestamp_ms: 1700000000000 + i * 200,
+                ..Telemetry::default()
+            });
+        }
+        for _ in 0..100 {
+            if recorder.warning().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(recorder.warning().is_some());
+        *sink.remaining_failures.lock().unwrap() = 0;
+        recorder.flush(Duration::from_secs(5)).await.unwrap();
+        assert!(recorder.warning().is_none());
+        assert_eq!(
+            storage.session(session.id).unwrap().unwrap().samples.len(),
+            20
+        );
+    }
+
+    #[tokio::test]
+    async fn flush_deadline_includes_a_full_queue() {
+        let (tx, rx) = sync_channel(1);
+        tx.send(RecorderMessage::Sample(Telemetry::default()))
+            .unwrap();
+        let consumer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            rx.recv().unwrap();
+        });
+        let recorder = Recorder {
+            tx: Some(tx),
+            health: Arc::new(std::sync::Mutex::new(RecordingHealth::default())),
+        };
+        assert!(recorder.flush(Duration::from_millis(20)).await.is_err());
+        assert!(
+            !consumer.is_finished(),
+            "Flush waited for the blocked consumer instead of its deadline"
+        );
+        consumer.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropped_samples_remain_a_warning_after_successful_flush() {
+        let (tx, rx) = sync_channel(1);
+        let recorder = Recorder {
+            tx: Some(tx),
+            health: Arc::new(std::sync::Mutex::new(RecordingHealth::default())),
+        };
+        recorder.push(Telemetry::default());
+        recorder.push(Telemetry::default()); // Full queue: this sample is lost.
+        assert_eq!(recorder.dropped(), 1);
+        let consumer = std::thread::spawn(move || {
+            rx.recv().unwrap();
+            if let RecorderMessage::Flush(ack) = rx.recv().unwrap() {
+                ack.send(Ok(())).unwrap();
+            }
+        });
+        recorder.flush(Duration::from_secs(5)).await.unwrap();
+        assert!(recorder.warning().unwrap().contains("1 measurements"));
+        consumer.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn recorder_worker_death_is_visible_without_another_sample() {
+        struct PanickingSink;
+        impl SampleSink for PanickingSink {
+            fn write_samples(&self, _: Uuid, _: &[Telemetry]) -> Result<(), String> {
+                panic!("injected recorder failure")
+            }
+        }
+        let recorder = Recorder::start(Arc::new(PanickingSink), Uuid::new_v4());
+        recorder.push(Telemetry::default());
+        assert!(recorder.flush(Duration::from_secs(2)).await.is_err());
+        for _ in 0..100 {
+            if recorder.warning().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(recorder.warning().unwrap().contains("recording stopped"));
+    }
+
+    #[tokio::test]
+    async fn summary_save_failure_is_reported_even_when_samples_were_saved() {
+        let mut rig = rig().await;
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("summary-failure.sqlite");
+        rig.storage = Arc::new(Storage::open(&path).unwrap());
+        let fault = rusqlite::Connection::open(&path).unwrap();
+        fault.execute_batch("CREATE TRIGGER fail_summary BEFORE UPDATE OF ended_at ON sessions BEGIN SELECT RAISE(FAIL, 'injected summary failure'); END;").unwrap();
+        let id = rig
+            .runner
+            .start_free_ride(None, 800, 84.0, rig.hub.clone(), rig.storage.clone())
+            .await
+            .unwrap();
+        wait_for(&rig.runner, |s| matches!(s, RunnerState::Running { .. })).await;
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        rig.runner.stop_and_wait(Duration::from_secs(5)).await;
+        assert!(matches!(
+            rig.runner.state().await,
+            RunnerState::Finished {
+                save_warning: Some(_),
+                ..
+            }
+        ));
+        let detail = rig.storage.session(id).unwrap().unwrap();
+        assert!(!detail.samples.is_empty());
+        assert!(detail.summary.ended_at.is_none());
+        assert!(
+            detail
+                .summary
+                .recording_warning
+                .unwrap()
+                .contains("summary could not be saved")
+        );
+        fault.execute_batch("DROP TRIGGER fail_summary;").unwrap();
+        rig.hub.disconnect().await;
     }
 }
