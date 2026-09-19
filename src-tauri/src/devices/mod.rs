@@ -795,8 +795,10 @@ impl DeviceHub {
         }
     }
 
-    /// Scan for every kind of sensor. Simulators are listed first.
-    pub async fn scan(&self) -> Result<Vec<DeviceInfo>, String> {
+    /// Scan for every kind of sensor. With `include_simulated` (developer
+    /// mode) the simulators are listed first; otherwise only real hardware
+    /// is offered.
+    pub async fn scan(&self, include_simulated: bool) -> Result<Vec<DeviceInfo>, String> {
         tracing::info!("Scanning for Bluetooth sensors");
         self.scanning.store(true, Ordering::Relaxed);
         self.set_scan_error(None);
@@ -818,10 +820,15 @@ impl DeviceHub {
                     elapsed_ms = started.elapsed().as_millis() as u64,
                     "Scan finished"
                 );
-                let mut devices = trainer::simulated_devices();
-                devices.push(heart_rate::simulated_device());
-                devices.push(cycling_power::simulated_device());
-                devices.push(cadence::simulated_device());
+                let mut devices = if include_simulated {
+                    let mut simulators = trainer::simulated_devices();
+                    simulators.push(heart_rate::simulated_device());
+                    simulators.push(cycling_power::simulated_device());
+                    simulators.push(cadence::simulated_device());
+                    simulators
+                } else {
+                    Vec::new()
+                };
                 devices.extend(found);
                 Ok(devices)
             }
@@ -829,9 +836,9 @@ impl DeviceHub {
     }
 
     /// Scan and keep only devices usable as a trainer (pre-hub API).
-    pub async fn scan_trainers(&self) -> Result<Vec<DeviceInfo>, String> {
+    pub async fn scan_trainers(&self, include_simulated: bool) -> Result<Vec<DeviceInfo>, String> {
         Ok(self
-            .scan()
+            .scan(include_simulated)
             .await?
             .into_iter()
             .filter(|device| device.supports(Capability::Ftms))
@@ -1160,6 +1167,24 @@ mod tests {
             .iter()
             .filter(|line| line.step == "Reconnect attempt")
             .count()
+    }
+
+    #[tokio::test]
+    async fn simulators_are_offered_only_in_developer_mode() {
+        let hub = DeviceHub::default();
+        let offered = hub.scan(true).await.unwrap();
+        assert!(
+            offered.iter().any(|device| device.simulated),
+            "developer mode should offer the simulators"
+        );
+        assert!(
+            hub.scan(false).await.unwrap().is_empty(),
+            "without developer mode only real hardware is offered"
+        );
+        assert!(
+            hub.scan_trainers(false).await.unwrap().is_empty(),
+            "the trainer scan hides simulators too"
+        );
     }
 
     #[tokio::test(start_paused = true)]

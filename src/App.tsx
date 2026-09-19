@@ -130,6 +130,7 @@ function App() {
   );
   const [rideDisplayPreferences, setRideDisplayPreferences] =
     useState<RideDisplayPreferences>(defaultRideDisplayPreferences);
+  const [devMode, setDevMode] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [devicePicker, setDevicePicker] = useState<DeviceRole | null>(null);
@@ -157,6 +158,7 @@ function App() {
         nextSmoothing,
         nextZones,
         nextRideDisplayPreferences,
+        nextDevMode,
       ] =
         await Promise.all([
           api.profile(),
@@ -167,6 +169,7 @@ function App() {
           api.powerSmoothing(),
           api.trainingZones(),
           api.rideDisplayPreferences(),
+          api.devMode(),
         ]);
       setProfile(nextProfile);
       setWorkouts(nextWorkouts);
@@ -179,6 +182,7 @@ function App() {
       setRideDisplayPreferences(
         normalizeRideDisplayPreferences(nextRideDisplayPreferences),
       );
+      setDevMode(nextDevMode);
       if (nextRunner.status === "running" || nextRunner.status === "paused") {
         liveSessionRef.current = nextRunner.sessionId;
         const session = await api.session(nextRunner.sessionId);
@@ -449,6 +453,7 @@ function App() {
             workouts={workouts}
             sessions={sessions}
             connected={connected}
+            devMode={devMode}
             onConnect={() => setDevicePicker("trainer")}
             onRide={openRide}
             onNavigate={setPage}
@@ -543,6 +548,7 @@ function App() {
             profile={profile}
             trainingZones={trainingZones}
             rideDisplayPreferences={rideDisplayPreferences}
+            devMode={devMode}
             perform={perform}
             onProfileUpdate={setProfile}
             onTrainingZonesUpdate={setTrainingZones}
@@ -566,6 +572,12 @@ function App() {
               }, "save ride layout")
             }
             onForgetDevices={() => perform(() => api.forgetAllDevices(), "forget all devices")}
+            onDevMode={(enabled) =>
+              void perform(async () => {
+                await api.saveDevMode(enabled);
+                setDevMode(enabled);
+              }, "save developer mode")
+            }
           />
         )}
         {page !== "ride" && riding && runner.recordingWarning && <RecordingWarning message={runner.recordingWarning} />}
@@ -658,6 +670,7 @@ function Overview({
   workouts,
   sessions,
   connected,
+  devMode,
   onConnect,
   onRide,
   onNavigate,
@@ -667,6 +680,7 @@ function Overview({
   workouts: Workout[];
   sessions: SessionSummary[];
   connected: boolean;
+  devMode: boolean;
   onConnect: () => void;
   onRide: (id: string) => void;
   onNavigate: (page: Page) => void;
@@ -689,7 +703,7 @@ function Overview({
         <article className="card connection-card">
           <div className="card-icon"><Bluetooth /></div>
           <div><span className="label">SMART TRAINER</span><h2>{connected ? "Trainer ready" : "Connect your trainer"}</h2>
-            <p>{connected ? "FTMS control is available. Choose a workout when you’re ready." : "Pair an FTMS Bluetooth trainer or use the built-in simulator."}</p>
+            <p>{connected ? "FTMS control is available. Choose a workout when you’re ready." : devMode ? "Pair an FTMS Bluetooth trainer or use the built-in simulator." : "Pair an FTMS Bluetooth trainer to get started."}</p>
           </div>
           <button className={connected ? "secondary" : "primary"} onClick={onConnect}>{connected ? "Manage" : "Connect"}</button>
         </article>
@@ -1144,7 +1158,7 @@ export function Ride({
       {!active && <PageHeader eyebrow="TRAINING ROOM" title="Start a ride" />}
       {riding && runner.recordingWarning && <RecordingWarning message={runner.recordingWarning} />}
       {runner.status === "finished" && runner.saveWarning && <RecordingWarning message={runner.saveWarning} />}
-      {!connected && <div className="notice"><Bluetooth /><div><strong>No trainer connected</strong><p>Connect a trainer or the simulator to begin.</p></div><button className="primary" onClick={onConnect}>Connect</button></div>}
+      {!connected && <div className="notice"><Bluetooth /><div><strong>No trainer connected</strong><p>Connect a trainer to begin.</p></div><button className="primary" onClick={onConnect}>Connect</button></div>}
       {riding && runner.control === "lost" && (
         <div className="notice" role="status">
           <Bluetooth />
@@ -1347,6 +1361,7 @@ export function SettingsPage({
   profile,
   trainingZones,
   rideDisplayPreferences,
+  devMode,
   perform,
   onProfileUpdate,
   onTrainingZonesUpdate,
@@ -1354,10 +1369,12 @@ export function SettingsPage({
   onSaveTrainingZones,
   onSaveRideDisplayPreferences,
   onForgetDevices,
+  onDevMode,
 }: {
   profile: Profile;
   trainingZones: TrainingZoneSettings;
   rideDisplayPreferences: RideDisplayPreferences;
+  devMode: boolean;
   perform: (action: () => Promise<unknown>, label?: string) => Promise<void>;
   onProfileUpdate: (profile: Profile) => void;
   onTrainingZonesUpdate: (zones: TrainingZoneSettings) => void;
@@ -1365,6 +1382,7 @@ export function SettingsPage({
   onSaveTrainingZones: (zones: TrainingZoneSettings) => void;
   onSaveRideDisplayPreferences: (preferences: RideDisplayPreferences) => void;
   onForgetDevices: () => Promise<void>;
+  onDevMode: (enabled: boolean) => void;
 }) {
   const [draft, setDraft] = useState(profile);
   const [zoneDraft, setZoneDraft] = useState(trainingZones);
@@ -1528,7 +1546,7 @@ export function SettingsPage({
           <p>Defaults follow your FTP and maximum heart rate. Editing a boundary switches that set to custom values.</p>
         </div>
         <div className="zone-settings">
-          <label className="zone-sync-toggle">
+          <label className="settings-toggle">
             <input
               type="checkbox"
               checked={zoneDraft.syncPowerZonesFromIntervals}
@@ -1613,6 +1631,24 @@ export function SettingsPage({
         </div>
       </section>
       <section className="card settings-card"><div><span className="label">DATA & DIAGNOSTICS</span><h2>Local-first by design</h2><p>Every finalized ride is stored in SQLite and as a persistent Garmin-compatible FIT file. Missing FIT files are regenerated automatically.</p></div><div className="data-locations"><div className="log-location"><span>Ride Files</span><code>{rideFilesPath}</code><button className="secondary" onClick={() => void api.revealRideFiles().catch(() => undefined)}>Show Ride Files</button></div><div className="log-location"><span>Log file</span><code>{logPath}</code><button className="secondary" onClick={() => void api.revealLogFile().catch(() => undefined)}>Show in folder</button><button className="secondary" onClick={() => void navigator.clipboard.writeText(logPath)}>Copy path</button></div><div className="log-location"><span>Known devices</span><p className="settings-note">Devices you have connected are remembered on this computer so they can be reconnected without scanning. Forgetting them does not disconnect anything.</p><button className="danger-button" onClick={() => void onForgetDevices()}>Forget all devices</button></div></div></section>
+      <section className="card settings-card">
+        <div>
+          <span className="label">DEVELOPER</span>
+          <h2>Developer mode</h2>
+          <p>Off by default. Turn it on to work on blake.bike without a trainer in the room; leave it off for real rides so a scan only ever offers your own hardware.</p>
+        </div>
+        <label className="settings-toggle">
+          <input
+            type="checkbox"
+            checked={devMode}
+            onChange={(event) => onDevMode(event.target.checked)}
+          />
+          <span>
+            Offer simulated devices
+            <small>Adds the simulated trainer, HR strap, power meter and cadence sensor to device scans. A simulator that is already connected stays connected until you disconnect it.</small>
+          </span>
+        </label>
+      </section>
     </>
   );
 }

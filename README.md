@@ -7,7 +7,7 @@ FTMS smart trainers. The initial target platforms are macOS and Ubuntu/Pop!_OS
 ## Features
 
 - FTMS trainer discovery, telemetry, ERG power control, and safe stop behavior
-- Built-in simulated trainer for development and hardware-free use
+- Built-in simulated trainer and sensors, offered when developer mode is on (Settings → Developer)
 - Structured workout editor with steady, ramp, free-ride, and imported repeat blocks
 - ZWO import/export, rider FTP and safety power limit
 - Crash-resistant SQLite ride recording, history charts, and CSV/FIT export

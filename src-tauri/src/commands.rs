@@ -60,7 +60,8 @@ pub async fn device_state(state: State<'_, AppState>) -> Result<DeviceState, Str
 #[tauri::command]
 pub async fn scan_trainers(state: State<'_, AppState>) -> Result<Vec<DeviceInfo>, String> {
     tracing::debug!("command scan_trainers");
-    state.devices.scan_trainers().await
+    let dev_mode = state.storage.dev_mode()?;
+    state.devices.scan_trainers(dev_mode).await
 }
 
 #[tauri::command]
@@ -98,7 +99,8 @@ pub async fn devices_snapshot(state: State<'_, AppState>) -> Result<DevicesSnaps
 #[tauri::command]
 pub async fn scan_devices(state: State<'_, AppState>) -> Result<Vec<DeviceInfo>, String> {
     tracing::debug!("command scan_devices");
-    state.devices.scan().await
+    let dev_mode = state.storage.dev_mode()?;
+    state.devices.scan(dev_mode).await
 }
 
 #[tauri::command]
@@ -115,7 +117,15 @@ pub async fn connect_device(
 
 #[tauri::command]
 pub fn known_devices(state: State<'_, AppState>) -> Result<Vec<KnownDevice>, String> {
-    state.storage.known_devices()
+    let dev_mode = state.storage.dev_mode()?;
+    Ok(state
+        .storage
+        .known_devices()?
+        .into_iter()
+        // A simulator remembered from a developer-mode session should not
+        // offer itself once developer mode is off.
+        .filter(|device| dev_mode || !device.simulated)
+        .collect())
 }
 
 #[tauri::command]
@@ -574,6 +584,17 @@ pub fn set_power_smoothing(
 ) -> Result<(), String> {
     tracing::debug!(?smoothing, "command set_power_smoothing");
     state.storage.save_power_smoothing(smoothing)
+}
+
+#[tauri::command]
+pub fn get_dev_mode(state: State<'_, AppState>) -> Result<bool, String> {
+    state.storage.dev_mode()
+}
+
+#[tauri::command]
+pub fn set_dev_mode(state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
+    tracing::info!(enabled, "command set_dev_mode");
+    state.storage.save_dev_mode(enabled)
 }
 
 #[tauri::command]

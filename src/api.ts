@@ -110,6 +110,8 @@ export const api = {
   powerSmoothing: () => invoke<PowerSmoothing>("get_power_smoothing"),
   savePowerSmoothing: (smoothing: PowerSmoothing) =>
     invoke<void>("set_power_smoothing", { smoothing }),
+  devMode: () => invoke<boolean>("get_dev_mode"),
+  saveDevMode: (enabled: boolean) => invoke<void>("set_dev_mode", { enabled }),
   trainingZones: () => invoke<TrainingZoneSettings>("get_training_zones"),
   saveTrainingZones: (zones: TrainingZoneSettings) =>
     invoke<void>("set_training_zones", { zones }),
