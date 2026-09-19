@@ -21,6 +21,7 @@ import {
   formatUptime,
   isConnected,
   makeAndModel,
+  transportLabel,
   metricsFedBy,
   readoutMark,
 } from "./devices";
@@ -97,7 +98,7 @@ export function DevicesPage({
     <>
       <header className="page-header">
         <div>
-          <span>BLUETOOTH SENSORS</span>
+          <span>BIKE SENSORS</span>
           <h1>Devices</h1>
         </div>
         <div className="header-actions">
@@ -111,6 +112,23 @@ export function DevicesPage({
         <div className="inline-error devices-scan-error">
           <strong>{hub.scanError.message}</strong>
           <span>{hub.scanError.guidance}</span>
+        </div>
+      )}
+
+      {hub?.antAdapter.status !== "notAttached" && (
+        <div className={`ant-adapter-status ${hub?.antAdapter.status ?? "notAttached"}`}>
+          <strong>ANT+</strong>
+          <span>
+            {hub?.antAdapter.status === "ready"
+              ? `${hub.antAdapter.name} ready`
+              : hub?.antAdapter.status === "permissionDenied"
+                ? `Permission denied · ${hub.antAdapter.message}. Run scripts/install-ant-udev.sh, then replug the stick.`
+                : hub?.antAdapter.status === "busy"
+                  ? `Stick busy · ${hub.antAdapter.message}`
+                  : hub?.antAdapter.status === "error"
+                    ? hub.antAdapter.message
+                    : ""}
+          </span>
         </div>
       )}
 
@@ -136,6 +154,7 @@ export function DevicesPage({
                     <strong>{device.name}</strong>
                     <span>
                       {deviceRoleLabel[device.role]}
+                      {` · ${transportLabel(device)}`}
                       {makeAndModel(device.manufacturer, device.model) && ` · ${makeAndModel(device.manufacturer, device.model)}`}
                       {device.simulated && " · simulated"}
                     </span>
@@ -152,6 +171,7 @@ export function DevicesPage({
                       onClick={() => void perform(() => api.connectDevice(device.role, {
                         id: device.id,
                         name: device.name,
+                        transport: device.transport,
                         simulated: device.simulated,
                         rssi: null,
                         capabilities: device.capabilities,
@@ -277,6 +297,9 @@ function DeviceCard({
   const [showLog, setShowLog] = useState(false);
   const Icon = roleIcon[slot.role];
   const connected = isConnected(slot.state);
+  const activeDevice = connected && (slot.state.status === "ready" || slot.state.status === "controlling")
+    ? slot.state.device
+    : null;
   const name = deviceName(slot.state);
   const { stats } = slot;
   const status = statusOf(slot.state, stats.reconnectAttempt ?? 0);
@@ -292,8 +315,11 @@ function DeviceCard({
         <div className="device-card-title">
           <span className="label">{deviceRoleLabel[slot.role].toUpperCase()}</span>
           <h3>{name ?? (slot.state.status === "connecting" || slot.state.status === "reconnecting" ? slot.state.name : "Not connected")}</h3>
-          {connected && makeAndModel(stats.manufacturer, stats.model) && (
-            <span className="device-make">{makeAndModel(stats.manufacturer, stats.model)}</span>
+          {activeDevice && (
+            <span className="device-make">
+              {transportLabel(activeDevice)}
+              {makeAndModel(stats.manufacturer, stats.model) && ` · ${makeAndModel(stats.manufacturer, stats.model)}`}
+            </span>
           )}
         </div>
         <span className={`status-chip ${status.tone}`}>{status.text}</span>

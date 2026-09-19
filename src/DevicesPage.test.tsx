@@ -59,6 +59,7 @@ const idleStats: DeviceSlot["stats"] = {
 const snapshot: DevicesSnapshot = {
   scanning: false,
   scanError: null,
+  antAdapter: { status: "notAttached" },
   sourcePreferences: {
     power: { mode: "auto" },
     cadence: { mode: "auto" },
@@ -117,7 +118,7 @@ describe("DevicesPage", () => {
     expect(screen.getByRole("heading", { name: "KICKR CORE" })).toBeInTheDocument();
     expect(screen.getByText("ERG control")).toBeInTheDocument();
     // Manufacturer shows under the connected device's name.
-    expect(screen.getByText("Wahoo · KICKR CORE")).toBeInTheDocument();
+    expect(screen.getByText("BLE · Wahoo · KICKR CORE")).toBeInTheDocument();
     expect(screen.getByText("200 W · 88 rpm · 30.1 km/h · target 200 W")).toBeInTheDocument();
     expect(screen.getByText(/2\.0 Hz/)).toBeInTheDocument();
     expect(screen.getByText("-55 dBm")).toBeInTheDocument();
@@ -200,7 +201,7 @@ describe("DevicesPage", () => {
     // The trainer is connected right now; the strap was used two days ago.
     expect(screen.getByText("connected now")).toBeInTheDocument();
     expect(screen.getByText(/last used 2 days ago/)).toBeInTheDocument();
-    expect(screen.getByText(/Heart rate · Garmin/)).toBeInTheDocument();
+    expect(screen.getByText(/Heart rate · BLE · Garmin/)).toBeInTheDocument();
 
     const rows = screen.getAllByRole("button", { name: /^Connect$/ });
     // Two idle role cards plus the remembered strap row.
@@ -210,6 +211,23 @@ describe("DevicesPage", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Forget HRM-Pro" }));
     await waitFor(() => expect(api.forgetDevice).toHaveBeenCalledWith("strap"));
+  });
+
+  it("shows actionable ANT adapter failures but keeps no-stick quiet", () => {
+    const view = render(<DevicesPage hub={snapshot} sources={snapshot.sources} onConnect={vi.fn()} onCalibrate={vi.fn()} onSourcePreference={vi.fn()} perform={perform} />);
+    expect(screen.queryByText("ANT+")).not.toBeInTheDocument();
+    view.rerender(
+      <DevicesPage
+        hub={{ ...snapshot, antAdapter: { status: "permissionDenied", message: "Permission denied on /dev/ttyUSB0" } }}
+        sources={snapshot.sources}
+        onConnect={vi.fn()}
+        onCalibrate={vi.fn()}
+        onSourcePreference={vi.fn()}
+        perform={perform}
+      />,
+    );
+    expect(screen.getByText("ANT+")).toBeInTheDocument();
+    expect(screen.getByText(/Permission denied.*ttyUSB0/)).toBeInTheDocument();
   });
 
   it("renders sensibly before the first snapshot arrives", () => {

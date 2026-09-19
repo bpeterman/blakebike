@@ -1,0 +1,4 @@
+# BlakeBike ANT USBStick2 (Dynastream 0fcf:1008).
+# Grant the active desktop session access without making the device world-writable.
+SUBSYSTEM=="usb", ATTR{idVendor}=="0fcf", ATTR{idProduct}=="1008", TAG+="uaccess", MODE="0660"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0fcf", ATTRS{idProduct}=="1008", TAG+="uaccess", MODE="0660"

@@ -19,6 +19,7 @@ pub fn simulated_device() -> DeviceInfo {
     DeviceInfo {
         id: SIMULATED_CADENCE_ID.into(),
         name: "Simulated Cadence Sensor".into(),
+        transport: Default::default(),
         simulated: true,
         rssi: Some(-50),
         capabilities: vec![Capability::Csc],
@@ -203,6 +204,7 @@ mod tests {
         let power_meter = DeviceInfo {
             id: "pm".into(),
             name: "Crank".into(),
+            transport: Default::default(),
             simulated: false,
             rssi: None,
             capabilities: vec![Capability::CyclingPower],

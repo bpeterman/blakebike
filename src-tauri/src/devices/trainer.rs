@@ -95,6 +95,7 @@ pub fn simulated_devices() -> Vec<DeviceInfo> {
     vec![DeviceInfo {
         id: SIMULATED_TRAINER_ID.into(),
         name: "BlakeBike Simulator".into(),
+        transport: Default::default(),
         simulated: true,
         rssi: Some(-30),
         capabilities: vec![Capability::Ftms],

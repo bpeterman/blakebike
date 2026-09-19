@@ -9,6 +9,7 @@ pub fn simulated_device() -> DeviceInfo {
     DeviceInfo {
         id: SIMULATED_POWER_METER_ID.into(),
         name: "Simulated Power Meter".into(),
+        transport: Default::default(),
         simulated: true,
         rssi: Some(-45),
         capabilities: vec![Capability::CyclingPower],

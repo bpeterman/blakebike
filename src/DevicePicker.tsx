@@ -1,13 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Activity, Bluetooth, ChevronRight, Radio, X } from "lucide-react";
+import { Activity, ChevronRight, Radio, X } from "lucide-react";
 import { api } from "./api";
-import type { DeviceInfo, DeviceLogLine, DeviceRole, DeviceSlot, KnownDevice } from "./types";
+import type { AntAdapterStatus, DeviceInfo, DeviceLogLine, DeviceRole, DeviceSlot, KnownDevice } from "./types";
 import { deviceRoleLabel } from "./types";
-import { capabilityLabel, deviceFitsRole, makeAndModel, readoutMark } from "./devices";
+import { capabilityLabel, deviceFitsRole, makeAndModel, readoutMark, transportLabel } from "./devices";
 
 const roleHint: Record<DeviceRole, string> = {
   trainer: "Make sure your trainer is awake and not paired with another app.",
-  heartRate: "Wet the strap contacts and wear it so it starts broadcasting.",
+  heartRate: "Wet the strap contacts and wear it so it broadcasts over BLE or ANT+.",
   power: "Spin the crank to wake the power meter before scanning.",
   cadence: "Spin the crank to wake the cadence sensor before scanning.",
 };
@@ -18,12 +18,14 @@ export function DevicePicker({
   role,
   slot,
   scanError,
+  antAdapter,
   close,
   perform,
 }: {
   role: DeviceRole;
   slot: DeviceSlot | undefined;
   scanError: { message: string; guidance: string } | null;
+  antAdapter: AntAdapterStatus | undefined;
   close: () => void;
   perform: (action: () => Promise<unknown>, label?: string) => Promise<void>;
 }) {
@@ -97,6 +99,9 @@ export function DevicePicker({
   const busy = connecting !== null && outcome === null;
   const error =
     state?.status === "error" ? { message: state.message, guidance: state.guidance } : scanError;
+  const antError = role === "heartRate" && antAdapter && ["permissionDenied", "busy", "error"].includes(antAdapter.status)
+    ? antAdapter
+    : null;
 
   return (
     <div className="modal-backdrop">
@@ -104,8 +109,8 @@ export function DevicePicker({
         <button className="modal-close" disabled={busy} onClick={close} aria-label="Close">
           <X />
         </button>
-        <div className="modal-icon">{busy ? <span className="spinner" /> : <Bluetooth />}</div>
-        <span className="label">BLUETOOTH · {label.toUpperCase()}</span>
+        <div className="modal-icon">{busy ? <span className="spinner" /> : <Radio />}</div>
+        <span className="label">SENSORS · {label.toUpperCase()}</span>
         <h2>
           {connecting
             ? outcome === "connected"
@@ -153,6 +158,16 @@ export function DevicePicker({
                 <span>{error.guidance}</span>
               </div>
             )}
+            {antError && "message" in antError && (
+              <div className="inline-error">
+                <strong>ANT+ adapter unavailable</strong>
+                <span>
+                  {antError.message}
+                  {antError.status === "permissionDenied" && " Run scripts/install-ant-udev.sh, then replug the stick."}
+                  {antError.status === "busy" && " Close Garmin Express or another app using the stick."}
+                </span>
+              </div>
+            )}
             <div className="device-list">
               {devices.map((device) => {
                 const remembered = known.find((candidate) => candidate.id === device.id);
@@ -163,7 +178,12 @@ export function DevicePicker({
                   <span>
                     <strong>{device.name}{make && <em className="device-make-inline">{make}</em>}</strong>
                     <small>
-                      {device.simulated ? "No hardware required" : `${device.rssi ?? "—"} dBm`}
+                      {device.simulated
+                        ? "No hardware required"
+                        : device.transport === "ant"
+                          ? "ANT+ USB"
+                          : `${device.rssi ?? "—"} dBm`}
+                      {!device.simulated && ` · ${transportLabel(device)}`}
                       {remembered && !device.simulated && " · remembered"}
                       {(device.capabilities ?? []).length > 0 && (
                         <span className="capability-chips">

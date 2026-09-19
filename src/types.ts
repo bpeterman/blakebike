@@ -46,9 +46,13 @@ export type WorkoutInterval = {
 
 export type Capability = "ftms" | "heartRate" | "cyclingPower" | "csc";
 
+export type DeviceTransport = "ble" | "ant";
+
 export type DeviceInfo = {
   id: string;
   name: string;
+  /** Missing only in records written before transports were explicit. */
+  transport?: DeviceTransport;
   simulated: boolean;
   rssi: number | null;
   capabilities?: Capability[];
@@ -104,6 +108,8 @@ export type DeviceSlot = {
 export type KnownDevice = {
   id: string;
   name: string;
+  /** Missing only in records written before transports were explicit. */
+  transport?: DeviceTransport;
   role: DeviceRole;
   capabilities: Capability[];
   simulated: boolean;
@@ -124,9 +130,15 @@ export type TelemetrySource = { role: DeviceRole; fallback: boolean };
 /** Which device supplied each fused telemetry value. */
 export type TelemetrySources = Record<Metric, TelemetrySource | null>;
 
+export type AntAdapterStatus =
+  | { status: "notAttached" }
+  | { status: "ready"; name: string }
+  | { status: "permissionDenied" | "busy" | "error"; message: string };
+
 export type DevicesSnapshot = {
   scanning: boolean;
   scanError: { message: string; guidance: string } | null;
+  antAdapter: AntAdapterStatus;
   slots: DeviceSlot[];
   sourcePreferences: SourcePreferences;
   sources: TelemetrySources;
