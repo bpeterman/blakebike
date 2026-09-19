@@ -222,11 +222,13 @@ describe("Ride charts", () => {
         label.querySelector(".workout-profile-block-target")?.textContent,
         label.querySelector(".workout-profile-block-duration")?.textContent,
       ]);
-    // 60 s and 30 s blocks are wide enough on the fallback canvas; 15 s free-ride blocks are not.
+    // On the 600 px fallback canvas the 15 s free-ride blocks are 59 and 60 px wide, and "Free ride"
+    // is estimated at 59.8 px, so only the last one (which gives up no gap) is labelled.
     expect(labelText()).toEqual([
       ["0", "100 W", "1:00"],
       ["1.0", "200 W", "0:30"],
       ["1.0", "200 W", "0:30"],
+      ["1.1", "Free ride", "0:15"],
     ]);
     expect(container.querySelector(".timeline-target")).toHaveTextContent("200 W");
 
@@ -235,6 +237,7 @@ describe("Ride charts", () => {
       ["0", "110 W", "1:00"],
       ["1.0", "220 W", "0:30"],
       ["1.0", "220 W", "0:30"],
+      ["1.1", "Free ride", "0:15"],
     ]);
     expect(container.querySelector(".timeline-target")).toHaveTextContent("220 W");
     expect(screen.getByText("Plan 200 W · 110% bias")).toBeInTheDocument();

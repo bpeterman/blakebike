@@ -107,6 +107,22 @@ describe("profileLabel", () => {
     expect(labelsFor([steady(300, 100)], 200, 20)).toEqual([null]);
   });
 
+  it("uses real text metrics when the drawing supplies them", () => {
+    // The estimate puts "110 W · 1:00" at 74 px, too long for the 38 px of room in a 15 px wide 110 W block.
+    // A measurer that knows the type is narrower lets the duration back in.
+    const segments = profileSegments([steady(120, 110), steady(60, 55)], FTP);
+    const scale = profileScale(segments, { width: 45, height: 100, ftpWatts: FTP });
+    const [, under] = profileShapes(segments, scale);
+    const calls: [string, string][] = [];
+    const narrow = (text: string, role: string) => {
+      calls.push([text, role]);
+      return text.length * 3;
+    };
+    expect(profileLabel(under, scale, FONT, narrow)).toMatchObject({ placement: "vertical", duration: "1:00" });
+    expect(calls).toEqual([["110 W", "target"], ["1:00", "duration"], [" · 1:00", "duration"]]);
+    expect(profileLabel(under, scale, FONT)).toMatchObject({ placement: "vertical", duration: null });
+  });
+
   it("follows the bias", () => {
     expect(labelsFor([steady(300, 100)], 200, 100, 110)[0]?.target).toBe("220 W");
     expect(labelsFor([steady(300, 100)], 200, 100, 90)[0]?.target).toBe("180 W");

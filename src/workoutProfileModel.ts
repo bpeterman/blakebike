@@ -200,15 +200,31 @@ export type ProfileLabel = {
   duration: string | null;
 };
 
+/** The two type styles a label is set in; the duration and separator share the lighter one. */
+export type LabelRole = "target" | "duration";
+
+/** Rendered width in pixels of `text` set in the style for `role`. */
+export type LabelMeasure = (text: string, role: LabelRole) => number;
+
 /** Width of a glyph relative to the font size, generous for a sans face with tabular digits. */
 const LABEL_GLYPH_RATIO = 0.62;
+/** Clearance between a label and the block's baseline or top. */
 const LABEL_PADDING_PX = 4;
+/** Clearance between a horizontal label and each side of its column; neighbours end up twice this apart. */
+const LABEL_GUTTER_PX = 2;
 /** Room above the first line's baseline for its cap height. */
 const LABEL_CAP_RATIO = 0.75;
 /** Separator between target and duration when they share one line. */
 export const LABEL_SEPARATOR = " · ";
 
-const textWidth = (text: string, fontSize: number) => text.length * fontSize * LABEL_GLYPH_RATIO;
+/**
+ * Fallback measurer for environments without text metrics. It overestimates
+ * on purpose so a label is never drawn where it might not fit.
+ */
+export const estimateLabelWidth =
+  (fontSize: number): LabelMeasure =>
+  (text) =>
+    text.length * fontSize * LABEL_GLYPH_RATIO;
 
 /**
  * Where to write a block's target and duration, or null when the block has
@@ -221,6 +237,7 @@ export const profileLabel = (
   shape: ProfileShape,
   scale: ProfileScale,
   fontSize: number,
+  measure: LabelMeasure = estimateLabelWidth(fontSize),
 ): ProfileLabel | null => {
   const target = formatIntervalTarget(shape.startWatts, shape.endWatts);
   const duration = formatDuration(shape.endSeconds - shape.startSeconds);
@@ -229,8 +246,9 @@ export const profileLabel = (
   const lowerTop = Math.max(startY, endY);
   const upperTop = Math.min(startY, endY);
   const label = { x: shape.x + shape.width / 2, lineHeight, target };
+  const targetWidth = measure(target, "target");
 
-  const widthNeeded = Math.max(textWidth(target, fontSize), textWidth(duration, fontSize)) + LABEL_PADDING_PX * 2;
+  const widthNeeded = Math.max(targetWidth, measure(duration, "duration")) + LABEL_GUTTER_PX * 2;
   if (shape.width >= widthNeeded) {
     const heightNeeded = lineHeight * 2 + fontSize * LABEL_CAP_RATIO + LABEL_PADDING_PX * 2;
     if (scale.height - lowerTop >= heightNeeded) {
@@ -245,8 +263,8 @@ export const profileLabel = (
   if (shape.width >= fontSize + 2) {
     const room = scale.height - lowerTop - LABEL_PADDING_PX * 2;
     const vertical = { ...label, placement: "vertical" as const, y: scale.height - LABEL_PADDING_PX };
-    if (textWidth(`${target}${LABEL_SEPARATOR}${duration}`, fontSize) <= room) return { ...vertical, duration };
-    if (textWidth(target, fontSize) <= room) return { ...vertical, duration: null };
+    if (targetWidth + measure(`${LABEL_SEPARATOR}${duration}`, "duration") <= room) return { ...vertical, duration };
+    if (targetWidth <= room) return { ...vertical, duration: null };
   }
   return null;
 };

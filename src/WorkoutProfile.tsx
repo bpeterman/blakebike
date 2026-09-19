@@ -1,4 +1,4 @@
-import { memo, useId, useMemo } from "react";
+import { memo, useId, useLayoutEffect, useMemo, useState, type RefObject } from "react";
 import {
   DEFAULT_BIAS_PERCENT,
   formatDuration,
@@ -16,6 +16,8 @@ import {
   profileSummary,
   repeatSpans,
   timeAxisTicks,
+  type LabelMeasure,
+  type LabelRole,
   type ProfileShape,
 } from "./workoutProfileModel";
 import { useElementSize } from "./useElementSize";
@@ -54,9 +56,40 @@ export type WorkoutProfileProps = {
 const AXIS_HEIGHT = 16;
 const REPEAT_BAND_HEIGHT = 14;
 const LABEL_FONT_PX = 10;
+/** Type weights per label role. Set as attributes so the measurer and the drawing agree. */
+const LABEL_WEIGHTS: Record<LabelRole, number> = { target: 700, duration: 500 };
 const FALLBACK_SIZE = { width: 600, height: 120 };
 
 const pathKey = (path: StepPath) => path.join(".");
+
+/**
+ * Measures label text with a canvas in the host's own font family, so labels
+ * are drawn exactly when they fit. Undefined where canvas text metrics are
+ * unavailable (jsdom), leaving the model to its conservative estimate.
+ */
+function useLabelMeasure(host: RefObject<HTMLElement | null>, fontSize: number): LabelMeasure | undefined {
+  const [fontFamily, setFontFamily] = useState<string | null>(null);
+  useLayoutEffect(() => {
+    if (host.current) setFontFamily(getComputedStyle(host.current).fontFamily);
+  }, [host]);
+  return useMemo(() => {
+    if (fontFamily === null || typeof CanvasRenderingContext2D === "undefined") return undefined;
+    const context = document.createElement("canvas").getContext("2d");
+    if (!context) return undefined;
+    const cache = new Map<string, number>();
+    return (text, role) => {
+      const font = `${LABEL_WEIGHTS[role]} ${fontSize}px ${fontFamily}`;
+      const key = `${font}|${text}`;
+      let width = cache.get(key);
+      if (width === undefined) {
+        context.font = font;
+        width = context.measureText(text).width;
+        cache.set(key, width);
+      }
+      return width;
+    };
+  }, [fontFamily, fontSize]);
+}
 
 const pointsAttribute = (points: ProfileShape["points"]) =>
   points.map(([x, y]) => `${round(x)},${round(y)}`).join(" ");
@@ -85,6 +118,7 @@ export const WorkoutProfile = memo(function WorkoutProfile({
   const [canvasRef, size] = useElementSize<HTMLDivElement>(FALLBACK_SIZE);
   const idPrefix = useId().replace(/[^a-zA-Z0-9_-]/g, "");
   const editor = variant === "editor";
+  const measureLabel = useLabelMeasure(canvasRef, LABEL_FONT_PX);
 
   const segments = useMemo(
     () => profileSegments(steps, ftpWatts, biasPercent),
@@ -183,7 +217,7 @@ export const WorkoutProfile = memo(function WorkoutProfile({
                     : shape.kind === "ramp"
                       ? `url(#${idPrefix}-ramp-${index})`
                       : zoneColor(shape.startWatts, powerZones);
-                const label = labels ? profileLabel(shape, scale, LABEL_FONT_PX) : null;
+                const label = labels ? profileLabel(shape, scale, LABEL_FONT_PX, measureLabel) : null;
                 return (
                   <g key={`${pathKey(shape.path)}:${shape.iterations.join(".")}`}>
                     <polygon
@@ -227,15 +261,22 @@ export const WorkoutProfile = memo(function WorkoutProfile({
                             : undefined
                         }
                       >
-                        <tspan className="workout-profile-block-target">{label.target}</tspan>
+                        <tspan className="workout-profile-block-target" fontWeight={LABEL_WEIGHTS.target}>
+                          {label.target}
+                        </tspan>
                         {label.duration !== null && label.placement === "vertical" && (
-                          <>
+                          <tspan className="workout-profile-block-duration" fontWeight={LABEL_WEIGHTS.duration}>
                             <tspan className="workout-profile-block-separator">{LABEL_SEPARATOR}</tspan>
-                            <tspan className="workout-profile-block-duration">{label.duration}</tspan>
-                          </>
+                            {label.duration}
+                          </tspan>
                         )}
                         {label.duration !== null && label.placement !== "vertical" && (
-                          <tspan className="workout-profile-block-duration" x={round(label.x)} dy={round(label.lineHeight)}>
+                          <tspan
+                            className="workout-profile-block-duration"
+                            fontWeight={LABEL_WEIGHTS.duration}
+                            x={round(label.x)}
+                            dy={round(label.lineHeight)}
+                          >
                             {label.duration}
                           </tspan>
                         )}
