@@ -36,6 +36,14 @@ export type Workout = {
   updatedAt: string;
 };
 
+export type WorkoutInterval = {
+  kind: Exclude<WorkoutStep["kind"], "repeat">;
+  durationSeconds: number;
+  startWatts: number | null;
+  endWatts: number | null;
+  freeRide: boolean;
+};
+
 export type Capability = "ftms" | "heartRate" | "cyclingPower" | "csc";
 
 export type DeviceInfo = {
@@ -171,6 +179,7 @@ export type RunnerState =
       elapsedSeconds: number;
       totalSeconds: number | null;
       intervalIndex: number;
+      intervalElapsedSeconds: number;
       targetPowerWatts: number | null;
       plannedTargetWatts: number | null;
       manualErg: boolean;
@@ -298,7 +307,35 @@ export const timeInZones = (
 };
 
 /** Keep chart rendering bounded while preserving the first and last samples. */
-export const downsampleTelemetry = (samples: Telemetry[], maximum = 1_200): Telemetry[] => {
+export const withActiveElapsed = <T extends Pick<Telemetry, "timestampMs">>(
+  samples: T[],
+  expectedElapsedSeconds?: number,
+  maxGapMs = 5_000,
+): Array<T & { activeElapsedMs: number }> => {
+  let elapsedMs = 0;
+  const result = samples.map((sample, index) => {
+    if (index > 0) {
+      const delta = sample.timestampMs - samples[index - 1].timestampMs;
+      if (delta > 0 && delta <= maxGapMs) elapsedMs += delta;
+    }
+    return { ...sample, activeElapsedMs: elapsedMs };
+  });
+  const expectedMs = expectedElapsedSeconds === undefined
+    ? elapsedMs
+    : Math.max(0, expectedElapsedSeconds * 1000);
+  if (elapsedMs > 0 && expectedMs !== elapsedMs) {
+    return result.map((sample) => ({
+      ...sample,
+      activeElapsedMs: Math.round((sample.activeElapsedMs / elapsedMs) * expectedMs),
+    }));
+  }
+  return result;
+};
+
+export const downsampleTelemetry = <T extends Telemetry>(
+  samples: T[],
+  maximum = 1_200,
+): T[] => {
   if (samples.length <= maximum || maximum < 2) return samples;
   const result = [samples[0]];
   const step = (samples.length - 1) / (maximum - 1);
@@ -316,6 +353,51 @@ export const workoutDuration = (steps: WorkoutStep[]): number =>
     }
     return total + step.durationSeconds;
   }, 0);
+
+const targetWatts = (target: PowerTarget, ftpWatts: number): number =>
+  target.unit === "watts"
+    ? target.value
+    : Math.min(65_535, Math.floor((ftpWatts * target.value) / 100));
+
+/** Mirrors the Rust workout compiler so interval indexes align with the runner. */
+export const compileWorkoutIntervals = (
+  steps: WorkoutStep[],
+  ftpWatts: number,
+): WorkoutInterval[] =>
+  steps.flatMap((step): WorkoutInterval[] => {
+    if (step.kind === "repeat") {
+      return Array.from(
+        { length: step.repetitions },
+        () => compileWorkoutIntervals(step.steps, ftpWatts),
+      ).flat();
+    }
+    if (step.kind === "steady") {
+      const watts = targetWatts(step.target, ftpWatts);
+      return [{
+        kind: step.kind,
+        durationSeconds: step.durationSeconds,
+        startWatts: watts,
+        endWatts: watts,
+        freeRide: false,
+      }];
+    }
+    if (step.kind === "ramp") {
+      return [{
+        kind: step.kind,
+        durationSeconds: step.durationSeconds,
+        startWatts: targetWatts(step.start, ftpWatts),
+        endWatts: targetWatts(step.end, ftpWatts),
+        freeRide: false,
+      }];
+    }
+    return [{
+      kind: step.kind,
+      durationSeconds: step.durationSeconds,
+      startWatts: null,
+      endWatts: null,
+      freeRide: true,
+    }];
+  });
 
 export const formatDuration = (seconds: number): string => {
   const hours = Math.floor(seconds / 3600);

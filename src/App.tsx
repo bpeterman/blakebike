@@ -13,7 +13,6 @@ import {
   Pause,
   Play,
   Plus,
-  Radio,
   RefreshCw,
   Settings,
   SkipForward,
@@ -51,11 +50,13 @@ import type {
   Telemetry,
   TrainingZoneSettings,
   Workout,
+  WorkoutInterval,
   WorkoutStep,
 } from "./types";
 import {
   BIAS_STEP_PERCENT,
   clampBias,
+  compileWorkoutIntervals,
   defaultRideDisplayPreferences,
   defaultTrainingZoneSettings,
   deviceRoleLabel,
@@ -70,6 +71,7 @@ import {
   powerSmoothingOptions,
   rideKeyAction,
   timeInZones,
+  withActiveElapsed,
   withSmoothedPower,
   workoutDuration,
 } from "./types";
@@ -460,7 +462,8 @@ function App() {
           <HistoryPage
             sessions={sessions}
             selected={selectedSession}
-            distanceUnit={profile.distanceUnit}
+            profile={profile}
+            trainingZones={trainingZones}
             onSelect={(session) =>
               void perform(async () =>
                 setSelectedSession(await api.session(session.id)),
@@ -733,6 +736,10 @@ export function Ride({
   const [targetDraft, setTargetDraft] = useState("100");
   const active = runner.status === "running" || runner.status === "paused" || runner.status === "countdown";
   const selected = workouts.find((workout) => workout.id === selectedWorkout);
+  const activeWorkout = selected
+    ?? ("workoutName" in runner
+      ? workouts.find((workout) => workout.name === runner.workoutName)
+      : undefined);
   const elapsed = runner.status === "running" || runner.status === "paused" ? runner.elapsedSeconds : 0;
   const total = runner.status === "running" || runner.status === "paused" ? runner.totalSeconds : selected ? workoutDuration(selected.steps) : 0;
   const progress = total ? Math.min(100, (elapsed / total) * 100) : 0;
@@ -753,8 +760,8 @@ export function Ride({
     [telemetryHistory, powerSmoothing],
   );
   const chartHistory = useMemo(
-    () => downsampleTelemetry(smoothedHistory),
-    [smoothedHistory],
+    () => downsampleTelemetry(withActiveElapsed(smoothedHistory, elapsed)),
+    [elapsed, smoothedHistory],
   );
   const powerZones = useMemo(
     () => effectivePowerZones(trainingZones, profile.ftpWatts),
@@ -768,6 +775,12 @@ export function Ride({
     powerSmoothing === "instant"
       ? telemetry.powerWatts
       : smoothedHistory[smoothedHistory.length - 1]?.displayPowerWatts ?? telemetry.powerWatts;
+  const workoutIntervals = useMemo(
+    () => activeWorkout
+      ? compileWorkoutIntervals(activeWorkout.steps, profile.ftpWatts)
+      : [],
+    [activeWorkout, profile.ftpWatts],
+  );
 
   useEffect(() => {
     if (targetPower !== null) setTargetDraft(String(targetPower));
@@ -821,7 +834,7 @@ export function Ride({
 
   return (
     <>
-      <PageHeader eyebrow={active ? "WORKOUT IN PROGRESS" : "TRAINING ROOM"} title={active && "workoutName" in runner ? runner.workoutName : "Start a ride"} />
+      {!active && <PageHeader eyebrow="TRAINING ROOM" title="Start a ride" />}
       {!connected && <div className="notice"><Bluetooth /><div><strong>No trainer connected</strong><p>Connect a trainer or the simulator to begin.</p></div><button className="primary" onClick={onConnect}>Connect</button></div>}
       {!active ? (
         <section className="ride-setup">
@@ -867,7 +880,7 @@ export function Ride({
                 </span>
               } />
             <LiveMetric
-              icon={Gauge}
+              icon={RefreshCw}
               label="CADENCE"
               value={Math.round(telemetry.cadenceRpm ?? 0)}
               unit="rpm"
@@ -880,8 +893,24 @@ export function Ride({
                 />
               }
             />
-            <LiveMetric icon={Radio} label="SPEED" value={displayedSpeed.value} unit={displayedSpeed.unit} />
+            <LiveMetric icon={Gauge} label="SPEED" value={displayedSpeed.value} unit={displayedSpeed.unit} />
             <LiveMetric icon={HeartPulse} label="HEART RATE" value={telemetry.heartRateBpm ?? "—"} unit="bpm" note={sourceNote(telemetry.sources?.heartRate)} />
+          </div>
+          {structured && workoutIntervals.length > 0 && (
+            <WorkoutTimeline
+              intervals={workoutIntervals}
+              workoutName={runner.workoutName}
+              currentIndex={runner.intervalIndex}
+              intervalElapsedSeconds={runner.intervalElapsedSeconds}
+              elapsedSeconds={elapsed}
+              totalSeconds={total ?? 0}
+              paused={runner.status === "paused"}
+            />
+          )}
+          <div className="ride-controls">
+            <button className="secondary control" onClick={() => void perform(() => api.pauseOrResume(), "pause/resume")}>{runner.status === "paused" ? <Play /> : <Pause />} {runner.status === "paused" ? "Resume" : "Pause"}</button>
+            {!openEnded && <button className="secondary control" onClick={() => void perform(() => api.skipInterval(), "skip interval")}><SkipForward /> Skip</button>}
+            <button className="stop control" onClick={() => void perform(() => api.stopWorkout(), "stop workout")}><CircleStop /> End ride</button>
           </div>
           <div className="card live-chart">
             <div className="chart-heading">
@@ -994,11 +1023,6 @@ export function Ride({
               />
             </div>
           )}
-          <div className="ride-controls">
-            <button className="secondary control" onClick={() => void perform(() => api.pauseOrResume(), "pause/resume")}>{runner.status === "paused" ? <Play /> : <Pause />} {runner.status === "paused" ? "Resume" : "Pause"}</button>
-            {!openEnded && <button className="secondary control" onClick={() => void perform(() => api.skipInterval(), "skip interval")}><SkipForward /> Skip</button>}
-            <button className="stop control" onClick={() => void perform(() => api.stopWorkout(), "stop workout")}><CircleStop /> End ride</button>
-          </div>
         </section>
       )}
       {runner.status === "finished" && <div className="toast success-toast">Ride saved to history.</div>}
@@ -1006,7 +1030,9 @@ export function Ride({
   );
 }
 
-function HistoryPage({ sessions, selected, distanceUnit, onSelect, onClose, onExport, onExportFit, onGarmin }: { sessions: SessionSummary[]; selected: SessionDetail | null; distanceUnit: Profile["distanceUnit"]; onSelect: (session: SessionSummary) => void; onClose: () => void; onExport: (session: SessionSummary) => void; onExportFit: (session: SessionSummary) => void; onGarmin: (session: SessionSummary) => void }) {
+function HistoryPage({ sessions, selected, profile, trainingZones, onSelect, onClose, onExport, onExportFit, onGarmin }: { sessions: SessionSummary[]; selected: SessionDetail | null; profile: Profile; trainingZones: TrainingZoneSettings; onSelect: (session: SessionSummary) => void; onClose: () => void; onExport: (session: SessionSummary) => void; onExportFit: (session: SessionSummary) => void; onGarmin: (session: SessionSummary) => void }) {
+  const powerZones = effectivePowerZones(trainingZones, profile.ftpWatts);
+  const heartRateZones = effectiveHeartRateZones(trainingZones, profile.maxHeartRateBpm);
   return (
     <>
       <PageHeader eyebrow={`${sessions.length} RECORDED RIDES`} title="Ride history" />
@@ -1014,9 +1040,9 @@ function HistoryPage({ sessions, selected, distanceUnit, onSelect, onClose, onEx
       <div className="history-list">{sessions.map((session) => <button key={session.id} className="history-row" onClick={() => onSelect(session)}>
         <span className={session.completed ? "completion complete" : "completion"}>{session.completed ? "✓" : "–"}</span>
         <div className="history-title"><strong>{session.workoutName}</strong><span>{new Date(session.startedAt).toLocaleString()}</span></div>
-        <Metric value={formatDuration(session.elapsedSeconds)} unit="duration" /><Metric value={`${session.averagePowerWatts}`} unit="W avg" /><DistanceMetric meters={session.estimatedDistanceMeters} unit={distanceUnit} /><ChevronRight />
+        <Metric value={formatDuration(session.elapsedSeconds)} unit="duration" /><Metric value={`${session.averagePowerWatts}`} unit="W avg" /><DistanceMetric meters={session.estimatedDistanceMeters} unit={profile.distanceUnit} /><ChevronRight />
       </button>)}</div>}
-      {selected && <div className="modal-backdrop"><div className="modal detail-modal"><button className="modal-close" onClick={onClose}><X /></button><span className="label">RIDE DETAIL</span><h2>{selected.summary.workoutName}</h2><p>{new Date(selected.summary.startedAt).toLocaleString()}</p><div className="detail-metrics"><Metric value={formatDuration(selected.summary.elapsedSeconds)} unit="duration" /><Metric value={`${selected.summary.averagePowerWatts}`} unit="W average" /><Metric value={`${selected.summary.maxPowerWatts}`} unit="W maximum" /><Metric value={`${Math.round(selected.summary.averageCadenceRpm ?? 0)}`} unit="rpm average" /><DistanceMetric meters={selected.summary.estimatedDistanceMeters} unit={distanceUnit} /></div><p className="distance-note">Estimated distance · {distanceSourceLabel(selected.summary.distanceSource)}</p><div className="history-charts"><h3>Power</h3><SessionAreaChart samples={downsampleTelemetry(selected.samples)} dataKey="powerWatts" unit="W" color="#c8ff32" name="Power" domain={[0, "dataMax + 50"]}/><h3>Heart rate</h3><SessionAreaChart samples={downsampleTelemetry(selected.samples)} dataKey="heartRateBpm" unit="bpm" color="#ff6f7d" name="Heart rate" domain={["dataMin - 10", "dataMax + 10"]}/></div><div className="detail-actions"><button className="primary" onClick={() => onGarmin(selected.summary)}><Upload size={16}/> Upload to Garmin</button><button className="secondary" onClick={() => onExportFit(selected.summary)}><Download size={16}/> Export FIT</button><button className="secondary" onClick={() => onExport(selected.summary)}><Download size={16}/> Export CSV</button></div><p className="handoff-note">Garmin Connect and Finder will open. Drag the selected FIT file onto Garmin’s import page, then confirm the upload.</p></div></div>}
+      {selected && <div className="modal-backdrop"><div className="modal detail-modal"><button className="modal-close" onClick={onClose}><X /></button><span className="label">RIDE DETAIL</span><h2>{selected.summary.workoutName}</h2><p>{new Date(selected.summary.startedAt).toLocaleString()}</p><div className="detail-metrics"><Metric value={formatDuration(selected.summary.elapsedSeconds)} unit="duration" /><Metric value={`${selected.summary.averagePowerWatts}`} unit="W average" /><Metric value={`${selected.summary.maxPowerWatts}`} unit="W maximum" /><Metric value={`${Math.round(selected.summary.averageCadenceRpm ?? 0)}`} unit="rpm average" /><DistanceMetric meters={selected.summary.estimatedDistanceMeters} unit={profile.distanceUnit} /></div><p className="distance-note">Estimated distance · {distanceSourceLabel(selected.summary.distanceSource)}</p><div className="history-charts"><h3>Power</h3><SessionAreaChart samples={downsampleTelemetry(withActiveElapsed(selected.samples, selected.summary.elapsedSeconds))} dataKey="powerWatts" unit="W" color="#c8ff32" name="Power" domain={[0, "dataMax + 50"]}/><h3>Heart rate</h3><SessionAreaChart samples={downsampleTelemetry(withActiveElapsed(selected.samples, selected.summary.elapsedSeconds))} dataKey="heartRateBpm" unit="bpm" color="#ff6f7d" name="Heart rate" domain={["dataMin - 10", "dataMax + 10"]}/><div className="zone-chart-grid history-zone-charts"><TimeInZoneChart title="Power zones" zones={powerZones} seconds={timeInZones(selected.samples, powerZones, "power")}/><TimeInZoneChart title="Heart-rate zones" zones={heartRateZones} seconds={timeInZones(selected.samples, heartRateZones, "heartRate")}/></div></div><div className="detail-actions"><button className="primary" onClick={() => onGarmin(selected.summary)}><Upload size={16}/> Upload to Garmin</button><button className="secondary" onClick={() => onExportFit(selected.summary)}><Download size={16}/> Export FIT</button><button className="secondary" onClick={() => onExport(selected.summary)}><Download size={16}/> Export CSV</button></div><p className="handoff-note">Garmin Connect and Finder will open. Drag the selected FIT file onto Garmin’s import page, then confirm the upload.</p></div></div>}
     </>
   );
 }
@@ -1234,14 +1260,13 @@ function SessionAreaChart({
   name,
   domain,
 }: {
-  samples: Array<Telemetry & { displayPowerWatts?: number }>;
+  samples: Array<Telemetry & { displayPowerWatts?: number; activeElapsedMs: number }>;
   dataKey: "powerWatts" | "displayPowerWatts" | "heartRateBpm";
   unit: string;
   color: string;
   name: string;
   domain: [number | string, number | string];
 }) {
-  const start = samples[0]?.timestampMs ?? 0;
   const gradientId = `fill-${dataKey}`;
   return (
     <ResponsiveContainer width="100%" height={220}>
@@ -1254,15 +1279,15 @@ function SessionAreaChart({
         </defs>
         <CartesianGrid strokeDasharray="4 4" vertical={false} />
         <XAxis
-          dataKey="timestampMs"
+          dataKey="activeElapsedMs"
           type="number"
           domain={["dataMin", "dataMax"]}
-          tickFormatter={(value) => formatDuration(Math.max(0, Math.round((Number(value) - start) / 1000)))}
+          tickFormatter={(value) => formatDuration(Math.max(0, Math.round(Number(value) / 1000)))}
           minTickGap={45}
         />
         <YAxis width={42} domain={domain} />
         <Tooltip
-          labelFormatter={(value) => formatDuration(Math.max(0, Math.round((Number(value) - start) / 1000)))}
+          labelFormatter={(value) => formatDuration(Math.max(0, Math.round(Number(value) / 1000)))}
           formatter={(value) => [`${value ?? "—"} ${unit}`, name]}
         />
         <Area
@@ -1294,7 +1319,7 @@ function TimeInZoneChart({
   }));
   return (
     <div className="card zone-chart">
-      <div className="chart-heading"><div><span className="label">LIVE TOTALS</span><h3>{title}</h3></div></div>
+      <div className="chart-heading"><div><span className="label">TIME IN ZONE</span><h3>{title}</h3></div></div>
       <ResponsiveContainer width="100%" height={Math.max(150, data.length * 30)}>
         <BarChart data={data} layout="vertical" margin={{ left: 4, right: 12 }}>
           <XAxis type="number" hide />
@@ -1381,6 +1406,98 @@ function WorkoutEditor({ initial, close, save }: { initial: Workout; close: () =
 
 function TargetInput({ label, target, onChange }: { label: string; target: { unit: "watts" | "percentFtp"; value: number }; onChange: (target: { unit: "watts" | "percentFtp"; value: number }) => void }) {
   return <label>{label}<input type="number" min="1" max="300" value={target.unit === "percentFtp" ? target.value : target.value} onChange={(event) => onChange({ unit: "percentFtp", value: Number(event.target.value) })}/></label>;
+}
+
+function WorkoutTimeline({
+  intervals,
+  workoutName,
+  currentIndex,
+  intervalElapsedSeconds,
+  elapsedSeconds,
+  totalSeconds,
+  paused,
+}: {
+  intervals: WorkoutInterval[];
+  workoutName: string;
+  currentIndex: number;
+  intervalElapsedSeconds: number;
+  elapsedSeconds: number;
+  totalSeconds: number;
+  paused: boolean;
+}) {
+  const current = intervals[currentIndex];
+  if (!current) return null;
+
+  const maximumWatts = Math.max(
+    1,
+    ...intervals.flatMap((interval) => [interval.startWatts ?? 0, interval.endWatts ?? 0]),
+  );
+  const currentRemaining = Math.max(0, current.durationSeconds - intervalElapsedSeconds);
+  const workoutRemaining = Math.max(0, totalSeconds - elapsedSeconds);
+  const currentTarget = current.freeRide
+    ? "Free ride"
+    : current.startWatts === current.endWatts
+      ? `${current.startWatts} W`
+      : `${current.startWatts}–${current.endWatts} W`;
+
+  return (
+    <section className="card workout-timeline" aria-label="Workout timeline">
+      <div className="timeline-heading">
+        <div>
+          <span className="label">{workoutName}</span>
+          <h3>Block {currentIndex + 1} of {intervals.length}</h3>
+          <span className="timeline-target">{currentTarget}{paused ? " · Paused" : ""}</span>
+        </div>
+        <div className="timeline-countdowns">
+          <div>
+            <span>Current block</span>
+            <strong>{formatDuration(currentRemaining)}</strong>
+          </div>
+          <div>
+            <span>Workout remaining</span>
+            <strong>{formatDuration(workoutRemaining)}</strong>
+          </div>
+        </div>
+      </div>
+      <div className="workout-timeline-scroll">
+        <div
+          className="workout-timeline-track"
+          style={{ width: `${Math.max(100, intervals.length * 3)}%` }}
+        >
+          {intervals.map((interval, index) => {
+            const state = index < currentIndex
+              ? "completed"
+              : index === currentIndex
+                ? "current"
+                : "upcoming";
+            const startHeight = ((interval.startWatts ?? maximumWatts * 0.35) / maximumWatts) * 100;
+            const endHeight = ((interval.endWatts ?? maximumWatts * 0.35) / maximumWatts) * 100;
+            const progress = state === "completed"
+              ? 100
+              : state === "current"
+                ? Math.min(100, (intervalElapsedSeconds / interval.durationSeconds) * 100)
+                : 0;
+            return (
+              <div
+                className={`workout-timeline-block ${state}`}
+                data-state={state}
+                aria-label={`Block ${index + 1} of ${intervals.length}, ${state}`}
+                key={index}
+                style={{ width: `${(interval.durationSeconds / totalSeconds) * 100}%` }}
+              >
+                <i
+                  style={{
+                    clipPath: `polygon(0 ${100 - startHeight}%, 100% ${100 - endHeight}%, 100% 100%, 0 100%)`,
+                    background: `linear-gradient(90deg, var(--timeline-progress) ${progress}%, var(--timeline-rest) ${progress}%)`,
+                  }}
+                />
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </section>
+  );
 }
 
 function WorkoutBars({ steps }: { steps: WorkoutStep[] }) {

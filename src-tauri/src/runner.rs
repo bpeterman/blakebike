@@ -68,6 +68,7 @@ pub enum RunnerState {
         elapsed_seconds: u32,
         total_seconds: Option<u32>,
         interval_index: usize,
+        interval_elapsed_seconds: u32,
         target_power_watts: Option<u16>,
         planned_target_watts: Option<u16>,
         manual_erg: bool,
@@ -656,6 +657,7 @@ async fn run_timeline(
                         elapsed_seconds: elapsed,
                         total_seconds,
                         interval_index,
+                        interval_elapsed_seconds: interval_elapsed,
                         target_power_watts: if interval.free_ride {
                             Some(manual_target.load(Ordering::Relaxed))
                         } else {
@@ -927,6 +929,27 @@ mod tests {
         assert_eq!(json["overrideActive"], false);
         assert!(json["plannedTargetWatts"].is_null());
         assert!(json.get("workout_name").is_none());
+    }
+
+    #[test]
+    fn paused_state_keeps_interval_elapsed_time() {
+        let state = RunnerState::Paused {
+            session_id: Uuid::nil(),
+            workout_name: "Intervals".into(),
+            elapsed_seconds: 75,
+            total_seconds: Some(300),
+            interval_index: 1,
+            interval_elapsed_seconds: 15,
+            target_power_watts: Some(200),
+            planned_target_watts: Some(200),
+            manual_erg: false,
+            override_active: false,
+            bias_percent: DEFAULT_BIAS_PERCENT,
+        };
+        let json = serde_json::to_value(state).unwrap();
+
+        assert_eq!(json["intervalIndex"], 1);
+        assert_eq!(json["intervalElapsedSeconds"], 15);
     }
 
     #[test]
