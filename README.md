@@ -56,6 +56,17 @@ marked `BLE`. A missing ANT stick is ignored, while permission and busy-device
 failures are shown alongside the scan results. Close Garmin Express or another
 fitness app if it has exclusive access to the stick.
 
+If the stick or monitor is still missing, collect a read-only Linux diagnostic:
+
+```sh
+./scripts/diagnose-ant-linux.sh 2>&1 | tee ant-diagnostics.txt
+```
+
+The report checks USB descriptors, sysfs interfaces and drivers, raw USB and
+serial permissions, process holders, udev rules, kernel messages, and recent
+BlakeBike ANT log lines. Paste the complete `ant-diagnostics.txt` into the
+shared troubleshooting note. It does not use `sudo` or modify the system.
+
 ## Debugging
 
 Everything the app does is written to a daily log file (14 days kept), shown
