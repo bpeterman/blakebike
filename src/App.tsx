@@ -280,8 +280,7 @@ function App() {
   );
   const active =
     runner.status === "running" ||
-    runner.status === "paused" ||
-    runner.status === "countdown";
+    runner.status === "paused";
   const riding = runner.status === "running" || runner.status === "paused";
 
   const perform = useCallback(async (action: () => Promise<unknown>, label = "user action") => {
@@ -783,7 +782,7 @@ export function Ride({
   const [targetDraft, setTargetDraft] = useState("100");
   const [powerChartExpanded, setPowerChartExpanded] = useState(true);
   const [heartRateChartExpanded, setHeartRateChartExpanded] = useState(true);
-  const active = runner.status === "running" || runner.status === "paused" || runner.status === "countdown";
+  const active = runner.status === "running" || runner.status === "paused";
   const selected = workouts.find((workout) => workout.id === selectedWorkout);
   const activeWorkout = selected
     ?? ("workoutName" in runner
@@ -1118,7 +1117,6 @@ export function Ride({
         </section>
       ) : (
         <section className="live-ride">
-          {runner.status === "countdown" && <div className="countdown">{runner.seconds}</div>}
           <div className="live-ride-grid">
             {displayPreferences.cards.map((card) =>
               card.visible ? (

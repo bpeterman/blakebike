@@ -41,10 +41,6 @@ const NO_OVERRIDE: u16 = 0;
 )]
 pub enum RunnerState {
     Idle,
-    Countdown {
-        seconds: u8,
-        workout_name: String,
-    },
     Running {
         session_id: Uuid,
         workout_name: String,
@@ -268,40 +264,10 @@ impl WorkoutRunner {
             .bias_percent
             .store(DEFAULT_BIAS_PERCENT, Ordering::Relaxed);
         self.standalone.store(standalone, Ordering::Relaxed);
-        *self.state.write().await = RunnerState::Countdown {
-            seconds: 3,
-            workout_name: ride_name.clone(),
-        };
-        emit_state(&app, &self.state).await;
 
         let state = self.state.clone();
         let controls = self.controls.clone();
         let worker = tokio::spawn(async move {
-            for remaining in (1..=3).rev() {
-                *state.write().await = RunnerState::Countdown {
-                    seconds: remaining,
-                    workout_name: ride_name.clone(),
-                };
-                emit_state(&app, &state).await;
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                if controls.control.load(Ordering::Relaxed) == STOPPED {
-                    let _ = finish(
-                        &app,
-                        &storage,
-                        &state,
-                        session.clone(),
-                        0,
-                        0,
-                        0,
-                        0.0,
-                        0,
-                        0,
-                        false,
-                    )
-                    .await;
-                    return;
-                }
-            }
             let result = run_timeline(
                 &app,
                 &ride_name,

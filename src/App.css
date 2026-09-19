@@ -254,8 +254,6 @@ p { color: #8d9587; font-size: 13px; }
 .progress i { display: block; height: 100%; background: #c8ff32; }
 .open-ended-time { display: flex; align-items: baseline; justify-content: center; gap: 10px; color: #737c6e; font-size: 10px; text-transform: uppercase; letter-spacing: .08em; }
 .open-ended-time strong { color: #e8ede3; font-size: 17px; letter-spacing: 0; }
-.countdown { position: fixed; z-index: 20; inset: 0; display: grid; place-items: center; color: #c8ff32; background: rgba(12,14,11,.88); font-size: 160px; font-weight: 800; }
-
 .history-list { overflow: hidden; border: 1px solid #2b3029; border-radius: 13px; }
 .history-row { width: 100%; display: grid; grid-template-columns: auto 1fr 100px 100px 100px auto; align-items: center; gap: 15px; padding: 15px 18px; border: 0; border-bottom: 1px solid #292e27; color: #e8ede3; background: #191c18; text-align: left; }
 .history-row:last-child { border-bottom: 0; }

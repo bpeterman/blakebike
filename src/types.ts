@@ -153,7 +153,6 @@ export type Telemetry = {
 
 export type RunnerState =
   | { status: "idle" }
-  | { status: "countdown"; seconds: number; workoutName: string }
   | {
       status: "running";
       sessionId: string;
