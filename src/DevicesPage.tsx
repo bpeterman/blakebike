@@ -61,6 +61,7 @@ export function DevicesPage({
   onConnect,
   onCalibrate,
   onSourcePreference,
+  onOfferUndo = () => undefined,
   perform,
 }: {
   hub: DevicesSnapshot | null;
@@ -68,6 +69,7 @@ export function DevicesPage({
   onConnect: (role: DeviceRole) => void;
   onCalibrate: () => void;
   onSourcePreference: (metric: Metric, choice: SourceChoice) => void;
+  onOfferUndo?: (message: string, action: () => Promise<void>) => void;
   perform: (action: () => Promise<unknown>, label?: string) => Promise<void>;
 }) {
   const [known, setKnown] = useState<KnownDevice[]>([]);
@@ -169,7 +171,14 @@ export function DevicesPage({
                     className="icon-button danger"
                     aria-label={`Forget ${device.name}`}
                     title="Forget this device"
-                    onClick={() => void perform(async () => { await api.forgetDevice(device.id); refreshKnown(); }, "forget device")}
+                    onClick={() => void perform(async () => {
+                      await api.forgetDevice(device.id);
+                      refreshKnown();
+                      onOfferUndo(`“${device.name}” forgotten.`, async () => {
+                        await api.restoreKnownDevices([device]);
+                        refreshKnown();
+                      });
+                    }, "forget device")}
                   >
                     <Trash2 size={16} />
                   </button>
