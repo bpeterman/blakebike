@@ -41,11 +41,15 @@ and the signed-in user must have access to its system D-Bus service.
 
 ## Debugging
 
-Everything the app does is written to a single log file, shown (with a
-"Show in folder" button) under Settings → Data & Diagnostics:
+Everything the app does is written to a daily log file (14 days kept), shown
+(with a "Show in folder" button) under Settings → Data & Diagnostics:
 
-- macOS: `~/Library/Logs/com.bpeterman.blakebike/blakebike.log`
-- Linux: `~/.local/share/com.bpeterman.blakebike/logs/blakebike.log`
+- macOS: `~/Library/Logs/com.bpeterman.blakebike/blakebike.YYYY-MM-DD.log`
+- Linux: `~/.local/share/com.bpeterman.blakebike/logs/blakebike.YYYY-MM-DD.log`
+
+Dates are UTC. On startup the app also closes any ride the previous run never
+finished (crash, kill, power loss) from the samples it had recorded, and
+regenerates missing FIT files.
 
 Every finalized ride is also written to the app data directory under
 `Ride Files/`. These FIT files are permanent local copies; missing files are
@@ -62,8 +66,9 @@ the UI shows. When reporting a problem, note the time, reproduce it, and grep
 the log around that time:
 
 ```sh
-tail -f ~/Library/Logs/com.bpeterman.blakebike/blakebike.log   # follow live
-grep -n "ERROR\|WARN" ~/Library/Logs/com.bpeterman.blakebike/blakebike.log
+LOG=~/Library/Logs/com.bpeterman.blakebike/blakebike.$(date -u +%F).log
+tail -f "$LOG"                 # follow live
+grep -n "ERROR\|WARN" "$LOG"
 ```
 
 For a one-off run with even more detail (raw BLE notifications, every

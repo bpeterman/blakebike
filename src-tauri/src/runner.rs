@@ -282,6 +282,8 @@ pub struct WorkoutRunner {
     worker: tokio::sync::Mutex<Option<JoinHandle<()>>>,
     /// Where finalized rides are written as FIT files.
     ride_files_dir: PathBuf,
+    /// Keeps the machine and display awake while a ride is active.
+    awake: Arc<std::sync::Mutex<Option<keepawake::KeepAwake>>>,
 }
 
 impl Default for WorkoutRunner {
@@ -299,6 +301,7 @@ impl WorkoutRunner {
             manual_adjustment_lock: tokio::sync::Mutex::new(()),
             worker: tokio::sync::Mutex::new(None),
             ride_files_dir,
+            awake: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -406,6 +409,29 @@ impl WorkoutRunner {
         let session = storage.start_session(workout_id, &ride_name, distance_weight_kg)?;
         let session_id = session.id;
         devices.set_ride_active(true);
+        // A ride is not a good time for the Mac to go to sleep. Headless runs
+        // (tests) leave power management alone.
+        if app.is_some() {
+            let assertion = keepawake::Builder::default()
+                .display(true)
+                .idle(true)
+                .reason("Ride in progress")
+                .app_name("blake.bike")
+                .app_reverse_domain("com.bpeterman.blakebike")
+                .create();
+            match assertion {
+                Ok(assertion) => {
+                    tracing::info!("Sleep prevented for the duration of the ride");
+                    *self
+                        .awake
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(assertion);
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "Could not prevent sleep; the ride runs anyway")
+                }
+            }
+        }
         tracing::info!(
             session_id = %session_id,
             workout_id = ?workout_id,
@@ -453,6 +479,7 @@ impl WorkoutRunner {
             recorder: Recorder::start(storage.clone(), session_id),
         };
         let ride_files_dir = self.ride_files_dir.clone();
+        let awake = self.awake.clone();
         let supervisor_app = app;
         let supervisor_state = self.state.clone();
         let supervisor_storage = storage.clone();
@@ -477,6 +504,14 @@ impl WorkoutRunner {
                 tracing::warn!("Trainer writer did not wind down in time");
             }
             ride.devices.set_ride_active(false);
+            if awake
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+                .is_some()
+            {
+                tracing::info!("Sleep allowed again");
+            }
             *ride.state.write().await = RunnerState::Finished {
                 session_id,
                 completed,
@@ -738,6 +773,22 @@ impl WorkoutRunner {
             Ok(())
         } else {
             Err("No active interval to skip".into())
+        }
+    }
+
+    /// Stop the ride (if any) and wait, bounded, until it is finalized: the
+    /// session summary and FIT file written and the trainer told to stop.
+    /// Used on app exit so the process does not die mid-finalization.
+    pub async fn stop_and_wait(&self, grace: Duration) {
+        let active = self.controls.control.load(Ordering::Relaxed) <= PAUSED;
+        if active {
+            let _ = self.stop().await;
+        }
+        let worker = self.worker.lock().await.take();
+        if let Some(worker) = worker
+            && tokio::time::timeout(grace, worker).await.is_err()
+        {
+            tracing::warn!("Ride did not finalize within the shutdown grace period");
         }
     }
 
@@ -2047,6 +2098,38 @@ mod tests {
             started.elapsed()
         );
         assert_eq!(set_target_writes(&rig.hub), vec![120, 180]);
+        rig.hub.disconnect().await;
+    }
+
+    #[tokio::test]
+    async fn stop_and_wait_returns_with_the_session_finalized() {
+        let rig = rig().await;
+        let session_id = rig
+            .runner
+            .start_free_ride(None, 800, 84.0, rig.hub.clone(), rig.storage.clone())
+            .await
+            .unwrap();
+        wait_for(&rig.runner, |state| {
+            matches!(state, RunnerState::Running { .. })
+        })
+        .await;
+        rig.runner.stop_and_wait(Duration::from_secs(5)).await;
+        // No polling: by the time it returns, the ride is closed.
+        assert!(matches!(
+            rig.runner.state().await,
+            RunnerState::Finished { .. }
+        ));
+        assert!(
+            rig.storage
+                .session(session_id)
+                .unwrap()
+                .unwrap()
+                .summary
+                .ended_at
+                .is_some()
+        );
+        // Calling it again with nothing active is harmless.
+        rig.runner.stop_and_wait(Duration::from_secs(1)).await;
         rig.hub.disconnect().await;
     }
 

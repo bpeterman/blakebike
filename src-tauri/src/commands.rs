@@ -667,14 +667,16 @@ fn ensure_session_fit(state: &AppState, session_id: Uuid) -> Result<PathBuf, Str
 
 #[tauri::command]
 pub fn get_log_file_path(state: State<'_, AppState>) -> String {
-    state.log_path.display().to_string()
+    state.log_path().display().to_string()
 }
 
 /// Reveal the log file in Finder / the system file manager.
 #[tauri::command]
 pub fn reveal_log_file(state: State<'_, AppState>) -> Result<(), String> {
     tracing::info!("Revealing log file");
-    tauri_plugin_opener::reveal_item_in_dir(&state.log_path)
+    let path = state.log_path();
+    tauri_plugin_opener::reveal_item_in_dir(&path)
+        .or_else(|_| tauri_plugin_opener::open_path(&state.log_dir, None::<&str>))
         .map_err(|error| format!("Could not open log location: {error}"))
 }
 
