@@ -1,6 +1,8 @@
+import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import type {
   CalibrationProgress,
   ConnectProgress,
@@ -35,7 +37,11 @@ export type WorkoutExportResult = {
   directory: string;
 };
 
+export const websiteUrl = "https://blake.bike";
+
 export const api = {
+  appVersion: () => getVersion(),
+  openWebsite: () => openUrl(websiteUrl),
   deviceState: () => invoke<DeviceState>("device_state"),
   scanTrainers: () => invoke<DeviceInfo[]>("scan_trainers"),
   connectTrainer: (device: DeviceInfo) =>

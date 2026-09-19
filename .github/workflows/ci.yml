@@ -30,9 +30,19 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libdbus-1-dev pkg-config
       - run: pnpm install --frozen-lockfile
+      - run: pnpm release:check
       - run: pnpm check
       - run: pnpm test
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
       - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
       - run: cargo test --manifest-path src-tauri/Cargo.toml
       - run: pnpm tauri build --no-bundle
+
+      # The released dmg is universal, so Intel has to keep compiling even
+      # though every runner and every dev machine here is Apple Silicon.
+      - name: Add the Intel target
+        if: runner.os == 'macOS'
+        run: rustup target add x86_64-apple-darwin
+      - name: Build for Intel Macs
+        if: runner.os == 'macOS'
+        run: pnpm tauri build --no-bundle --target x86_64-apple-darwin

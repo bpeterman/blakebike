@@ -16,9 +16,11 @@ import {
   ChevronUp,
   CircleStop,
   Download,
+  ExternalLink,
   Gauge,
   HeartPulse,
   History,
+  Info,
   Library,
   Pause,
   Play,
@@ -44,6 +46,12 @@ import {
   YAxis,
 } from "recharts";
 import { api } from "./api";
+import {
+  formatReleaseDate,
+  releaseFor,
+  releases,
+  type Release,
+} from "./releaseNotes";
 import type {
   DeviceRole,
   DeviceState,
@@ -1771,7 +1779,105 @@ export function SettingsPage({
           </span>
         </label>
       </section>
+      <AboutCard />
     </>
+  );
+}
+
+function AboutCard() {
+  const [version, setVersion] = useState<string | null>(null);
+  const [showNotes, setShowNotes] = useState(false);
+  useEffect(() => {
+    void api
+      .appVersion()
+      .then(setVersion)
+      .catch(() => undefined);
+  }, []);
+  const release = releaseFor(version);
+  const released = formatReleaseDate(release?.date ?? null);
+  return (
+    <section className="card settings-card about-card">
+      <div>
+        <span className="label">ABOUT</span>
+        <h2>blake.bike {version ?? release?.version ?? ""}</h2>
+        {release?.summary && <p>{release.summary}</p>}
+        {released && <p className="settings-note">Released {released}</p>}
+      </div>
+      <div className="settings-actions">
+        <button
+          className="secondary"
+          disabled={releases.length === 0}
+          onClick={() => setShowNotes(true)}
+        >
+          <Info size={16} /> Release notes
+        </button>
+        <button className="secondary" onClick={() => void api.openWebsite().catch(() => undefined)}>
+          <ExternalLink size={16} /> blake.bike
+        </button>
+      </div>
+      {showNotes && (
+        <ReleaseNotesModal
+          currentVersion={version ?? release?.version ?? null}
+          onClose={() => setShowNotes(false)}
+        />
+      )}
+    </section>
+  );
+}
+
+export function ReleaseNotesModal({
+  currentVersion,
+  onClose,
+}: {
+  currentVersion: string | null;
+  onClose: () => void;
+}) {
+  return (
+    <div className="modal-backdrop">
+      <div className="modal release-notes-modal">
+        <button className="modal-close" onClick={onClose} aria-label="Close release notes"><X /></button>
+        <span className="label">RELEASE NOTES</span>
+        <h2>What's new in blake.bike</h2>
+        <div className="release-list">
+          {releases.map((release) => (
+            <ReleaseEntry
+              key={release.version}
+              release={release}
+              installed={release.version === currentVersion}
+            />
+          ))}
+        </div>
+        <div className="modal-actions">
+          <button className="primary" onClick={onClose}>Close</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ReleaseEntry({ release, installed }: { release: Release; installed: boolean }) {
+  const released = formatReleaseDate(release.date);
+  return (
+    <article className="release-entry">
+      <header>
+        <h3>
+          {release.version}
+          {installed && <span className="release-installed">Installed</span>}
+        </h3>
+        {released && <span className="release-date">{released}</span>}
+      </header>
+      {release.summary && <p className="release-summary">{release.summary}</p>}
+      {release.sections.map((section) => (
+        <div className="release-section" key={section.title}>
+          <span className="label">{section.title.toUpperCase()}</span>
+          <ul>
+            {section.items.map((item) => (
+              <li key={item}>{item}</li>
+            ))}
+          </ul>
+        </div>
+      ))}
+    </article>
   );
 }
 

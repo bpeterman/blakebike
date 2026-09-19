@@ -1,0 +1,69 @@
+name: Release
+
+# Publishing is deliberately manual: you commit the version bump and push a
+# `vX.Y.Z` tag (see docs/releasing.md). This workflow does the rest.
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  macos:
+    name: macOS dmg
+    runs-on: macos-14
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.4.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - run: pnpm install --frozen-lockfile
+
+      # Refuse to publish a tag that disagrees with the manifests or changelog.
+      - run: node scripts/release.mjs check --tag ${{ github.ref_name }}
+      - run: pnpm check
+      - run: pnpm test
+
+      - name: Extract release notes
+        id: notes
+        run: |
+          {
+            echo 'body<<CHANGELOG_EOF'
+            node scripts/release.mjs notes ${{ github.ref_name }}
+            echo
+            echo '---'
+            echo
+            echo 'This build is not signed or notarized by Apple. macOS will refuse to open it on the first try:'
+            echo 'right-click **blake.bike.app** in Applications and choose **Open**, then confirm.'
+            echo 'CHANGELOG_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Signing and notarization: create a Developer ID Application
+          # certificate, add these repository secrets, and uncomment.
+          # APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          # APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          # APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          # APPLE_ID: ${{ secrets.APPLE_ID }}
+          # APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          # APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: blake.bike ${{ github.ref_name }}
+          releaseBody: ${{ steps.notes.outputs.body }}
+          releaseDraft: false
+          prerelease: false
+          args: --target universal-apple-darwin --bundles app,dmg
+
+  # Linux artifacts are built locally for now. To publish them too, add a job
+  # on ubuntu-24.04 that installs the system dependencies from ci.yml and runs
+  # tauri-action with `args: --bundles appimage,deb` and the same tagName.

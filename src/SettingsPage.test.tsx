@@ -3,6 +3,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("./api", () => ({
   api: {
+    appVersion: vi.fn(() => Promise.resolve("9.9.9")),
+    openWebsite: vi.fn(() => Promise.resolve()),
     logFilePath: vi.fn(() => Promise.resolve("/tmp/blakebike.log")),
     rideFilesPath: vi.fn(() => Promise.resolve("/tmp/Ride Files")),
     intervalsApiKeyConfigured: vi.fn(() => Promise.resolve(false)),
@@ -17,6 +19,7 @@ vi.mock("./api", () => ({
 
 import { api } from "./api";
 import { SettingsPage } from "./App";
+import { latestRelease } from "./releaseNotes";
 import {
   defaultRideDisplayPreferences,
   defaultTrainingZoneSettings,
@@ -254,5 +257,55 @@ describe("Intervals.icu settings", () => {
     expect(onSaveRideDisplayPreferences.mock.calls[1][0]).toEqual(
       defaultRideDisplayPreferences,
     );
+  });
+});
+
+describe("about card", () => {
+  const renderSettings = () =>
+    render(
+      <SettingsPage
+        profile={profile}
+        trainingZones={defaultTrainingZoneSettings}
+        rideDisplayPreferences={defaultRideDisplayPreferences}
+        devMode={false}
+        onDevMode={vi.fn()}
+        perform={perform}
+        onProfileUpdate={vi.fn()}
+        onTrainingZonesUpdate={vi.fn()}
+        onSave={vi.fn()}
+        onSaveTrainingZones={vi.fn()}
+        onSaveRideDisplayPreferences={vi.fn()}
+        onForgetDevices={() => Promise.resolve()}
+      />,
+    );
+
+  it("shows the running version with only the latest summary, not every note", async () => {
+    renderSettings();
+
+    await screen.findByText(/blake\.bike 9\.9\.9/);
+    expect(screen.getByText(latestRelease!.summary)).toBeInTheDocument();
+    const firstItem = latestRelease!.sections[0]?.items[0];
+    expect(firstItem).toBeDefined();
+    expect(screen.queryByText(firstItem!)).not.toBeInTheDocument();
+  });
+
+  it("opens the full release notes in a modal", async () => {
+    renderSettings();
+
+    fireEvent.click(await screen.findByRole("button", { name: /Release notes/ }));
+    expect(screen.getByText("What's new in blake.bike")).toBeInTheDocument();
+    expect(screen.getByText(latestRelease!.sections[0]!.items[0]!)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Close release notes" }));
+    await waitFor(() =>
+      expect(screen.queryByText("What's new in blake.bike")).not.toBeInTheDocument(),
+    );
+  });
+
+  it("opens the developer website", async () => {
+    renderSettings();
+
+    fireEvent.click(await screen.findByRole("button", { name: /blake\.bike$/ }));
+    expect(api.openWebsite).toHaveBeenCalled();
   });
 });
