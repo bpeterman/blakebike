@@ -390,6 +390,21 @@ textarea { min-height: 70px; resize: vertical; }
 .dots::after { content: ""; animation: dots 1.2s steps(4, end) infinite; }
 @keyframes dots { 0% { content: ""; } 25% { content: "."; } 50% { content: ".."; } 75% { content: "..."; } }
 .modal-close:disabled { opacity: .35; }
+.calibration-modal { width: min(560px, 95vw); }
+.calibration-modal .modal-icon.error { color: #ff8a7a; background: #2b1e1c; }
+.calibration-modal .modal-icon.success { color: #c8ff32; background: #26301d; }
+.calibration-copy { display: grid; gap: 8px; margin: 18px 0; color: #a7afa1; font-size: 13px; line-height: 1.6; }
+.calibration-copy p { margin: 0; }
+.calibration-copy ol { display: grid; gap: 6px; margin: 4px 0 0; padding-left: 21px; }
+.calibration-gauge { display: grid; place-items: center; gap: 4px; margin: 22px 0 14px; padding: 24px; border: 1px solid #39422f; border-radius: 12px; background: #121510; }
+.calibration-gauge > span { color: #7f887a; font-size: 10px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; }
+.calibration-gauge strong { color: #f1f5ed; font-size: 42px; letter-spacing: -.04em; }
+.calibration-gauge strong small { color: #8f9989; font-size: 13px; letter-spacing: 0; }
+.calibration-gauge em { color: #c8ff32; font-size: 12px; font-style: normal; }
+.calibration-message { margin: 0 0 16px; color: #bdc5b7; text-align: center; }
+.calibration-message.error { color: #ffaaa1; }
+.calibration-actions { align-items: center; margin-top: 18px; }
+.calibration-actions small { color: #7f887a; }
 
 /* Devices hub */
 .role-dots { display: flex; gap: 4px; }
@@ -398,6 +413,7 @@ textarea { min-height: 70px; resize: vertical; }
 .devices-scan-error { margin-bottom: 16px; }
 .device-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 15px; }
 .device-card { display: grid; gap: 14px; padding: 20px; }
+.calibration-unavailable { margin-top: -8px; color: #8f8878; font-size: 10px; }
 .device-card.online { border-color: #3a4a25; }
 .device-card.error { border-color: #5a3a35; }
 .device-card-head { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 14px; }

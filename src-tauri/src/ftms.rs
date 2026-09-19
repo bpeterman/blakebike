@@ -17,6 +17,8 @@ pub enum FtmsError {
     UnexpectedResponse,
     #[error("trainer rejected opcode {opcode:#04x}: {result:?}")]
     Rejected { opcode: u8, result: ResponseCode },
+    #[error("invalid spin-down target speed range")]
+    InvalidSpinDownRange,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,6 +52,22 @@ pub enum ControlOpcode {
     SetTargetPower = 0x05,
     StartOrResume = 0x07,
     StopOrPause = 0x08,
+    SpinDownControl = 0x13,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SpinDownTarget {
+    pub low_kph: f32,
+    pub high_kph: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpinDownStatus {
+    Requested,
+    Success,
+    Error,
+    StopPedaling,
+    Unknown(u8),
 }
 
 pub fn request_control() -> Vec<u8> {
@@ -70,6 +88,20 @@ pub fn set_target_power(watts: u16) -> Vec<u8> {
     payload
 }
 
+pub fn start_spin_down() -> Vec<u8> {
+    vec![ControlOpcode::SpinDownControl as u8, 0x01]
+}
+
+/// Target Setting Features is the second uint32 in Fitness Machine Feature.
+pub fn supports_spin_down(features: &[u8]) -> Result<bool, FtmsError> {
+    let bytes: [u8; 4] = features
+        .get(4..8)
+        .ok_or(FtmsError::Truncated)?
+        .try_into()
+        .expect("feature slice length was checked");
+    Ok(u32::from_le_bytes(bytes) & (1 << 15) != 0)
+}
+
 pub fn parse_control_response(data: &[u8], expected_opcode: u8) -> Result<(), FtmsError> {
     if data.len() < 3 || data[0] != 0x80 || data[1] != expected_opcode {
         return Err(FtmsError::UnexpectedResponse);
@@ -83,6 +115,37 @@ pub fn parse_control_response(data: &[u8], expected_opcode: u8) -> Result<(), Ft
             result,
         })
     }
+}
+
+pub fn parse_spin_down_response(data: &[u8]) -> Result<SpinDownTarget, FtmsError> {
+    parse_control_response(data, ControlOpcode::SpinDownControl as u8)?;
+    if data.len() < 7 {
+        return Err(FtmsError::Truncated);
+    }
+    let low = u16::from_le_bytes([data[3], data[4]]);
+    let high = u16::from_le_bytes([data[5], data[6]]);
+    if low == 0 || high < low {
+        return Err(FtmsError::InvalidSpinDownRange);
+    }
+    Ok(SpinDownTarget {
+        low_kph: low as f32 / 100.0,
+        high_kph: high as f32 / 100.0,
+    })
+}
+
+pub fn parse_spin_down_status(data: &[u8]) -> Result<Option<SpinDownStatus>, FtmsError> {
+    let opcode = *data.first().ok_or(FtmsError::Truncated)?;
+    if opcode != 0x14 {
+        return Ok(None);
+    }
+    let status = *data.get(1).ok_or(FtmsError::Truncated)?;
+    Ok(Some(match status {
+        0x01 => SpinDownStatus::Requested,
+        0x02 => SpinDownStatus::Success,
+        0x03 => SpinDownStatus::Error,
+        0x04 => SpinDownStatus::StopPedaling,
+        other => SpinDownStatus::Unknown(other),
+    }))
 }
 
 pub fn parse_indoor_bike_data(data: &[u8], timestamp_ms: i64) -> Result<Telemetry, FtmsError> {
@@ -175,6 +238,44 @@ mod tests {
     #[test]
     fn encodes_power_as_signed_little_endian() {
         assert_eq!(set_target_power(275), vec![0x05, 0x13, 0x01]);
+    }
+
+    #[test]
+    fn parses_spin_down_feature_command_response_and_status() {
+        let mut features = [0u8; 8];
+        features[4..8].copy_from_slice(&(1u32 << 15).to_le_bytes());
+        assert_eq!(supports_spin_down(&features), Ok(true));
+        assert_eq!(start_spin_down(), vec![0x13, 0x01]);
+        assert_eq!(
+            parse_spin_down_response(&[0x80, 0x13, 0x01, 0xb8, 0x0b, 0xac, 0x0d]),
+            Ok(SpinDownTarget {
+                low_kph: 30.0,
+                high_kph: 35.0,
+            })
+        );
+        assert_eq!(
+            parse_spin_down_status(&[0x14, 0x04]),
+            Ok(Some(SpinDownStatus::StopPedaling))
+        );
+        assert_eq!(
+            parse_spin_down_status(&[0x14, 0x02]),
+            Ok(Some(SpinDownStatus::Success))
+        );
+        assert_eq!(parse_spin_down_status(&[0x01]), Ok(None));
+    }
+
+    #[test]
+    fn rejects_bad_spin_down_packets() {
+        assert_eq!(supports_spin_down(&[0; 7]), Err(FtmsError::Truncated));
+        assert_eq!(
+            parse_spin_down_response(&[0x80, 0x13, 0x01]),
+            Err(FtmsError::Truncated)
+        );
+        assert_eq!(
+            parse_spin_down_response(&[0x80, 0x13, 0x01, 2, 0, 1, 0]),
+            Err(FtmsError::InvalidSpinDownRange)
+        );
+        assert_eq!(parse_spin_down_status(&[0x14]), Err(FtmsError::Truncated));
     }
 
     #[test]

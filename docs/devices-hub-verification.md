@@ -56,6 +56,16 @@ For each of Trainer, Heart rate, Power meter, Cadence sensor:
 - [ ] **F2 · Linux: BlueZ restart.** `sudo systemctl restart bluetooth` while connected. Expected: all cards go to Link lost; the next scan or reconnect succeeds (the hub recreates the adapter after a "Channel closed" error). Check the log for `Discarding cached Bluetooth adapter`.
 - [ ] **F3 · macOS: Bluetooth permission.** Fresh install path only: first scan prompts for Bluetooth access; denying shows the guidance banner; allowing in System Settings and rescanning works without a relaunch.
 
+## G. Trainer calibration
+
+- [ ] **G1 · Capability gating.** Connect a trainer that advertises Target Setting Features bit 15. Expected: its ready card enables Calibrate. A trainer without the bit keeps the action disabled and explains that FTMS spin-down is unavailable.
+- [ ] **G2 · Target-speed guidance.** Open Calibrate, review the safety guidance, and begin. Expected: the modal shows the low/high speed range returned by the trainer, updates current speed from Indoor Bike Data, and prompts you to pedal into that range.
+- [ ] **G3 · Coast-down.** When the trainer sends Spin Down Status `Stop Pedaling`, expected: the prompt changes immediately. Stop pedalling and wait; a success status shows Calibration complete and adds start/completion lines to the trainer card log.
+- [ ] **G4 · Errors and retry.** Force a failed or timed-out calibration if the vendor app provides a test path. Expected: the modal shows an actionable error, the card leaves its calibrating state, and Try again can start a fresh procedure.
+- [ ] **G5 · Disconnect cancellation.** Start calibration, then disconnect or power off the trainer. Expected: calibration exits with a cancellation/link error rather than hanging, and reconnect remains available.
+- [ ] **G6 · Workout exclusion.** Start a free ride or workout so the card reads ERG control. Expected: Calibrate is disabled with an in-workout explanation and calibration cannot interrupt target-power commands.
+- [ ] **G7 · Simulator.** Connect BlakeBike Simulator and run calibration. Expected: accelerate → stop pedalling → success completes deterministically without hardware.
+
 ## Reporting
 
 For each failure note: platform, device (make/model/firmware from the card), the step, and the timestamp. Then grab the surrounding log:

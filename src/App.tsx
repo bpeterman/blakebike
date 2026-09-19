@@ -88,6 +88,7 @@ import {
 } from "./types";
 import { DevicePicker } from "./DevicePicker";
 import { DevicesPage } from "./DevicesPage";
+import { TrainerCalibrationModal } from "./TrainerCalibrationModal";
 import { isConnected as slotConnected, sourceNote } from "./devices";
 import { SourceSelect } from "./SourceSelect";
 import { defaultSourcePreferences, withSourcePreference } from "./sourcePreferences";
@@ -124,6 +125,7 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [devicePicker, setDevicePicker] = useState<DeviceRole | null>(null);
+  const [calibrationOpen, setCalibrationOpen] = useState(false);
   const [editor, setEditor] = useState<Workout | null>(null);
   const [selectedWorkout, setSelectedWorkout] = useState<string | null>(null);
   const [selectedSession, setSelectedSession] = useState<SessionDetail | null>(
@@ -439,6 +441,7 @@ function App() {
             hub={hub}
             sources={telemetry.sources}
             onConnect={setDevicePicker}
+            onCalibrate={() => setCalibrationOpen(true)}
             onSourcePreference={changeSourcePreference}
             perform={perform}
           />
@@ -563,6 +566,12 @@ function App() {
           scanError={hub?.scanError ?? null}
           close={() => setDevicePicker(null)}
           perform={perform}
+        />
+      )}
+      {calibrationOpen && (
+        <TrainerCalibrationModal
+          speedKph={telemetry.speedKph}
+          close={() => setCalibrationOpen(false)}
         />
       )}
       {editor && (

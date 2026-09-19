@@ -52,6 +52,8 @@ const idleStats: DeviceSlot["stats"] = {
   drops: 0,
   lastRawHex: null,
   lastReading: null,
+  calibrationSupported: false,
+  calibrating: false,
 };
 
 const snapshot: DevicesSnapshot = {
@@ -87,6 +89,7 @@ const snapshot: DevicesSnapshot = {
         connectedSinceMs: Date.now() - 125_000,
         lastRawHex: "44 02 c8 00",
         lastReading: "200 W · 88 rpm · 30.1 km/h · target 200 W",
+        calibrationSupported: true,
       },
       log: [
         { atMs: Date.now() - 3000, level: "ok", step: "Control granted", detail: "ERG mode available", connect: true },
@@ -108,7 +111,7 @@ describe("DevicesPage", () => {
 
   it("renders a card per role with live stats and the log on demand", () => {
     const onConnect = vi.fn();
-    render(<DevicesPage hub={snapshot} sources={snapshot.sources} onConnect={onConnect} onSourcePreference={vi.fn()} perform={perform} />);
+    render(<DevicesPage hub={snapshot} sources={snapshot.sources} onConnect={onConnect} onCalibrate={vi.fn()} onSourcePreference={vi.fn()} perform={perform} />);
 
     expect(screen.getByText("1 of 4 connected")).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "KICKR CORE" })).toBeInTheDocument();
@@ -142,7 +145,7 @@ describe("DevicesPage", () => {
 
   it("shows source selection, fallback state, and saves changes", () => {
     const onSourcePreference = vi.fn();
-    render(<DevicesPage hub={snapshot} sources={snapshot.sources} onConnect={vi.fn()} onSourcePreference={onSourcePreference} perform={perform} />);
+    render(<DevicesPage hub={snapshot} sources={snapshot.sources} onConnect={vi.fn()} onCalibrate={vi.fn()} onSourcePreference={onSourcePreference} perform={perform} />);
     // Heart rate is pinned to the strap, which is down, so the trainer is a fallback.
     expect(screen.getByText("falling back to KICKR CORE")).toBeInTheDocument();
     expect(screen.getAllByText("from KICKR CORE")).toHaveLength(2);
@@ -153,8 +156,46 @@ describe("DevicesPage", () => {
     expect(onSourcePreference).toHaveBeenCalledWith("power", { mode: "role", role: "power" });
   });
 
+  it("offers calibration only for a ready trainer that advertises spin-down", () => {
+    const onCalibrate = vi.fn();
+    const trainer = snapshot.slots[0];
+    const ready: DevicesSnapshot = {
+      ...snapshot,
+      slots: [
+        {
+          ...trainer,
+          state: {
+            status: "ready",
+            device: { id: "k", name: "KICKR CORE", simulated: false, rssi: -55, capabilities: ["ftms"] },
+          },
+          stats: { ...trainer.stats, calibrationSupported: true },
+        },
+        ...snapshot.slots.slice(1),
+      ],
+    };
+    const view = render(
+      <DevicesPage hub={ready} sources={ready.sources} onConnect={vi.fn()} onCalibrate={onCalibrate} onSourcePreference={vi.fn()} perform={perform} />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Calibrate" }));
+    expect(onCalibrate).toHaveBeenCalledOnce();
+
+    const unsupported: DevicesSnapshot = {
+      ...ready,
+      slots: ready.slots.map((slot) =>
+        slot.role === "trainer"
+          ? { ...slot, stats: { ...slot.stats, calibrationSupported: false } }
+          : slot,
+      ),
+    };
+    view.rerender(
+      <DevicesPage hub={unsupported} sources={unsupported.sources} onConnect={vi.fn()} onCalibrate={onCalibrate} onSourcePreference={vi.fn()} perform={perform} />,
+    );
+    expect(screen.getByRole("button", { name: "Calibrate" })).toBeDisabled();
+    expect(screen.getByText(/does not advertise FTMS spin-down/)).toBeInTheDocument();
+  });
+
   it("lists known devices with make, offers one-click connect and forget", async () => {
-    render(<DevicesPage hub={snapshot} sources={snapshot.sources} onConnect={vi.fn()} onSourcePreference={vi.fn()} perform={perform} />);
+    render(<DevicesPage hub={snapshot} sources={snapshot.sources} onConnect={vi.fn()} onCalibrate={vi.fn()} onSourcePreference={vi.fn()} perform={perform} />);
     await waitFor(() => expect(screen.getByText("Connect again with one click")).toBeInTheDocument());
     // The trainer is connected right now; the strap was used two days ago.
     expect(screen.getByText("connected now")).toBeInTheDocument();
@@ -172,7 +213,7 @@ describe("DevicesPage", () => {
   });
 
   it("renders sensibly before the first snapshot arrives", () => {
-    render(<DevicesPage hub={null} sources={undefined} onConnect={vi.fn()} onSourcePreference={vi.fn()} perform={perform} />);
+    render(<DevicesPage hub={null} sources={undefined} onConnect={vi.fn()} onCalibrate={vi.fn()} onSourcePreference={vi.fn()} perform={perform} />);
     expect(screen.getByText("0 of 4 connected")).toBeInTheDocument();
     expect(screen.getAllByRole("button", { name: /^Connect$/ }).length).toBeGreaterThanOrEqual(4);
   });

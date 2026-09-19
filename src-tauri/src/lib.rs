@@ -127,6 +127,7 @@ pub fn run() {
             commands::scan_devices,
             commands::connect_device,
             commands::disconnect_device,
+            commands::calibrate_trainer,
             commands::device_log,
             commands::get_source_preferences,
             commands::set_source_preferences,
