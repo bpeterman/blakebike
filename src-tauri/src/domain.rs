@@ -80,18 +80,26 @@ impl Workout {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "camelCase")]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum WorkoutStep {
     Steady {
+        // `alias` keeps workouts saved by pre-camelCase builds loadable.
+        #[serde(alias = "duration_seconds")]
         duration_seconds: u32,
         target: PowerTarget,
     },
     Ramp {
+        #[serde(alias = "duration_seconds")]
         duration_seconds: u32,
         start: PowerTarget,
         end: PowerTarget,
     },
     FreeRide {
+        #[serde(alias = "duration_seconds")]
         duration_seconds: u32,
     },
     Repeat {
@@ -103,8 +111,12 @@ pub enum WorkoutStep {
 impl WorkoutStep {
     pub fn duration_seconds(&self) -> u32 {
         match self {
-            Self::Steady { duration_seconds, .. }
-            | Self::Ramp { duration_seconds, .. }
+            Self::Steady {
+                duration_seconds, ..
+            }
+            | Self::Ramp {
+                duration_seconds, ..
+            }
             | Self::FreeRide { duration_seconds } => *duration_seconds,
             Self::Repeat { repetitions, steps } => {
                 u32::from(*repetitions)
@@ -286,5 +298,34 @@ mod tests {
     #[test]
     fn rejects_empty_workout() {
         assert!(Workout::new("", vec![]).validate().is_err());
+    }
+
+    #[test]
+    fn workout_steps_use_camel_case_fields() {
+        let step = WorkoutStep::Steady {
+            duration_seconds: 300,
+            target: PowerTarget::PercentFtp(75),
+        };
+        let json = serde_json::to_value(&step).unwrap();
+        assert_eq!(json["kind"], "steady");
+        assert_eq!(json["durationSeconds"], 300);
+        assert!(json.get("duration_seconds").is_none());
+        assert!(serde_json::from_value::<WorkoutStep>(json).is_ok());
+    }
+
+    #[test]
+    fn workout_steps_accept_legacy_snake_case_fields() {
+        let legacy = serde_json::json!({
+            "kind": "repeat",
+            "repetitions": 2,
+            "steps": [
+                { "kind": "steady", "duration_seconds": 120, "target": { "unit": "percentFtp", "value": 80 } },
+                { "kind": "ramp", "duration_seconds": 60,
+                  "start": { "unit": "watts", "value": 100 }, "end": { "unit": "watts", "value": 200 } },
+                { "kind": "freeRide", "duration_seconds": 30 }
+            ]
+        });
+        let step: WorkoutStep = serde_json::from_value(legacy).unwrap();
+        assert_eq!(step.duration_seconds(), 2 * (120 + 60 + 30));
     }
 }

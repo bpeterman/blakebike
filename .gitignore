@@ -22,3 +22,7 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# local dev-restart log
+.dev.log
+_to_delete/
