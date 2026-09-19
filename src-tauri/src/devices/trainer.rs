@@ -18,8 +18,9 @@ use futures::StreamExt;
 use tokio::sync::{Mutex, RwLock, broadcast};
 
 use super::{
-    Capability, DeviceInfo, DeviceSlot, DeviceState,
+    Capability, DeviceInfo, DeviceRole, DeviceSlot, DeviceState,
     ble::{self, Ble, GATT_CONNECT_TIMEOUT, GATT_STEP_TIMEOUT, bluetooth_uuid, hex, with_timeout},
+    fuser::{Reading, TelemetryFuser},
 };
 use crate::{
     domain::Telemetry,
@@ -46,7 +47,7 @@ pub fn simulated_devices() -> Vec<DeviceInfo> {
 pub struct Trainer {
     slot: Arc<DeviceSlot>,
     ble: Arc<Ble>,
-    telemetry: broadcast::Sender<Telemetry>,
+    fuser: Arc<TelemetryFuser>,
     peripheral: RwLock<Option<Peripheral>>,
     control_point: RwLock<Option<Characteristic>>,
     target_power: Arc<AtomicU16>,
@@ -57,16 +58,12 @@ pub struct Trainer {
 }
 
 impl Trainer {
-    pub fn new(
-        slot: Arc<DeviceSlot>,
-        ble: Arc<Ble>,
-        telemetry: broadcast::Sender<Telemetry>,
-    ) -> Self {
+    pub fn new(slot: Arc<DeviceSlot>, ble: Arc<Ble>, fuser: Arc<TelemetryFuser>) -> Self {
         let (control_responses, _) = broadcast::channel(16);
         Self {
             slot,
             ble,
-            telemetry,
+            fuser,
             peripheral: RwLock::new(None),
             control_point: RwLock::new(None),
             target_power: Arc::new(AtomicU16::new(100)),
@@ -296,7 +293,7 @@ impl Trainer {
         *self.control_point.write().await = Some(control);
         self.slot.record_connected(device.rssi, &details);
         let slot = self.slot.clone();
-        let telemetry_tx = self.telemetry.clone();
+        let fuser = self.fuser.clone();
         let control_tx = self.control_responses.clone();
         let reconnect_name = device.name.clone();
         let worker = tokio::spawn(async move {
@@ -351,8 +348,12 @@ impl Trainer {
                                     )),
                                 );
                             }
-                            let _ = telemetry_tx.send(telemetry.clone());
-                            slot.emit("trainer://telemetry", telemetry);
+                            slot.record_reading(describe(&telemetry));
+                            fuser.ingest(
+                                DeviceRole::Trainer,
+                                Reading::Trainer(telemetry),
+                                Utc::now().timestamp_millis(),
+                            );
                         }
                         Err(error) => {
                             let failures = slot.record_parse_failure(&notification.value);
@@ -377,6 +378,7 @@ impl Trainer {
             }
             tracing::warn!(samples, "Notification stream ended; trainer link lost");
             slot.record_drop();
+            fuser.forget(DeviceRole::Trainer);
             slot.note(
                 "error",
                 "Link lost",
@@ -421,7 +423,7 @@ impl Trainer {
             .await;
         let target = self.target_power.clone();
         let slot = self.slot.clone();
-        let telemetry_tx = self.telemetry.clone();
+        let fuser = self.fuser.clone();
         let worker = tokio::spawn(async move {
             let mut power = 90.0_f32;
             let mut tick = tokio::time::interval(Duration::from_millis(500));
@@ -445,13 +447,13 @@ impl Trainer {
                     first = false;
                     slot.note("ok", "First sample received", Some("simulated".into()));
                 }
-                let _ = telemetry_tx.send(telemetry.clone());
-                if !slot.emit("trainer://telemetry", telemetry) {
-                    tracing::warn!("UI gone; stopping simulated trainer");
-                    break;
-                }
+                slot.record_reading(describe(&telemetry));
+                fuser.ingest(
+                    DeviceRole::Trainer,
+                    Reading::Trainer(telemetry),
+                    Utc::now().timestamp_millis(),
+                );
             }
-            slot.set_state(DeviceState::Idle).await;
         });
         self.slot.set_worker(worker).await;
     }
@@ -592,6 +594,7 @@ impl Trainer {
             }
         }
         *self.control_point.write().await = None;
+        self.fuser.forget(DeviceRole::Trainer);
         let was_connected = self.slot.state().await.is_connected();
         if had_peripheral || was_connected {
             self.slot.note("info", "Disconnected", None);
@@ -601,6 +604,21 @@ impl Trainer {
             self.slot.set_state(DeviceState::Idle).await;
         }
     }
+}
+
+/// One-line summary of an Indoor Bike Data sample for the hub card.
+fn describe(telemetry: &Telemetry) -> String {
+    let mut parts = vec![format!("{} W", telemetry.power_watts)];
+    if let Some(cadence) = telemetry.cadence_rpm {
+        parts.push(format!("{cadence:.0} rpm"));
+    }
+    if let Some(speed) = telemetry.speed_kph {
+        parts.push(format!("{speed:.1} km/h"));
+    }
+    if let Some(target) = telemetry.target_power_watts {
+        parts.push(format!("target {target} W"));
+    }
+    parts.join(" · ")
 }
 
 #[cfg(test)]
@@ -624,9 +642,9 @@ mod tests {
     async fn simulated_target_power_respects_rider_limit() {
         let (telemetry, _) = broadcast::channel(4);
         let trainer = Trainer::new(
-            DeviceSlot::new(super::super::DeviceRole::Trainer, None),
+            DeviceSlot::new(DeviceRole::Trainer, None),
             Arc::new(Ble::default()),
-            telemetry,
+            Arc::new(TelemetryFuser::new(None, telemetry)),
         );
         assert_eq!(trainer.set_target_power(100, 800).await.unwrap(), 100);
         assert_eq!(trainer.set_target_power(900, 800).await.unwrap(), 800);
@@ -638,9 +656,7 @@ mod tests {
         let hub = super::super::DeviceHub::default();
         let mut telemetry = hub.subscribe();
         let device = simulated_devices().remove(0);
-        hub.connect(super::super::DeviceRole::Trainer, device)
-            .await
-            .unwrap();
+        hub.connect(DeviceRole::Trainer, device).await.unwrap();
         assert!(hub.state().await.is_connected());
         let sample = tokio::time::timeout(Duration::from_secs(3), telemetry.recv())
             .await
@@ -653,7 +669,7 @@ mod tests {
         assert_eq!(hub.set_target_power(900, 400).await.unwrap(), 400);
         hub.disconnect().await;
         assert!(matches!(hub.state().await, DeviceState::Idle));
-        let log = hub.slot(super::super::DeviceRole::Trainer).log_lines();
+        let log = hub.slot(DeviceRole::Trainer).log_lines();
         assert!(
             log.iter()
                 .any(|line| line.step == "Simulated FTMS service online")

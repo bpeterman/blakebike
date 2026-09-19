@@ -8,9 +8,14 @@ use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
-use crate::domain::{
-    PowerTarget, Profile, SessionDetail, SessionSummary, Telemetry, Workout, WorkoutStep,
+use crate::{
+    devices::SourcePreferences,
+    domain::{
+        PowerTarget, Profile, SessionDetail, SessionSummary, Telemetry, Workout, WorkoutStep,
+    },
 };
+
+const SOURCE_PREFERENCES_KEY: &str = "source_preferences";
 
 pub struct Storage {
     connection: Mutex<Connection>,
@@ -64,6 +69,10 @@ impl Storage {
                 );
                 CREATE INDEX IF NOT EXISTS telemetry_session_idx
                   ON telemetry_samples(session_id, timestamp_ms);
+                CREATE TABLE IF NOT EXISTS settings (
+                  key TEXT PRIMARY KEY,
+                  value_json TEXT NOT NULL
+                );
                 ",
             )
             .map_err(|error| error.to_string())?;
@@ -151,6 +160,45 @@ impl Storage {
             )
             .map_err(|error| error.to_string())?;
         Ok(())
+    }
+
+    fn setting<T: serde::de::DeserializeOwned>(&self, key: &str) -> Result<Option<T>, String> {
+        let json: Option<String> = self
+            .connection()?
+            .query_row(
+                "SELECT value_json FROM settings WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        match json {
+            Some(json) => serde_json::from_str(&json)
+                .map(Some)
+                .map_err(|error| format!("Stored setting {key} is unreadable: {error}")),
+            None => Ok(None),
+        }
+    }
+
+    fn save_setting<T: serde::Serialize>(&self, key: &str, value: &T) -> Result<(), String> {
+        let json = serde_json::to_string(value).map_err(|error| error.to_string())?;
+        self.connection()?
+            .execute(
+                "INSERT INTO settings(key, value_json) VALUES(?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json",
+                params![key, json],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    /// Which device feeds each telemetry metric; `Auto` everywhere by default.
+    pub fn source_preferences(&self) -> Result<SourcePreferences, String> {
+        Ok(self.setting(SOURCE_PREFERENCES_KEY)?.unwrap_or_default())
+    }
+
+    pub fn save_source_preferences(&self, preferences: &SourcePreferences) -> Result<(), String> {
+        self.save_setting(SOURCE_PREFERENCES_KEY, preferences)
     }
 
     pub fn workouts(&self) -> Result<Vec<Workout>, String> {
@@ -412,6 +460,25 @@ mod tests {
         let workouts = storage.workouts().unwrap();
         assert_eq!(workouts.len(), 1);
         assert!(storage.workout(workouts[0].id).unwrap().is_some());
+    }
+
+    #[test]
+    fn source_preferences_default_to_auto_and_round_trip() {
+        use crate::devices::{DeviceRole, fuser::SourceChoice};
+        let storage = Storage::in_memory().unwrap();
+        assert_eq!(
+            storage.source_preferences().unwrap(),
+            SourcePreferences::default()
+        );
+        let preferences = SourcePreferences {
+            heart_rate: SourceChoice::Role(DeviceRole::HeartRate),
+            ..SourcePreferences::default()
+        };
+        storage.save_source_preferences(&preferences).unwrap();
+        assert_eq!(storage.source_preferences().unwrap(), preferences);
+        let updated = SourcePreferences::default();
+        storage.save_source_preferences(&updated).unwrap();
+        assert_eq!(storage.source_preferences().unwrap(), updated);
     }
 
     #[test]

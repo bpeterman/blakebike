@@ -240,7 +240,7 @@ pub struct Interval {
     pub free_ride: bool,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Telemetry {
     pub timestamp_ms: i64,

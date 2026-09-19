@@ -73,6 +73,8 @@ export type SlotStats = {
   connectedSinceMs: number | null;
   drops: number;
   lastRawHex: string | null;
+  /** Human summary of the latest decoded reading, e.g. "215 W · 88 rpm". */
+  lastReading: string | null;
 };
 
 export type DeviceSlot = {
@@ -82,10 +84,23 @@ export type DeviceSlot = {
   log: DeviceLogLine[];
 };
 
+export type SourceChoice = { mode: "auto" } | { mode: "role"; role: DeviceRole };
+
+export type Metric = "power" | "cadence" | "heartRate";
+
+export type SourcePreferences = Record<Metric, SourceChoice>;
+
+export type TelemetrySource = { role: DeviceRole; fallback: boolean };
+
+/** Which device supplied each fused telemetry value. */
+export type TelemetrySources = Record<Metric, TelemetrySource | null>;
+
 export type DevicesSnapshot = {
   scanning: boolean;
   scanError: { message: string; guidance: string } | null;
   slots: DeviceSlot[];
+  sourcePreferences: SourcePreferences;
+  sources: TelemetrySources;
 };
 
 export type ConnectProgress = {
@@ -107,6 +122,8 @@ export type Telemetry = {
   speedKph: number | null;
   heartRateBpm: number | null;
   targetPowerWatts: number | null;
+  /** Present on live samples from the devices hub; absent on recorded history. */
+  sources?: TelemetrySources;
 };
 
 export type RunnerState =

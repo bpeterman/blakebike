@@ -6,8 +6,11 @@ use uuid::Uuid;
 
 use crate::{
     AppState,
-    devices::{DeviceInfo, DeviceLogLine, DeviceRole, DeviceState, DevicesSnapshot},
+    devices::{
+        DeviceInfo, DeviceLogLine, DeviceRole, DeviceState, DevicesSnapshot, SourcePreferences,
+    },
     domain::{Profile, SessionDetail, SessionSummary, Workout},
+    fit::ensure_ride_file,
     formats::{export_zwo, import_zwo},
     runner::RunnerState,
 };
@@ -65,6 +68,22 @@ pub async fn connect_device(
 pub async fn disconnect_device(state: State<'_, AppState>, role: DeviceRole) -> Result<(), String> {
     tracing::debug!(?role, "command disconnect_device");
     state.devices.disconnect_role(role).await;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn get_source_preferences(state: State<'_, AppState>) -> Result<SourcePreferences, String> {
+    Ok(state.devices.source_preferences())
+}
+
+#[tauri::command]
+pub fn set_source_preferences(
+    state: State<'_, AppState>,
+    preferences: SourcePreferences,
+) -> Result<(), String> {
+    tracing::debug!(?preferences, "command set_source_preferences");
+    state.storage.save_source_preferences(&preferences)?;
+    state.devices.set_source_preferences(preferences);
     Ok(())
 }
 
@@ -265,6 +284,56 @@ pub fn export_session_csv(
     writer
         .flush()
         .map_err(|error| format!("Could not finish CSV export: {error}"))
+}
+
+#[tauri::command]
+pub fn export_session_fit(
+    state: State<'_, AppState>,
+    session_id: Uuid,
+    path: PathBuf,
+) -> Result<(), String> {
+    let source = ensure_session_fit(&state, session_id)?;
+    if source == path {
+        return Ok(());
+    }
+    fs::copy(&source, &path)
+        .map(|_| ())
+        .map_err(|error| format!("Could not export FIT file: {error}"))
+}
+
+#[tauri::command]
+pub fn prepare_garmin_upload(
+    state: State<'_, AppState>,
+    session_id: Uuid,
+) -> Result<String, String> {
+    let path = ensure_session_fit(&state, session_id)?;
+    tauri_plugin_opener::open_url(
+        "https://connect.garmin.com/modern/import-data",
+        None::<&str>,
+    )
+    .map_err(|error| format!("Could not open Garmin Connect: {error}"))?;
+    tauri_plugin_opener::reveal_item_in_dir(&path)
+        .map_err(|error| format!("Could not reveal FIT file: {error}"))?;
+    Ok(path.display().to_string())
+}
+
+#[tauri::command]
+pub fn get_ride_files_path(state: State<'_, AppState>) -> String {
+    state.ride_files_dir.display().to_string()
+}
+
+#[tauri::command]
+pub fn reveal_ride_files(state: State<'_, AppState>) -> Result<(), String> {
+    tauri_plugin_opener::open_path(&state.ride_files_dir, None::<&str>)
+        .map_err(|error| format!("Could not open Ride Files: {error}"))
+}
+
+fn ensure_session_fit(state: &AppState, session_id: Uuid) -> Result<PathBuf, String> {
+    let detail = state
+        .storage
+        .session(session_id)?
+        .ok_or_else(|| "Ride not found".to_string())?;
+    ensure_ride_file(&state.ride_files_dir, &detail)
 }
 
 #[tauri::command]

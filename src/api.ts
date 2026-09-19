@@ -9,6 +9,7 @@ import type {
   DeviceSlot,
   DeviceState,
   DevicesSnapshot,
+  SourcePreferences,
   Profile,
   RunnerState,
   SessionDetail,
@@ -30,6 +31,9 @@ export const api = {
   disconnectDevice: (role: DeviceRole) =>
     invoke<void>("disconnect_device", { role }),
   deviceLog: (role: DeviceRole) => invoke<DeviceLogLine[]>("device_log", { role }),
+  sourcePreferences: () => invoke<SourcePreferences>("get_source_preferences"),
+  saveSourcePreferences: (preferences: SourcePreferences) =>
+    invoke<void>("set_source_preferences", { preferences }),
   profile: () => invoke<Profile>("get_profile"),
   saveProfile: (profile: Profile) =>
     invoke<void>("save_profile", { profile }),
@@ -78,6 +82,22 @@ export const api = {
       });
     }
   },
+  exportSessionFit: async (session: SessionSummary) => {
+    const path = await save({
+      defaultPath: `${safeName(session.workoutName)}-${session.startedAt.slice(0, 10)}.fit`,
+      filters: [{ name: "Garmin FIT activity", extensions: ["fit"] }],
+    });
+    if (path) {
+      await invoke<void>("export_session_fit", {
+        sessionId: session.id,
+        path,
+      });
+    }
+  },
+  prepareGarminUpload: (sessionId: string) =>
+    invoke<string>("prepare_garmin_upload", { sessionId }),
+  rideFilesPath: () => invoke<string>("get_ride_files_path"),
+  revealRideFiles: () => invoke<void>("reveal_ride_files"),
   logFilePath: () => invoke<string>("get_log_file_path"),
   revealLogFile: () => invoke<void>("reveal_log_file"),
   reportError: (context: string, message: string) =>
