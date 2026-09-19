@@ -17,7 +17,7 @@ RUST_LOG=trace pnpm tauri dev
 
 - [ ] **A1 · Scan finds every device.** Wake all four (pedal the trainer, wear the strap, spin the crank for the power meter and cadence sensor), open Devices → any card → Connect. Expected: the picker for that role lists only devices advertising a matching service, with capability chips (FTMS / Power / Cadence / Heart rate) and a dBm figure. The trainer should appear for the Trainer role; if it also advertises Cycling Power it should appear for Power and Cadence too.
 - [ ] **A2 · Nothing missing.** Compare against what the vendor app or `bluetoothctl scan on` (Linux) sees. If a device is missing, grep the log for `Saw peripheral` around the scan time — the trace line lists every advertised service UUID, which tells you whether the device advertises the standard service or only a proprietary one.
-- [ ] **A3 · Bluetooth off.** Turn Bluetooth off, scan. Expected: a red error banner on the Devices page with platform guidance; the simulators still listed in the picker.
+- [ ] **A3 · Bluetooth off.** Turn Bluetooth off, scan. Expected: a red error banner on the Devices page with platform guidance; the simulators still listed in the picker when developer mode is on, and no devices at all when it is off.
 
 ## B. Connect each role
 

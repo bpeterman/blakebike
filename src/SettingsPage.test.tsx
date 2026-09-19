@@ -58,6 +58,8 @@ describe("Intervals.icu settings", () => {
         onSave={vi.fn()}
         onSaveTrainingZones={onSaveTrainingZones}
         onSaveRideDisplayPreferences={vi.fn()}
+        devMode={false}
+        onDevMode={vi.fn()}
         onForgetDevices={() => Promise.resolve()}
       />,
     );
@@ -102,6 +104,8 @@ describe("Intervals.icu settings", () => {
         onSave={vi.fn()}
         onSaveTrainingZones={vi.fn()}
         onSaveRideDisplayPreferences={vi.fn()}
+        devMode={false}
+        onDevMode={vi.fn()}
         onForgetDevices={() => Promise.resolve()}
       />,
     );
@@ -150,6 +154,8 @@ describe("Intervals.icu settings", () => {
         onSave={vi.fn()}
         onSaveTrainingZones={vi.fn()}
         onSaveRideDisplayPreferences={vi.fn()}
+        devMode={false}
+        onDevMode={vi.fn()}
         onForgetDevices={() => Promise.resolve()}
       />,
     );
@@ -180,6 +186,33 @@ describe("Intervals.icu settings", () => {
     ).toBeEnabled();
   });
 
+  it("toggles developer mode", () => {
+    const onDevMode = vi.fn();
+    render(
+      <SettingsPage
+        profile={profile}
+        trainingZones={defaultTrainingZoneSettings}
+        rideDisplayPreferences={defaultRideDisplayPreferences}
+        perform={perform}
+        onProfileUpdate={vi.fn()}
+        onTrainingZonesUpdate={vi.fn()}
+        onSave={vi.fn()}
+        onSaveTrainingZones={vi.fn()}
+        onSaveRideDisplayPreferences={vi.fn()}
+        devMode={false}
+        onDevMode={onDevMode}
+        onForgetDevices={() => Promise.resolve()}
+      />,
+    );
+
+    const toggle = screen.getByRole("checkbox", {
+      name: /Offer simulated devices/,
+    });
+    expect(toggle).not.toBeChecked();
+    fireEvent.click(toggle);
+    expect(onDevMode).toHaveBeenCalledWith(true);
+  });
+
   it("drafts, reorders, resets, and saves the ride layout", () => {
     const onSaveRideDisplayPreferences = vi.fn();
     render(
@@ -193,6 +226,8 @@ describe("Intervals.icu settings", () => {
         onSave={vi.fn()}
         onSaveTrainingZones={vi.fn()}
         onSaveRideDisplayPreferences={onSaveRideDisplayPreferences}
+        devMode={false}
+        onDevMode={vi.fn()}
         onForgetDevices={() => Promise.resolve()}
       />,
     );

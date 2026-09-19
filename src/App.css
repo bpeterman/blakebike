@@ -283,10 +283,10 @@ textarea { min-height: 70px; resize: vertical; }
 .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .settings-card .primary { justify-self: start; }
 .zone-settings { display: grid; gap: 18px; }
-.zone-sync-toggle { display: flex; grid-template-columns: auto 1fr; align-items: start; gap: 9px; padding: 10px 12px; border: 1px solid #39452c; border-radius: 8px; background: #1c2318; cursor: pointer; }
-.zone-sync-toggle input { width: 16px; height: 16px; margin-top: 2px; accent-color: #c8ff32; }
-.zone-sync-toggle span { display: grid; gap: 2px; color: #dce5d3; font-size: 11px; }
-.zone-sync-toggle small { color: #7f887a; font-size: 10px; font-weight: 400; }
+.settings-toggle { display: flex; grid-template-columns: auto 1fr; align-items: start; gap: 9px; padding: 10px 12px; border: 1px solid #39452c; border-radius: 8px; background: #1c2318; cursor: pointer; }
+.settings-toggle input { width: 16px; height: 16px; margin-top: 2px; accent-color: #c8ff32; }
+.settings-toggle span { display: grid; gap: 2px; color: #dce5d3; font-size: 11px; }
+.settings-toggle small { color: #7f887a; font-size: 10px; font-weight: 400; }
 .ride-layout-settings { display: grid; gap: 14px; }
 .ride-card-list { display: grid; gap: 6px; }
 .ride-card-setting { display: flex; align-items: center; gap: 12px; min-height: 46px; padding: 7px 8px 7px 12px; border: 1px solid #2d322b; border-radius: 8px; background: #151814; }
