@@ -698,16 +698,38 @@ impl Storage {
         Ok(summary)
     }
 
+    /// One sample; rides use `record_samples` in batches.
+    #[cfg(test)]
     pub fn record_sample(&self, session_id: Uuid, sample: &Telemetry) -> Result<(), String> {
-        let json = serde_json::to_string(sample).map_err(|error| error.to_string())?;
-        self.connection()?
-            .execute(
-                "INSERT OR REPLACE INTO telemetry_samples(session_id, timestamp_ms, payload_json)
-                 VALUES(?1, ?2, ?3)",
-                params![session_id.to_string(), sample.timestamp_ms, json],
-            )
+        self.record_samples(session_id, std::slice::from_ref(sample))
+    }
+
+    /// Insert a batch of samples in one transaction (the ride recorder writes
+    /// about once a second). Same upsert semantics as `record_sample`.
+    pub fn record_samples(&self, session_id: Uuid, samples: &[Telemetry]) -> Result<(), String> {
+        if samples.is_empty() {
+            return Ok(());
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction()
             .map_err(|error| error.to_string())?;
-        Ok(())
+        {
+            let mut statement = transaction
+                .prepare_cached(
+                    "INSERT OR REPLACE INTO telemetry_samples(session_id, timestamp_ms, payload_json)
+                     VALUES(?1, ?2, ?3)",
+                )
+                .map_err(|error| error.to_string())?;
+            let session = session_id.to_string();
+            for sample in samples {
+                let json = serde_json::to_string(sample).map_err(|error| error.to_string())?;
+                statement
+                    .execute(params![session, sample.timestamp_ms, json])
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        transaction.commit().map_err(|error| error.to_string())
     }
 
     pub fn finish_session(&self, summary: &SessionSummary) -> Result<(), String> {
@@ -1279,6 +1301,26 @@ mod tests {
         assert_eq!(storage.known_devices().unwrap().len(), 1);
         assert_eq!(storage.forget_all_devices().unwrap(), 1);
         assert!(storage.known_devices().unwrap().is_empty());
+    }
+
+    #[test]
+    fn records_sample_batches_in_one_transaction() {
+        let storage = Storage::in_memory().unwrap();
+        let session = storage.start_session(None, "Batch", 84.0).unwrap();
+        let samples: Vec<Telemetry> = (0..5)
+            .map(|index| Telemetry {
+                timestamp_ms: 1_700_000_000_000 + index * 200,
+                power_watts: 100 + index as u16,
+                ..Telemetry::default()
+            })
+            .collect();
+        storage.record_samples(session.id, &samples).unwrap();
+        storage.record_samples(session.id, &[]).unwrap();
+        // Re-writing the same timestamps replaces rather than duplicates.
+        storage.record_samples(session.id, &samples[..2]).unwrap();
+        let stored = storage.session(session.id).unwrap().unwrap().samples;
+        assert_eq!(stored.len(), 5);
+        assert_eq!(stored[4].power_watts, 104);
     }
 
     #[test]

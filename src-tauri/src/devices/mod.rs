@@ -25,13 +25,14 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 use tokio::{
-    sync::{Mutex, RwLock, broadcast},
+    sync::{Mutex, broadcast, watch},
     task::JoinHandle,
 };
 
 pub use ble::{Capability, DeviceInfo};
 pub use fuser::{SourcePreferences, TelemetrySources};
 pub use log::DeviceLogLine;
+pub use trainer::ControlError;
 
 use crate::domain::Telemetry;
 use log::DeviceLog;
@@ -100,6 +101,16 @@ impl DeviceState {
 
     pub fn is_connected(&self) -> bool {
         self.device().is_some()
+    }
+
+    /// True when there is no link to wait on: nothing connected, the link was
+    /// lost, or the last attempt failed. `Connecting` is not "down": commands
+    /// are exchanged during connection.
+    pub fn link_is_down(&self) -> bool {
+        matches!(
+            self,
+            DeviceState::Idle | DeviceState::Reconnecting { .. } | DeviceState::Error { .. }
+        )
     }
 }
 
@@ -201,7 +212,7 @@ struct StatsInner {
 pub struct DeviceSlot {
     pub role: DeviceRole,
     app: Option<AppHandle>,
-    state: RwLock<DeviceState>,
+    state: watch::Sender<DeviceState>,
     stats: std::sync::Mutex<StatsInner>,
     log: DeviceLog,
     worker: Mutex<Option<JoinHandle<()>>>,
@@ -212,7 +223,7 @@ impl DeviceSlot {
         Arc::new(Self {
             role,
             app,
-            state: RwLock::new(DeviceState::Idle),
+            state: watch::Sender::new(DeviceState::Idle),
             stats: std::sync::Mutex::new(StatsInner::default()),
             log: DeviceLog::default(),
             worker: Mutex::new(None),
@@ -235,16 +246,18 @@ impl DeviceSlot {
     }
 
     pub async fn state(&self) -> DeviceState {
-        self.state.read().await.clone()
+        self.state.borrow().clone()
     }
 
     pub async fn set_state(&self, next: DeviceState) {
-        {
-            let mut guard = self.state.write().await;
-            tracing::debug!(role = ?self.role, from = ?*guard, to = ?next, "Device state changed");
-            *guard = next;
-        }
+        let previous = self.state.send_replace(next.clone());
+        tracing::debug!(role = ?self.role, from = ?previous, to = ?next, "Device state changed");
         self.emit("devices://slot", self.snapshot().await);
+    }
+
+    /// Follow this slot's connection state; wakes on every change.
+    pub fn subscribe_state(&self) -> watch::Receiver<DeviceState> {
+        self.state.subscribe()
     }
 
     pub fn stats(&self) -> SlotStats {
@@ -329,8 +342,8 @@ impl DeviceSlot {
             let app = app.clone();
             let role = self.role;
             let stats = self.stats();
-            let state = self.state.try_read().map(|guard| guard.clone());
-            if let Ok(state) = state {
+            let state = self.state.borrow().clone();
+            {
                 let _ = app.emit(
                     "devices://slot",
                     SlotSnapshot {
@@ -480,7 +493,7 @@ impl DeviceHub {
     }
 
     fn build(app: Option<AppHandle>) -> Self {
-        let (telemetry, _) = broadcast::channel(64);
+        let (telemetry, _) = broadcast::channel(256);
         // A hub without a window (tests) never touches the OS Bluetooth stack.
         let ble = Arc::new(if app.is_some() {
             ble::Ble::default()
@@ -770,20 +783,35 @@ impl DeviceHub {
         self.trainer.faults()
     }
 
-    pub async fn begin_control(&self) -> Result<(), String> {
+    pub async fn begin_control(&self) -> Result<(), ControlError> {
         self.trainer.begin_control().await
     }
 
-    pub async fn set_target_power(&self, requested: u16, rider_max: u16) -> Result<u16, String> {
+    /// Request Control + Start/Resume again, for a trainer that answered
+    /// ControlNotPermitted mid-ride.
+    pub async fn reacquire_control(&self) -> Result<(), ControlError> {
+        self.trainer.reacquire_control().await
+    }
+
+    pub async fn set_target_power(
+        &self,
+        requested: u16,
+        rider_max: u16,
+    ) -> Result<u16, ControlError> {
         self.trainer.set_target_power(requested, rider_max).await
     }
 
-    pub async fn pause(&self) -> Result<(), String> {
+    pub async fn pause(&self) -> Result<(), ControlError> {
         self.trainer.pause().await
     }
 
-    pub async fn stop(&self) -> Result<(), String> {
+    pub async fn stop(&self) -> Result<(), ControlError> {
         self.trainer.stop().await
+    }
+
+    /// Follow the trainer slot's connection state.
+    pub fn subscribe_trainer_state(&self) -> watch::Receiver<DeviceState> {
+        self.trainer.slot().subscribe_state()
     }
 }
 

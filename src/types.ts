@@ -160,6 +160,9 @@ export type Telemetry = {
   sources?: TelemetrySources;
 };
 
+/** How the trainer is keeping up with the ride (absent on older payloads). */
+export type ControlStatus = "ok" | "degraded" | "lost";
+
 export type RunnerState =
   | { status: "idle" }
   | {
@@ -179,6 +182,7 @@ export type RunnerState =
       /** The rider has overridden this interval's target. */
       overrideActive: boolean;
       biasPercent: number;
+      control?: ControlStatus;
     }
   | {
       status: "paused";
@@ -193,6 +197,7 @@ export type RunnerState =
       manualErg: boolean;
       overrideActive: boolean;
       biasPercent: number;
+      control?: ControlStatus;
     }
   | { status: "finished"; sessionId: string; completed: boolean }
   | { status: "error"; message: string; sessionId: string | null };
