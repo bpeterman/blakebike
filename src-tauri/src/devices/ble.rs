@@ -37,6 +37,16 @@ pub enum Capability {
     Csc,
 }
 
+/// Physical transport used to communicate with a device. Missing values in
+/// older remembered-device JSON deserialize as Bluetooth.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DeviceTransport {
+    #[default]
+    Ble,
+    Ant,
+}
+
 impl Capability {
     pub const ALL: [Capability; 4] = [
         Capability::Ftms,
@@ -60,6 +70,8 @@ impl Capability {
 pub struct DeviceInfo {
     pub id: String,
     pub name: String,
+    #[serde(default)]
+    pub transport: DeviceTransport,
     pub simulated: bool,
     pub rssi: Option<i16>,
     #[serde(default)]
@@ -233,6 +245,7 @@ impl Ble {
             name: properties
                 .local_name
                 .unwrap_or_else(|| default_name(&capabilities).into()),
+            transport: DeviceTransport::Ble,
             simulated: false,
             rssi: properties.rssi,
             capabilities,
@@ -315,6 +328,7 @@ impl Ble {
                 name: properties
                     .local_name
                     .unwrap_or_else(|| default_name(&capabilities).into()),
+                transport: DeviceTransport::Ble,
                 simulated: false,
                 rssi: properties.rssi,
                 capabilities,
