@@ -838,7 +838,7 @@ mod tests {
         let (telemetry, _) = broadcast::channel(4);
         let trainer = Trainer::new(
             DeviceSlot::new(DeviceRole::Trainer, None),
-            Arc::new(Ble::default()),
+            Arc::new(Ble::disabled()),
             Arc::new(TelemetryFuser::new(None, telemetry)),
         );
         assert_eq!(trainer.set_target_power(100, 800).await.unwrap(), 100);

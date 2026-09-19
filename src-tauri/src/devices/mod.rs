@@ -481,7 +481,12 @@ impl DeviceHub {
 
     fn build(app: Option<AppHandle>) -> Self {
         let (telemetry, _) = broadcast::channel(64);
-        let ble = Arc::new(ble::Ble::default());
+        // A hub without a window (tests) never touches the OS Bluetooth stack.
+        let ble = Arc::new(if app.is_some() {
+            ble::Ble::default()
+        } else {
+            ble::Ble::disabled()
+        });
         let fuser = Arc::new(fuser::TelemetryFuser::new(app.clone(), telemetry.clone()));
         Self {
             trainer: trainer::Trainer::new(
