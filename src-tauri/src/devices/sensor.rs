@@ -14,6 +14,7 @@ use super::{
     DeviceInfo, DeviceRole, DeviceSlot, DeviceState,
     ble::{self, Ble, GATT_CONNECT_TIMEOUT, GATT_STEP_TIMEOUT, bluetooth_uuid, hex, with_timeout},
     fuser::{Reading, TelemetryFuser},
+    spawn_link_worker,
 };
 
 /// Kind-specific knowledge for one sensor role.
@@ -200,82 +201,73 @@ impl Sensor {
         let role = self.role();
         let reconnect_name = device.name.clone();
         let measurement_uuid = measurement.uuid;
-        let worker = tokio::spawn(async move {
-            let mut notifications = match peripheral.notifications().await {
-                Ok(stream) => stream,
-                Err(error) => {
-                    tracing::error!(error = %error, "Could not open notification stream");
-                    slot.note(
-                        "error",
-                        "Could not open notification stream",
-                        Some(error.to_string()),
-                    );
-                    return;
-                }
-            };
-            let mut samples: u64 = 0;
-            let mut last_summary = std::time::Instant::now();
-            while let Some(notification) = notifications.next().await {
-                if notification.uuid != measurement_uuid {
-                    tracing::trace!(uuid = %notification.uuid, raw = ?notification.value, "Other notification");
-                    continue;
-                }
-                let now = Utc::now().timestamp_millis();
-                match decoder.decode(&notification.value, now) {
-                    Ok(reading) => {
-                        samples += 1;
-                        slot.record_sample(Some(&notification.value));
-                        if let Some(reading) = reading {
-                            let summary = decoder.describe(&reading);
-                            if samples == 1 {
-                                slot.note("ok", "First sample received", Some(summary.clone()));
-                            }
-                            slot.record_reading(summary);
-                            fuser.ingest(role, reading, now);
-                        }
-                        if last_summary.elapsed() >= Duration::from_secs(60) {
-                            last_summary = std::time::Instant::now();
-                            let stats = slot.stats();
-                            slot.note(
-                                "info",
-                                "Measurements flowing",
-                                Some(format!(
-                                    "{} samples · {:.1} Hz · {} parse failures",
-                                    stats.samples, stats.rate_hz, stats.parse_failures
-                                )),
-                            );
-                        }
-                    }
+        let worker = spawn_link_worker(
+            slot.clone(),
+            fuser.clone(),
+            role,
+            reconnect_name,
+            async move {
+                let mut notifications = match peripheral.notifications().await {
+                    Ok(stream) => stream,
                     Err(error) => {
-                        let failures = slot.record_parse_failure(&notification.value);
-                        if failures <= 5 || failures.is_multiple_of(100) {
-                            tracing::warn!(?role, failures, error = %error, raw = ?notification.value, "Could not parse measurement");
-                            slot.note(
-                                "warn",
-                                "Could not parse measurement",
-                                Some(format!("{error} · {}", hex(&notification.value))),
-                            );
+                        tracing::error!(error = %error, "Could not open notification stream");
+                        slot.note(
+                            "error",
+                            "Could not open notification stream",
+                            Some(error.to_string()),
+                        );
+                        return 0;
+                    }
+                };
+                let mut samples: u64 = 0;
+                let mut last_summary = std::time::Instant::now();
+                while let Some(notification) = notifications.next().await {
+                    if notification.uuid != measurement_uuid {
+                        tracing::trace!(uuid = %notification.uuid, raw = ?notification.value, "Other notification");
+                        continue;
+                    }
+                    let now = Utc::now().timestamp_millis();
+                    match decoder.decode(&notification.value, now) {
+                        Ok(reading) => {
+                            samples += 1;
+                            slot.record_sample(Some(&notification.value));
+                            if let Some(reading) = reading {
+                                let summary = decoder.describe(&reading);
+                                if samples == 1 {
+                                    slot.note("ok", "First sample received", Some(summary.clone()));
+                                }
+                                slot.record_reading(summary);
+                                fuser.ingest(role, reading, now);
+                            }
+                            if last_summary.elapsed() >= Duration::from_secs(60) {
+                                last_summary = std::time::Instant::now();
+                                let stats = slot.stats();
+                                slot.note(
+                                    "info",
+                                    "Measurements flowing",
+                                    Some(format!(
+                                        "{} samples · {:.1} Hz · {} parse failures",
+                                        stats.samples, stats.rate_hz, stats.parse_failures
+                                    )),
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            let failures = slot.record_parse_failure(&notification.value);
+                            if failures <= 5 || failures.is_multiple_of(100) {
+                                tracing::warn!(?role, failures, error = %error, raw = ?notification.value, "Could not parse measurement");
+                                slot.note(
+                                    "warn",
+                                    "Could not parse measurement",
+                                    Some(format!("{error} · {}", hex(&notification.value))),
+                                );
+                            }
                         }
                     }
                 }
-            }
-            tracing::warn!(
-                ?role,
-                samples,
-                "Notification stream ended; sensor link lost"
-            );
-            slot.record_drop();
-            fuser.forget(role);
-            slot.note(
-                "error",
-                "Link lost",
-                Some(format!("after {samples} samples")),
-            );
-            slot.set_state(DeviceState::Reconnecting {
-                name: reconnect_name,
-            })
-            .await;
-        });
+                samples
+            },
+        );
         self.slot.set_worker(worker).await;
         self.slot.set_state(DeviceState::Ready { device }).await;
         Ok(())
@@ -299,27 +291,33 @@ impl Sensor {
         let slot = self.slot.clone();
         let fuser = self.fuser.clone();
         let role = self.role();
-        let worker = tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_millis(500));
-            let mut count: u64 = 0;
-            loop {
-                tick.tick().await;
-                let now = Utc::now().timestamp_millis();
-                let reading = decoder.simulate(count, now);
-                slot.record_sample(None);
-                let summary = decoder.describe(&reading);
-                if count == 0 {
-                    slot.note(
-                        "ok",
-                        "First sample received",
-                        Some(format!("simulated · {summary}")),
-                    );
+        let worker = spawn_link_worker(
+            slot.clone(),
+            fuser.clone(),
+            role,
+            device.name.clone(),
+            async move {
+                let mut tick = tokio::time::interval(Duration::from_millis(500));
+                let mut count: u64 = 0;
+                loop {
+                    tick.tick().await;
+                    let now = Utc::now().timestamp_millis();
+                    let reading = decoder.simulate(count, now);
+                    slot.record_sample(None);
+                    let summary = decoder.describe(&reading);
+                    if count == 0 {
+                        slot.note(
+                            "ok",
+                            "First sample received",
+                            Some(format!("simulated · {summary}")),
+                        );
+                    }
+                    slot.record_reading(summary);
+                    fuser.ingest(role, reading, now);
+                    count += 1;
                 }
-                slot.record_reading(summary);
-                fuser.ingest(role, reading, now);
-                count += 1;
-            }
-        });
+            },
+        );
         self.slot.set_worker(worker).await;
     }
 

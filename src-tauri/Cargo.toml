@@ -38,6 +38,9 @@ tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 fit-sdk-rust = "0.2.1"
+# Prevents system/display sleep while a ride is active (IOKit on macOS,
+# ScreenSaver + logind inhibit over D-Bus on Linux).
+keepawake = "0.6"
 
 [dev-dependencies]
 proptest = "1"
@@ -51,5 +54,7 @@ tokio = { version = "1", features = ["test-util"] }
 codegen-units = 1
 lto = true
 opt-level = 3
-panic = "abort"
+# Unwind so a panic in one task (a decoder, a BLE callback) is caught and
+# handled as a link loss instead of taking the whole ride down.
+panic = "unwind"
 strip = true

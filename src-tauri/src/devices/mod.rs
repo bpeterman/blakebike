@@ -15,12 +15,16 @@ pub mod trainer;
 
 use std::{
     collections::{HashMap, VecDeque},
+    future::Future,
+    panic::AssertUnwindSafe,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
+
+use futures::FutureExt;
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -36,6 +40,7 @@ pub use log::DeviceLogLine;
 pub use trainer::ControlError;
 
 use crate::domain::Telemetry;
+use fuser::TelemetryFuser;
 use log::DeviceLog;
 
 /// The job a connected device does. One device per role at a time.
@@ -479,6 +484,49 @@ fn refresh_rate(inner: &mut StatsInner, now: i64) {
     };
 }
 
+/// Run a device's notification loop as a task. Whatever ends it, including a
+/// panic, is treated as a link loss so the slot ends up in `Reconnecting` and
+/// the supervisor takes over. `body` returns the number of samples it saw.
+pub(crate) fn spawn_link_worker(
+    slot: Arc<DeviceSlot>,
+    fuser: Arc<TelemetryFuser>,
+    role: DeviceRole,
+    name: String,
+    body: impl Future<Output = u64> + Send + 'static,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let samples = match AssertUnwindSafe(body).catch_unwind().await {
+            Ok(samples) => samples,
+            Err(_) => {
+                tracing::error!(?role, "Device worker panicked; treating it as a link loss");
+                slot.note("error", "Device worker crashed", None);
+                0
+            }
+        };
+        link_lost(&slot, &fuser, role, name, samples).await;
+    })
+}
+
+/// What every device worker does when its stream ends: record the drop, stop
+/// feeding the fuser, and mark the slot as needing a reconnect.
+pub(crate) async fn link_lost(
+    slot: &DeviceSlot,
+    fuser: &TelemetryFuser,
+    role: DeviceRole,
+    name: String,
+    samples: u64,
+) {
+    tracing::warn!(?role, samples, "Notification stream ended; link lost");
+    slot.record_drop();
+    fuser.forget(role);
+    slot.note(
+        "error",
+        "Link lost",
+        Some(format!("after {samples} samples")),
+    );
+    slot.set_state(DeviceState::Reconnecting { name }).await;
+}
+
 /// Backoff between automatic reconnect attempts; the last entry repeats.
 const RECONNECT_BACKOFF: [Duration; 6] = [
     Duration::from_secs(1),
@@ -616,6 +664,14 @@ impl DeviceHub {
 
     pub fn ride_active(&self) -> bool {
         self.ride_active.load(Ordering::Relaxed)
+    }
+
+    /// Stop every automatic reconnect (app shutdown).
+    pub fn cancel_reconnects(&self) {
+        for link in self.links.values() {
+            link.set_last_device(None);
+            link.bump();
+        }
     }
 
     /// Start one reconnect supervisor per role. They live as long as the

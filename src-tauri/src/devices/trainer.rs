@@ -23,6 +23,7 @@ use super::{
     Capability, DeviceInfo, DeviceRole, DeviceSlot, DeviceState,
     ble::{self, Ble, GATT_CONNECT_TIMEOUT, GATT_STEP_TIMEOUT, bluetooth_uuid, hex, with_timeout},
     fuser::{Reading, TelemetryFuser},
+    spawn_link_worker,
 };
 use crate::{
     domain::Telemetry,
@@ -119,6 +120,8 @@ pub struct SimFaults {
     pub refuse_with: AtomicU8,
     /// The next N simulated connects fail.
     pub fail_connects: AtomicU32,
+    /// Makes the simulator's worker task panic on its next tick (once).
+    pub panic_worker: AtomicBool,
     /// Ends the simulator's telemetry loop, which is exactly what a real link
     /// loss looks like from the inside.
     pub drop_link: Notify,
@@ -434,89 +437,97 @@ impl Trainer {
         let control_tx = self.control_responses.clone();
         let status_tx = self.status_responses.clone();
         let reconnect_name = device.name.clone();
-        let worker = tokio::spawn(async move {
-            let mut notifications = match peripheral.notifications().await {
-                Ok(stream) => stream,
-                Err(error) => {
-                    tracing::error!(error = %error, "Could not open notification stream");
-                    slot.note(
-                        "error",
-                        "Could not open notification stream",
-                        Some(error.to_string()),
-                    );
-                    return;
-                }
-            };
-            tracing::debug!("Notification worker started");
-            let mut samples: u64 = 0;
-            let mut last_summary = std::time::Instant::now();
-            while let Some(notification) = notifications.next().await {
-                if notification.uuid == bluetooth_uuid(INDOOR_BIKE_DATA) {
-                    match parse_indoor_bike_data(&notification.value, Utc::now().timestamp_millis())
-                    {
-                        Ok(telemetry) => {
-                            samples += 1;
-                            slot.record_sample(Some(&notification.value));
-                            if samples == 1 {
-                                tracing::debug!(?telemetry, "First Indoor Bike Data sample");
-                                slot.note(
-                                    "ok",
-                                    "First sample received",
-                                    Some(format!(
-                                        "{} W · {} rpm",
-                                        telemetry.power_watts,
-                                        telemetry
-                                            .cadence_rpm
-                                            .map(|c| format!("{c:.0}"))
-                                            .unwrap_or_else(|| "—".into())
-                                    )),
-                                );
-                            } else if samples.is_multiple_of(120) {
-                                tracing::debug!(samples, ?telemetry, "Indoor Bike Data");
-                            }
-                            if last_summary.elapsed() >= Duration::from_secs(60) {
-                                last_summary = std::time::Instant::now();
-                                let stats = slot.stats();
-                                slot.note(
-                                    "info",
-                                    "Telemetry flowing",
-                                    Some(format!(
-                                        "{} samples · {:.1} Hz · {} parse failures",
-                                        stats.samples, stats.rate_hz, stats.parse_failures
-                                    )),
-                                );
-                            }
-                            slot.record_reading(describe(&telemetry));
-                            fuser.ingest(
-                                DeviceRole::Trainer,
-                                Reading::Trainer(telemetry),
-                                Utc::now().timestamp_millis(),
-                            );
-                        }
-                        Err(error) => {
-                            let failures = slot.record_parse_failure(&notification.value);
-                            if failures <= 5 || failures.is_multiple_of(100) {
-                                tracing::warn!(failures, error = %error, raw = ?notification.value, "Could not parse Indoor Bike Data");
-                                slot.note(
-                                    "warn",
-                                    "Could not parse Indoor Bike Data",
-                                    Some(format!("{error} · {}", hex(&notification.value))),
-                                );
-                            }
-                        }
+        let worker = spawn_link_worker(
+            slot.clone(),
+            fuser.clone(),
+            DeviceRole::Trainer,
+            reconnect_name,
+            async move {
+                let mut notifications = match peripheral.notifications().await {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        tracing::error!(error = %error, "Could not open notification stream");
+                        slot.note(
+                            "error",
+                            "Could not open notification stream",
+                            Some(error.to_string()),
+                        );
+                        return 0;
                     }
-                } else if notification.uuid == bluetooth_uuid(FITNESS_MACHINE_CONTROL_POINT) {
-                    tracing::debug!(raw = ?notification.value, "Control Point response");
-                    let _ = control_tx.send(notification.value);
-                } else if notification.uuid == bluetooth_uuid(FITNESS_MACHINE_STATUS) {
-                    tracing::debug!(raw = ?notification.value, "Fitness Machine Status");
-                    let _ = status_tx.send(notification.value);
-                } else {
-                    tracing::trace!(uuid = %notification.uuid, raw = ?notification.value, "Other notification");
+                };
+                tracing::debug!("Notification worker started");
+                let mut samples: u64 = 0;
+                let mut last_summary = std::time::Instant::now();
+                while let Some(notification) = notifications.next().await {
+                    if notification.uuid == bluetooth_uuid(INDOOR_BIKE_DATA) {
+                        match parse_indoor_bike_data(
+                            &notification.value,
+                            Utc::now().timestamp_millis(),
+                        ) {
+                            Ok(telemetry) => {
+                                samples += 1;
+                                slot.record_sample(Some(&notification.value));
+                                if samples == 1 {
+                                    tracing::debug!(?telemetry, "First Indoor Bike Data sample");
+                                    slot.note(
+                                        "ok",
+                                        "First sample received",
+                                        Some(format!(
+                                            "{} W · {} rpm",
+                                            telemetry.power_watts,
+                                            telemetry
+                                                .cadence_rpm
+                                                .map(|c| format!("{c:.0}"))
+                                                .unwrap_or_else(|| "—".into())
+                                        )),
+                                    );
+                                } else if samples.is_multiple_of(120) {
+                                    tracing::debug!(samples, ?telemetry, "Indoor Bike Data");
+                                }
+                                if last_summary.elapsed() >= Duration::from_secs(60) {
+                                    last_summary = std::time::Instant::now();
+                                    let stats = slot.stats();
+                                    slot.note(
+                                        "info",
+                                        "Telemetry flowing",
+                                        Some(format!(
+                                            "{} samples · {:.1} Hz · {} parse failures",
+                                            stats.samples, stats.rate_hz, stats.parse_failures
+                                        )),
+                                    );
+                                }
+                                slot.record_reading(describe(&telemetry));
+                                fuser.ingest(
+                                    DeviceRole::Trainer,
+                                    Reading::Trainer(telemetry),
+                                    Utc::now().timestamp_millis(),
+                                );
+                            }
+                            Err(error) => {
+                                let failures = slot.record_parse_failure(&notification.value);
+                                if failures <= 5 || failures.is_multiple_of(100) {
+                                    tracing::warn!(failures, error = %error, raw = ?notification.value, "Could not parse Indoor Bike Data");
+                                    slot.note(
+                                        "warn",
+                                        "Could not parse Indoor Bike Data",
+                                        Some(format!("{error} · {}", hex(&notification.value))),
+                                    );
+                                }
+                            }
+                        }
+                    } else if notification.uuid == bluetooth_uuid(FITNESS_MACHINE_CONTROL_POINT) {
+                        tracing::debug!(raw = ?notification.value, "Control Point response");
+                        let _ = control_tx.send(notification.value);
+                    } else if notification.uuid == bluetooth_uuid(FITNESS_MACHINE_STATUS) {
+                        tracing::debug!(raw = ?notification.value, "Fitness Machine Status");
+                        let _ = status_tx.send(notification.value);
+                    } else {
+                        tracing::trace!(uuid = %notification.uuid, raw = ?notification.value, "Other notification");
+                    }
                 }
-            }
-            link_lost(&slot, &fuser, reconnect_name, samples).await;
-        });
+                samples
+            },
+        );
         self.slot.set_worker(worker).await;
         tracing::debug!("Requesting FTMS control");
         self.slot.progress(
@@ -556,45 +567,54 @@ impl Trainer {
         let faults = self.faults.clone();
         let simulated = self.simulated.clone();
         let name = device.name.clone();
-        let worker = tokio::spawn(async move {
-            let mut power = 90.0_f32;
-            let mut tick = tokio::time::interval(Duration::from_millis(500));
-            let mut first = true;
-            let mut samples: u64 = 0;
-            loop {
-                tokio::select! {
-                    _ = tick.tick() => {}
-                    _ = faults.drop_link.notified() => break,
+        let worker = spawn_link_worker(
+            slot.clone(),
+            fuser.clone(),
+            DeviceRole::Trainer,
+            name,
+            async move {
+                let mut power = 90.0_f32;
+                let mut tick = tokio::time::interval(Duration::from_millis(500));
+                let mut first = true;
+                let mut samples: u64 = 0;
+                loop {
+                    tokio::select! {
+                        _ = tick.tick() => {}
+                        _ = faults.drop_link.notified() => break,
+                    }
+                    samples += 1;
+                    if faults.panic_worker.swap(false, Ordering::Relaxed) {
+                        panic!("simulated trainer worker panic");
+                    }
+                    let requested = target.load(Ordering::Relaxed) as f32;
+                    power += (requested - power) * 0.18;
+                    let elapsed = Utc::now().timestamp_millis() as f32 / 1_000.0;
+                    let wobble = elapsed.sin() * 3.0;
+                    let telemetry = Telemetry {
+                        timestamp_ms: Utc::now().timestamp_millis(),
+                        power_watts: (power + wobble).max(0.0) as u16,
+                        cadence_rpm: Some(88.0 + wobble / 2.0),
+                        speed_kph: Some(30.0 + wobble / 3.0),
+                        heart_rate_bpm: Some((125.0 + requested / 20.0).min(185.0) as u8),
+                        target_power_watts: Some(requested as u16),
+                    };
+                    slot.record_sample(None);
+                    if first {
+                        first = false;
+                        slot.note("ok", "First sample received", Some("simulated".into()));
+                    }
+                    slot.record_reading(describe(&telemetry));
+                    fuser.ingest(
+                        DeviceRole::Trainer,
+                        Reading::Trainer(telemetry),
+                        Utc::now().timestamp_millis(),
+                    );
                 }
-                samples += 1;
-                let requested = target.load(Ordering::Relaxed) as f32;
-                power += (requested - power) * 0.18;
-                let elapsed = Utc::now().timestamp_millis() as f32 / 1_000.0;
-                let wobble = elapsed.sin() * 3.0;
-                let telemetry = Telemetry {
-                    timestamp_ms: Utc::now().timestamp_millis(),
-                    power_watts: (power + wobble).max(0.0) as u16,
-                    cadence_rpm: Some(88.0 + wobble / 2.0),
-                    speed_kph: Some(30.0 + wobble / 3.0),
-                    heart_rate_bpm: Some((125.0 + requested / 20.0).min(185.0) as u8),
-                    target_power_watts: Some(requested as u16),
-                };
-                slot.record_sample(None);
-                if first {
-                    first = false;
-                    slot.note("ok", "First sample received", Some("simulated".into()));
-                }
-                slot.record_reading(describe(&telemetry));
-                fuser.ingest(
-                    DeviceRole::Trainer,
-                    Reading::Trainer(telemetry),
-                    Utc::now().timestamp_millis(),
-                );
-            }
-            // A dropped simulator is as gone as a dropped trainer.
-            simulated.store(false, Ordering::Relaxed);
-            link_lost(&slot, &fuser, name, samples).await;
-        });
+                // A dropped simulator is as gone as a dropped trainer.
+                simulated.store(false, Ordering::Relaxed);
+                samples
+            },
+        );
         self.slot.set_worker(worker).await;
     }
 
@@ -1017,20 +1037,6 @@ impl Trainer {
     }
 }
 
-/// What every trainer worker does when its stream ends: record the drop,
-/// stop feeding the fuser, and mark the slot as needing a reconnect.
-async fn link_lost(slot: &DeviceSlot, fuser: &TelemetryFuser, name: String, samples: u64) {
-    tracing::warn!(samples, "Notification stream ended; trainer link lost");
-    slot.record_drop();
-    fuser.forget(DeviceRole::Trainer);
-    slot.note(
-        "error",
-        "Link lost",
-        Some(format!("after {samples} samples")),
-    );
-    slot.set_state(DeviceState::Reconnecting { name }).await;
-}
-
 /// One-line summary of an Indoor Bike Data sample for the hub card.
 fn describe(telemetry: &Telemetry) -> String {
     let mut parts = vec![format!("{} W", telemetry.power_watts)];
@@ -1185,6 +1191,37 @@ mod tests {
         let (result, elapsed) = writer.await.unwrap();
         assert_eq!(result.unwrap_err(), ControlError::NotConnected);
         assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+        hub.disconnect().await;
+    }
+
+    #[tokio::test]
+    async fn a_worker_panic_is_handled_as_a_link_loss() {
+        let hub = super::super::DeviceHub::default();
+        hub.connect(DeviceRole::Trainer, simulated_devices().remove(0))
+            .await
+            .unwrap();
+        hub.simulated_faults()
+            .panic_worker
+            .store(true, Ordering::Relaxed);
+        for _ in 0..60 {
+            if matches!(
+                hub.slot(DeviceRole::Trainer).state().await,
+                DeviceState::Reconnecting { .. }
+            ) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(matches!(
+            hub.slot(DeviceRole::Trainer).state().await,
+            DeviceState::Reconnecting { .. }
+        ));
+        assert!(
+            hub.slot(DeviceRole::Trainer)
+                .log_lines()
+                .iter()
+                .any(|line| line.step == "Device worker crashed")
+        );
         hub.disconnect().await;
     }
 

@@ -9,21 +9,58 @@ mod intervals;
 mod runner;
 mod storage;
 
-use std::{fs, path::PathBuf, sync::Arc};
+use std::{
+    fs,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use devices::DeviceHub;
 use runner::WorkoutRunner;
 use storage::Storage;
-use tauri::Manager;
+use tauri::{AppHandle, Manager, RunEvent};
 use tracing_subscriber::EnvFilter;
+
+/// How long a quit waits for the ride to finalize and the trainer to be
+/// released before the process exits regardless.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
+/// Daily log files kept before the oldest is pruned.
+const LOG_FILES_KEPT: usize = 14;
 
 pub struct AppState {
     devices: Arc<DeviceHub>,
     runner: Arc<WorkoutRunner>,
     storage: Arc<Storage>,
-    log_path: PathBuf,
+    log_dir: PathBuf,
     ride_files_dir: PathBuf,
     _log_guard: tracing_appender::non_blocking::WorkerGuard,
+}
+
+impl AppState {
+    /// Today's log file. The appender rotates daily on UTC dates.
+    pub fn log_path(&self) -> PathBuf {
+        self.log_dir.join(format!(
+            "blakebike.{}.log",
+            chrono::Utc::now().format("%Y-%m-%d")
+        ))
+    }
+}
+
+static SHUTDOWN_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// Finish the ride (session summary, FIT file), release the trainer and stop
+/// reconnecting. Idempotent and bounded by the caller.
+async fn shutdown(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let devices = Arc::clone(&state.devices);
+    let runner = Arc::clone(&state.runner);
+    devices.cancel_reconnects();
+    runner.stop_and_wait(SHUTDOWN_GRACE).await;
+    devices.disconnect().await;
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -34,8 +71,12 @@ pub fn run() {
         .setup(|app| {
             let log_dir = app.path().app_log_dir()?;
             fs::create_dir_all(&log_dir)?;
-            let log_path = log_dir.join("blakebike.log");
-            let appender = tracing_appender::rolling::never(&log_dir, "blakebike.log");
+            let appender = tracing_appender::rolling::Builder::new()
+                .rotation(tracing_appender::rolling::Rotation::DAILY)
+                .filename_prefix("blakebike")
+                .filename_suffix("log")
+                .max_log_files(LOG_FILES_KEPT)
+                .build(&log_dir)?;
             let (log_writer, log_guard) = tracing_appender::non_blocking(appender);
             // Default: our own crate at debug (every BLE step, state change and
             // command), btleplug's internals at debug (they use the `log` crate
@@ -66,7 +107,7 @@ pub fn run() {
                 os = std::env::consts::OS,
                 arch = std::env::consts::ARCH,
                 debug_build = cfg!(debug_assertions),
-                log_file = %log_path.display(),
+                log_dir = %log_dir.display(),
                 "blake.bike started"
             );
             let app_data_dir = app.path().app_data_dir()?;
@@ -121,23 +162,11 @@ pub fn run() {
                 devices,
                 runner: Arc::new(WorkoutRunner::new(ride_files_dir.clone())),
                 storage: Arc::new(storage),
-                log_path,
+                log_dir,
                 ride_files_dir,
                 _log_guard: log_guard,
             });
             Ok(())
-        })
-        .on_window_event(|window, event| {
-            if matches!(event, tauri::WindowEvent::Destroyed) {
-                tracing::info!("Window destroyed; stopping workout and disconnecting devices");
-                let state = window.state::<AppState>();
-                let devices = Arc::clone(&state.devices);
-                let runner = Arc::clone(&state.runner);
-                tauri::async_runtime::spawn(async move {
-                    let _ = runner.stop().await;
-                    devices.disconnect().await;
-                });
-            }
         })
         .invoke_handler(tauri::generate_handler![
             commands::device_state,
@@ -197,6 +226,29 @@ pub fn run() {
             commands::report_client_event,
             commands::debug_inject_trainer_fault,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            // Closing the last window or quitting asks to exit; hold that
+            // until the ride is finalized and the trainer released, then exit
+            // for real (the second request passes straight through).
+            if let RunEvent::ExitRequested { api, code, .. } = &event
+                && !SHUTDOWN_STARTED.swap(true, Ordering::SeqCst)
+            {
+                tracing::info!(code = ?code, "Exit requested; finishing the ride first");
+                api.prevent_exit();
+                let app = app.clone();
+                let code = code.unwrap_or(0);
+                tauri::async_runtime::spawn(async move {
+                    if tokio::time::timeout(SHUTDOWN_GRACE + Duration::from_secs(2), shutdown(&app))
+                        .await
+                        .is_err()
+                    {
+                        tracing::warn!("Shutdown did not complete in time; exiting anyway");
+                    }
+                    tracing::info!("Shutdown complete");
+                    app.exit(code);
+                });
+            }
+        });
 }
