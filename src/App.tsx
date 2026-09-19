@@ -269,6 +269,7 @@ function App() {
     runner.status === "running" ||
     runner.status === "paused" ||
     runner.status === "countdown";
+  const riding = runner.status === "running" || runner.status === "paused";
 
   const perform = useCallback(async (action: () => Promise<unknown>, label = "user action") => {
     try {
@@ -366,30 +367,46 @@ function App() {
             </button>
           ))}
         </nav>
-        <button className="connection-pill" onClick={() => setPage("devices")}>
-          <span className="role-dots">
-            {deviceRoles.map((role) => {
-              const state = hub?.slots.find((slot) => slot.role === role)?.state;
-              const tone =
-                slotConnected(state) ? "online"
-                : state?.status === "reconnecting" || state?.status === "error" ? "error"
-                : state?.status === "connecting" ? "busy"
-                : "";
-              return <span key={role} className={`status-dot ${tone}`} title={deviceRoleLabel[role]} />;
-            })}
-          </span>
-          <span>
-            <small>DEVICES</small>
-            <strong>
-              {connectedRoles.length === 0
-                ? "None connected"
-                : connected && connectedRoles.length === 1
-                  ? deviceState.device.name
-                  : `${connectedRoles.length} of ${deviceRoles.length} connected`}
-            </strong>
-          </span>
-          <ChevronRight size={16} />
-        </button>
+        <div className="sidebar-bottom">
+          {riding && (
+            <div className="sidebar-ride-controls">
+              <span className="label">RIDE CONTROLS</span>
+              <div>
+                <button className="secondary" onClick={() => void perform(() => api.pauseOrResume(), "pause/resume")}>
+                  {runner.status === "paused" ? <Play /> : <Pause />}
+                  {runner.status === "paused" ? "Resume" : "Pause"}
+                </button>
+                <button className="stop" onClick={() => void perform(() => api.stopWorkout(), "stop workout")}>
+                  <CircleStop /> End
+                </button>
+              </div>
+            </div>
+          )}
+          <button className="connection-pill" onClick={() => setPage("devices")}>
+            <span className="role-dots">
+              {deviceRoles.map((role) => {
+                const state = hub?.slots.find((slot) => slot.role === role)?.state;
+                const tone =
+                  slotConnected(state) ? "online"
+                  : state?.status === "reconnecting" || state?.status === "error" ? "error"
+                  : state?.status === "connecting" ? "busy"
+                  : "";
+                return <span key={role} className={`status-dot ${tone}`} title={deviceRoleLabel[role]} />;
+              })}
+            </span>
+            <span>
+              <small>DEVICES</small>
+              <strong>
+                {connectedRoles.length === 0
+                  ? "None connected"
+                  : connected && connectedRoles.length === 1
+                    ? deviceState.device.name
+                    : `${connectedRoles.length} of ${deviceRoles.length} connected`}
+              </strong>
+            </span>
+            <ChevronRight size={16} />
+          </button>
+        </div>
       </aside>
 
       <main className="content">
@@ -905,26 +922,12 @@ export function Ride({
               elapsedSeconds={elapsed}
               totalSeconds={total ?? 0}
               paused={runner.status === "paused"}
+              onSkip={() => void perform(() => api.skipInterval(), "skip interval")}
             />
           )}
-          <div className="ride-controls">
-            <button className="secondary control" onClick={() => void perform(() => api.pauseOrResume(), "pause/resume")}>{runner.status === "paused" ? <Play /> : <Pause />} {runner.status === "paused" ? "Resume" : "Pause"}</button>
-            {!openEnded && <button className="secondary control" onClick={() => void perform(() => api.skipInterval(), "skip interval")}><SkipForward /> Skip</button>}
-            <button className="stop control" onClick={() => void perform(() => api.stopWorkout(), "stop workout")}><CircleStop /> End ride</button>
-          </div>
-          <div className="card live-chart">
-            <div className="chart-heading">
-              <div><span className="label">FULL SESSION</span><h3>Power</h3></div>
-              <label className="chart-toggle">
-                <input
-                  type="checkbox"
-                  checked={rideDisplay.showTimeInZone}
-                  onChange={(event) =>
-                    onRideDisplay({ showTimeInZone: event.target.checked })
-                  }
-                />
-                Time in zone
-              </label>
+          <div className="card workout-controls-card">
+            <div className="workout-controls-heading">
+              <span className="label">TARGET &amp; BIAS</span>
             </div>
             <div className={adjustable ? "target-line editable" : "target-line"}>
               <span>Target power</span>
@@ -984,6 +987,21 @@ export function Ride({
                 </div>
               </div>
             )}
+          </div>
+          <div className="card live-chart">
+            <div className="chart-heading">
+              <div><span className="label">FULL SESSION</span><h3>Power</h3></div>
+              <label className="chart-toggle">
+                <input
+                  type="checkbox"
+                  checked={rideDisplay.showTimeInZone}
+                  onChange={(event) =>
+                    onRideDisplay({ showTimeInZone: event.target.checked })
+                  }
+                />
+                Time in zone
+              </label>
+            </div>
             <SessionAreaChart
               samples={chartHistory}
               dataKey="displayPowerWatts"
@@ -1416,6 +1434,7 @@ function WorkoutTimeline({
   elapsedSeconds,
   totalSeconds,
   paused,
+  onSkip,
 }: {
   intervals: WorkoutInterval[];
   workoutName: string;
@@ -1424,6 +1443,7 @@ function WorkoutTimeline({
   elapsedSeconds: number;
   totalSeconds: number;
   paused: boolean;
+  onSkip: () => void;
 }) {
   const current = intervals[currentIndex];
   if (!current) return null;
@@ -1448,14 +1468,17 @@ function WorkoutTimeline({
           <h3>Block {currentIndex + 1} of {intervals.length}</h3>
           <span className="timeline-target">{currentTarget}{paused ? " · Paused" : ""}</span>
         </div>
-        <div className="timeline-countdowns">
-          <div>
-            <span>Current block</span>
-            <strong>{formatDuration(currentRemaining)}</strong>
-          </div>
-          <div>
-            <span>Workout remaining</span>
-            <strong>{formatDuration(workoutRemaining)}</strong>
+        <div className="timeline-side">
+          <button className="secondary" onClick={onSkip}><SkipForward /> Skip block</button>
+          <div className="timeline-countdowns">
+            <div>
+              <span>Current block</span>
+              <strong>{formatDuration(currentRemaining)}</strong>
+            </div>
+            <div>
+              <span>Workout remaining</span>
+              <strong>{formatDuration(workoutRemaining)}</strong>
+            </div>
           </div>
         </div>
       </div>

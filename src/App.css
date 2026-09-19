@@ -58,11 +58,16 @@ nav { display: grid; gap: 5px; }
 .nav-item.active { color: #f7faf4; background: #252a23; }
 .nav-item.active svg { color: #c8ff32; }
 .live-dot { position: absolute; right: 11px; width: 7px; height: 7px; background: #c8ff32; border-radius: 50%; box-shadow: 0 0 10px #c8ff32; }
+.sidebar-bottom { display: grid; gap: 10px; margin-top: auto; }
+.sidebar-ride-controls { padding: 11px; border: 1px solid #39432f; border-radius: 10px; background: #1c211a; }
+.sidebar-ride-controls > .label { display: block; margin-bottom: 8px; }
+.sidebar-ride-controls > div { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
+.sidebar-ride-controls button { min-width: 0; min-height: 36px; padding: 0 7px; }
+.sidebar-ride-controls button svg { width: 15px; height: 15px; }
 .connection-pill {
   display: flex;
   align-items: center;
   gap: 9px;
-  margin-top: auto;
   padding: 11px;
   border: 1px solid #30352e;
   border-radius: 10px;
@@ -177,9 +182,11 @@ p { color: #8d9587; font-size: 13px; }
 .live-metric.accent { border-color: #566d26; background: #1e2518; }
 .live-metric.accent > strong, .live-metric.accent > span svg { color: #c8ff32; }
 .workout-timeline { margin-top: 12px; padding: 18px; }
-.timeline-heading { display: flex; align-items: end; justify-content: space-between; gap: 24px; margin-bottom: 14px; }
+.timeline-heading { display: flex; align-items: start; justify-content: space-between; gap: 24px; margin-bottom: 14px; }
 .timeline-heading h3 { margin: 2px 0; font-size: 18px; }
 .timeline-target { color: #899283; font-size: 11px; }
+.timeline-side { display: grid; justify-items: end; gap: 12px; }
+.timeline-side > .secondary { min-height: 34px; }
 .timeline-countdowns { display: flex; gap: 30px; }
 .timeline-countdowns > div { display: grid; gap: 2px; text-align: right; }
 .timeline-countdowns span { color: #788173; font-size: 9px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
@@ -192,6 +199,10 @@ p { color: #8d9587; font-size: 13px; }
 .workout-timeline-block.completed { opacity: .58; --timeline-progress: #748842; --timeline-rest: #748842; }
 .workout-timeline-block.current { min-width: 10px; outline: 2px solid #c8ff32; outline-offset: -2px; background: #30382a; --timeline-progress: #c8ff32; --timeline-rest: #667b32; }
 .workout-timeline-block.upcoming { opacity: .72; }
+.workout-controls-card { margin-top: 12px; padding: 15px 18px; }
+.workout-controls-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 8px; }
+.workout-controls-card .target-line.editable { margin-bottom: 8px; }
+.workout-controls-card .plan-line { margin-bottom: 0; }
 .live-chart { margin-top: 12px; padding: 18px 18px 13px; }
 .secondary-chart { padding-top: 14px; }
 .chart-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 8px; }
@@ -230,8 +241,6 @@ p { color: #8d9587; font-size: 13px; }
 .progress i { display: block; height: 100%; background: #c8ff32; }
 .open-ended-time { display: flex; align-items: baseline; justify-content: center; gap: 10px; color: #737c6e; font-size: 10px; text-transform: uppercase; letter-spacing: .08em; }
 .open-ended-time strong { color: #e8ede3; font-size: 17px; letter-spacing: 0; }
-.ride-controls { display: flex; justify-content: center; gap: 10px; margin-top: 10px; }
-.ride-controls .control { min-width: 125px; min-height: 46px; }
 .countdown { position: fixed; z-index: 20; inset: 0; display: grid; place-items: center; color: #c8ff32; background: rgba(12,14,11,.88); font-size: 160px; font-weight: 800; }
 
 .history-list { overflow: hidden; border: 1px solid #2b3029; border-radius: 13px; }
