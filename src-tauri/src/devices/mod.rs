@@ -6,6 +6,7 @@
 pub mod ant;
 pub mod ble;
 pub mod cadence;
+pub mod control_point;
 pub mod crank;
 pub mod cycling_power;
 pub mod fuser;
@@ -37,9 +38,9 @@ use tokio::{
 };
 
 pub use ble::{Capability, DeviceInfo, DeviceTransport};
+pub use control_point::ControlError;
 pub use fuser::{SourcePreferences, TelemetrySources};
 pub use log::DeviceLogLine;
-pub use trainer::ControlError;
 
 use crate::domain::Telemetry;
 use fuser::TelemetryFuser;
@@ -155,10 +156,65 @@ pub struct SlotStats {
     pub last_raw_hex: Option<String>,
     /// Human summary of the latest decoded reading, e.g. "215 W · 88 rpm".
     pub last_reading: Option<String>,
-    /// Whether this trainer advertises the FTMS Spin Down Control feature.
+    /// Whether the device offers a calibration procedure we can drive: FTMS
+    /// Spin Down Control on a trainer, offset compensation on a power meter.
     pub calibration_supported: bool,
-    /// Whether a trainer spin-down procedure is currently running.
+    /// Whether that procedure is currently running.
     pub calibrating: bool,
+    /// The device itself is asking to be calibrated (a power meter's Offset
+    /// Compensation Indicator flag).
+    pub calibration_requested: bool,
+    /// The last calibration recorded for this device, seeded from the
+    /// remembered-device store on connect and refreshed on success.
+    pub last_calibration: Option<CalibrationRecord>,
+}
+
+/// Which procedure a calibration record describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CalibrationKind {
+    /// FTMS spin-down on a trainer.
+    SpinDown,
+    /// Cycling Power offset compensation ("zero offset") on a power meter.
+    ZeroOffset,
+}
+
+/// One completed calibration. For a zero offset `offset_raw` is the meter's
+/// answer in its own units; its drift between sessions is what matters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CalibrationRecord {
+    pub at: chrono::DateTime<Utc>,
+    pub kind: CalibrationKind,
+    pub offset_raw: Option<i16>,
+}
+
+/// Procedure-specific numbers carried by a calibration progress event.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum CalibrationDetail {
+    #[serde(rename_all = "camelCase")]
+    SpinDown {
+        target_low_kph: f32,
+        target_high_kph: f32,
+    },
+    #[serde(rename_all = "camelCase")]
+    ZeroOffset {
+        offset_raw: i16,
+        previous_offset_raw: Option<i16>,
+    },
+}
+
+/// What the calibration dialog follows on `devices://calibration`. Phases:
+/// `preparing`, then `accelerate` / `stopPedaling` (spin-down) or `holdStill`
+/// (zero offset), ending in `success` or `error`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CalibrationProgress {
+    pub role: DeviceRole,
+    pub phase: &'static str,
+    pub message: Option<String>,
+    pub detail: Option<CalibrationDetail>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -204,6 +260,9 @@ pub struct KnownDevice {
     pub manufacturer: Option<String>,
     pub model: Option<String>,
     pub last_connected_at: chrono::DateTime<Utc>,
+    /// Kept in its own store column so reconnecting never overwrites it.
+    #[serde(default)]
+    pub last_calibration: Option<CalibrationRecord>,
 }
 
 impl KnownDevice {
@@ -470,6 +529,57 @@ impl DeviceSlot {
         self.emit("devices://slot", self.snapshot().await);
     }
 
+    /// The device raised or cleared its own "please calibrate me" flag.
+    /// Only a change refreshes the card. Returns true when it changed.
+    pub fn set_calibration_requested(&self, requested: bool) -> bool {
+        let changed = {
+            let mut inner = self
+                .stats
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if inner.stats.calibration_requested == requested {
+                false
+            } else {
+                inner.stats.calibration_requested = requested;
+                true
+            }
+        };
+        if changed {
+            self.emit(
+                "devices://slot",
+                SlotSnapshot {
+                    role: self.role,
+                    state: self.state.borrow().clone(),
+                    stats: self.stats(),
+                    log: self.log.tail(log::TAIL),
+                },
+            );
+        }
+        changed
+    }
+
+    /// Remember the device's last calibration (from the store on connect, or
+    /// a procedure that just succeeded) and refresh the card.
+    pub async fn record_calibration(&self, record: Option<CalibrationRecord>) {
+        {
+            let mut inner = self
+                .stats
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            inner.stats.last_calibration = record;
+        }
+        self.emit("devices://slot", self.snapshot().await);
+    }
+
+    pub fn last_calibration(&self) -> Option<CalibrationRecord> {
+        self.stats().last_calibration
+    }
+
+    pub fn emit_calibration(&self, progress: CalibrationProgress) {
+        tracing::info!(role = ?progress.role, phase = progress.phase, detail = ?progress.detail, "Calibration progress");
+        self.emit("devices://calibration", progress);
+    }
+
     pub fn record_parse_failure(&self, raw: &[u8]) -> u64 {
         let mut inner = self
             .stats
@@ -497,6 +607,10 @@ impl DeviceSlot {
         inner.stats.parse_failures = 0;
         inner.stats.last_sample_ms = None;
         inner.stats.last_raw_hex = None;
+        // A different device may be behind this connect; the command layer
+        // seeds the record it has for it once the connect succeeds.
+        inner.stats.calibration_requested = false;
+        inner.stats.last_calibration = None;
         inner.window.clear();
     }
 
@@ -1134,7 +1248,27 @@ impl DeviceHub {
             manufacturer: stats.manufacturer,
             model: stats.model,
             last_connected_at: Utc::now(),
+            last_calibration: stats.last_calibration,
         })
+    }
+
+    /// Stop waiting on a calibration that cannot finish on its own terms (a
+    /// power meter's zero offset is bounded, but the rider may not want to
+    /// wait). The trainer's spin-down holds device control and can only be
+    /// cancelled by disconnecting.
+    pub fn cancel_calibration(&self, role: DeviceRole) -> Result<(), String> {
+        match role {
+            DeviceRole::Power => {
+                self.power.cancel_procedure();
+                Ok(())
+            }
+            DeviceRole::Trainer => {
+                Err("Cancel a trainer spin-down by disconnecting the trainer".into())
+            }
+            DeviceRole::HeartRate | DeviceRole::Cadence => {
+                Err(format!("{} has no calibration procedure", role.label()))
+            }
+        }
     }
 
     pub async fn disconnect_role(&self, role: DeviceRole) {
@@ -1162,11 +1296,37 @@ impl DeviceHub {
         }
     }
 
-    // Trainer control, used by the workout runner.
-
-    pub async fn calibrate_trainer(&self) -> Result<(), String> {
-        self.trainer.calibrate().await
+    /// Run the calibration procedure a role's device offers: FTMS spin-down
+    /// for the trainer, Cycling Power offset compensation for the power
+    /// meter. Progress goes out on `devices://calibration`; the returned
+    /// record is what the caller persists for the device.
+    pub async fn calibrate(&self, role: DeviceRole) -> Result<CalibrationRecord, String> {
+        match role {
+            DeviceRole::Trainer => self.trainer.calibrate().await,
+            DeviceRole::Power => {
+                if self.ride_active() {
+                    return Err("Zero offset is unavailable during a ride".into());
+                }
+                cycling_power::zero_offset(&self.power, &self.fuser).await
+            }
+            DeviceRole::HeartRate | DeviceRole::Cadence => {
+                Err(format!("{} has no calibration procedure", role.label()))
+            }
+        }
     }
+
+    /// Fault-injection knobs of a simulated sensor role (heart rate, power,
+    /// cadence); the trainer has its own richer set.
+    pub fn simulated_sensor_faults(&self, role: DeviceRole) -> Option<Arc<sensor::SensorFaults>> {
+        match role {
+            DeviceRole::HeartRate => Some(self.heart_rate.faults()),
+            DeviceRole::Power => Some(self.power.faults()),
+            DeviceRole::Cadence => Some(self.cadence.faults()),
+            DeviceRole::Trainer => None,
+        }
+    }
+
+    // Trainer control, used by the workout runner.
 
     /// The trainer's clamp for a requested target, without sending anything.
     pub fn clamp_target(&self, requested: u16, rider_max: u16) -> u16 {
@@ -1588,6 +1748,7 @@ mod tests {
             manufacturer: None,
             model: None,
             last_connected_at: Utc::now() - chrono::Duration::seconds(age_secs),
+            last_calibration: None,
         };
         let real = |id: &str, name: &str, capability: Capability| DeviceInfo {
             id: id.into(),

@@ -2,7 +2,6 @@
 //! Data notification worker, plus the built-in simulator.
 
 use std::{
-    fmt,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering},
@@ -16,12 +15,13 @@ use btleplug::{
 };
 use chrono::Utc;
 use futures::StreamExt;
-use serde::Serialize;
 use tokio::sync::{Mutex, Notify, RwLock, broadcast};
 
 use super::{
-    Capability, DeviceInfo, DeviceRole, DeviceSlot, DeviceState,
+    CalibrationDetail, CalibrationKind, CalibrationProgress, CalibrationRecord, Capability,
+    DeviceInfo, DeviceRole, DeviceSlot, DeviceState,
     ble::{self, Ble, GATT_CONNECT_TIMEOUT, GATT_STEP_TIMEOUT, bluetooth_uuid, hex, with_timeout},
+    control_point::{CONTROL_ACK_TIMEOUT, ControlError, run_procedure},
     fuser::{Reading, TelemetryFuser},
     spawn_ble_link_worker, spawn_link_worker,
 };
@@ -38,57 +38,6 @@ use crate::{
 
 pub const SIMULATED_TRAINER_ID: &str = "simulated-trainer";
 const CALIBRATION_TIMEOUT: Duration = Duration::from_secs(120);
-/// Budget for the GATT write of one control command. Trainers answer in well
-/// under a second; anything past this is a dead link, and a long wait only
-/// holds `command_lock` hostage.
-pub const CONTROL_WRITE_TIMEOUT: Duration = Duration::from_secs(4);
-/// Budget for the trainer's indication after a successful write.
-pub const CONTROL_ACK_TIMEOUT: Duration = Duration::from_secs(4);
-
-/// Why a control-point command did not go through, classified so callers can
-/// tell "the trainer is gone" from "the trainer said no" from "try later".
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ControlError {
-    /// No trainer, or its link is gone.
-    NotConnected,
-    /// The write went out (or was attempted) but nothing came back in time.
-    Timeout,
-    /// The trainer answered with an FTMS result code other than Success.
-    Refused(ResponseCode),
-    /// Transport failure: GATT write error, response stream closed, ...
-    Gatt(String),
-    /// A calibration is running; ERG control is on hold.
-    Busy(String),
-}
-
-impl fmt::Display for ControlError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ControlError::NotConnected => f.write_str("Trainer is not connected"),
-            ControlError::Timeout => f.write_str("Trainer control command timed out"),
-            ControlError::Refused(code) => write!(f, "Trainer refused the command: {code:?}"),
-            ControlError::Gatt(detail) => write!(f, "Trainer rejected control command: {detail}"),
-            ControlError::Busy(detail) => f.write_str(detail),
-        }
-    }
-}
-
-impl std::error::Error for ControlError {}
-
-impl From<ControlError> for String {
-    fn from(error: ControlError) -> Self {
-        error.to_string()
-    }
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CalibrationProgress {
-    pub phase: &'static str,
-    pub target_low_kph: Option<f32>,
-    pub target_high_kph: Option<f32>,
-    pub message: Option<String>,
-}
 
 /// Simulated devices offered at the top of every scan.
 pub fn simulated_devices() -> Vec<DeviceInfo> {
@@ -626,18 +575,20 @@ impl Trainer {
         target: Option<(f32, f32)>,
         message: Option<String>,
     ) {
-        self.slot.emit(
-            "trainer://calibration",
-            CalibrationProgress {
-                phase,
-                target_low_kph: target.map(|value| value.0),
-                target_high_kph: target.map(|value| value.1),
-                message,
-            },
-        );
+        self.slot.emit_calibration(CalibrationProgress {
+            role: DeviceRole::Trainer,
+            phase,
+            message,
+            detail: target.map(|(low, high)| CalibrationDetail::SpinDown {
+                target_low_kph: low,
+                target_high_kph: high,
+            }),
+        });
     }
 
-    pub async fn calibrate(&self) -> Result<(), String> {
+    /// Run the FTMS spin-down. On success the record says when; a spin-down
+    /// has no offset value to remember.
+    pub async fn calibrate(&self) -> Result<CalibrationRecord, String> {
         let device = match self.slot.state().await {
             DeviceState::Ready { device } => device,
             DeviceState::Controlling { .. } => {
@@ -667,22 +618,29 @@ impl Trainer {
         let result = self.calibrate_inner(device.simulated).await;
         self.calibrating.store(false, Ordering::SeqCst);
         self.slot.set_calibration(None, Some(false)).await;
-        match &result {
+        match result {
             Ok(()) => {
+                let record = CalibrationRecord {
+                    at: Utc::now(),
+                    kind: CalibrationKind::SpinDown,
+                    offset_raw: None,
+                };
+                self.slot.record_calibration(Some(record.clone())).await;
                 self.slot.note("ok", "Calibration complete", None);
                 self.emit_calibration(
                     "success",
                     None,
                     Some("Trainer calibration completed successfully.".into()),
                 );
+                Ok(record)
             }
             Err(error) => {
                 self.slot
                     .note("error", "Calibration failed", Some(error.clone()));
                 self.emit_calibration("error", None, Some(error.clone()));
+                Err(error)
             }
         }
-        result
     }
 
     async fn calibrate_inner(&self, simulated: bool) -> Result<(), String> {
@@ -854,20 +812,12 @@ impl Trainer {
             .first()
             .copied()
             .ok_or_else(|| ControlError::Gatt("Cannot send an empty trainer command".into()))?;
-        let mut state_rx = self.slot.subscribe_state();
-        if state_rx.borrow().link_is_down() {
-            return Err(ControlError::NotConnected);
-        }
         let peripheral = self.peripheral.read().await.clone();
         let control = self.control_point.read().await.clone();
         let simulated = peripheral.is_none();
         if simulated && !self.simulated.load(Ordering::Relaxed) {
             return Err(ControlError::NotConnected);
         }
-        let mut responses = self.control_responses.subscribe();
-        tracing::debug!(opcode = format_args!("0x{expected_opcode:02x}"), payload = ?payload, "Writing control command");
-        let started = tokio::time::Instant::now();
-
         let write = async {
             match (&peripheral, &control) {
                 (Some(peripheral), Some(control)) => peripheral
@@ -877,86 +827,19 @@ impl Trainer {
                 _ => self.simulated_write(expected_opcode, payload).await,
             }
         };
-        let written = tokio::select! {
-            result = tokio::time::timeout(CONTROL_WRITE_TIMEOUT, write) => match result {
-                Ok(result) => result,
-                Err(_) => Err(ControlError::Timeout),
-            },
-            _ = state_rx.wait_for(DeviceState::link_is_down) => Err(ControlError::NotConnected),
-        };
-        if let Err(error) = written {
-            tracing::error!(opcode = format_args!("0x{expected_opcode:02x}"), error = %error, "Control write failed");
-            self.slot.note(
-                "error",
-                "Control write failed",
-                Some(format!("op 0x{expected_opcode:02x} · {error}")),
-            );
-            return Err(error);
-        }
-        // FTMS sends the indication for a procedure after the ATT write
-        // response, so anything already queued is a late answer to an earlier
-        // (timed-out) command and must not be mistaken for this one's.
-        loop {
-            match responses.try_recv() {
-                Ok(stale) => tracing::debug!(raw = ?stale, "Discarding stale control response"),
-                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
-                Err(_) => break,
-            }
-        }
-        if simulated {
-            self.schedule_simulated_ack(expected_opcode);
-        }
-        let wait_for_ack = async {
-            loop {
-                match responses.recv().await {
-                    Ok(response) if response.get(1) == Some(&expected_opcode) => {
-                        return Ok(response);
-                    }
-                    Ok(other) => {
-                        tracing::trace!(raw = ?other, "Ignoring response for another opcode")
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => {
-                        return Err(ControlError::Gatt("Lost trainer response stream".into()));
-                    }
+        run_procedure(
+            &self.slot,
+            &self.control_responses,
+            expected_opcode,
+            CONTROL_ACK_TIMEOUT,
+            write,
+            || {
+                if simulated {
+                    self.schedule_simulated_ack(expected_opcode);
                 }
-            }
-        };
-        let acknowledgement = tokio::select! {
-            result = tokio::time::timeout(CONTROL_ACK_TIMEOUT, wait_for_ack) => match result {
-                Ok(result) => result,
-                Err(_) => Err(ControlError::Timeout),
             },
-            _ = state_rx.wait_for(DeviceState::link_is_down) => Err(ControlError::NotConnected),
-        };
-        match &acknowledgement {
-            Ok(_) => tracing::debug!(
-                opcode = format_args!("0x{expected_opcode:02x}"),
-                elapsed_ms = started.elapsed().as_millis() as u64,
-                "Control command acknowledged"
-            ),
-            Err(ControlError::Timeout) => {
-                tracing::error!(
-                    opcode = format_args!("0x{expected_opcode:02x}"),
-                    timeout_secs = CONTROL_ACK_TIMEOUT.as_secs(),
-                    "No control response in time"
-                );
-                self.slot.note(
-                    "error",
-                    "Control command timed out",
-                    Some(format!(
-                        "op 0x{expected_opcode:02x} · no response in {} s",
-                        CONTROL_ACK_TIMEOUT.as_secs()
-                    )),
-                );
-            }
-            Err(error) => tracing::warn!(
-                opcode = format_args!("0x{expected_opcode:02x}"),
-                error = %error,
-                "Control command abandoned"
-            ),
-        }
-        acknowledgement
+        )
+        .await
     }
 
     /// The simulator's side of a control write: remember the command and
@@ -1289,7 +1172,7 @@ mod tests {
         hub.connect(DeviceRole::Trainer, simulated_devices().remove(0))
             .await
             .unwrap();
-        hub.calibrate_trainer().await.unwrap();
+        hub.calibrate(DeviceRole::Trainer).await.unwrap();
         let stats = hub.slot(DeviceRole::Trainer).stats();
         assert!(stats.calibration_supported);
         assert!(!stats.calibrating);
@@ -1309,7 +1192,7 @@ mod tests {
             .unwrap();
         hub.begin_control().await.unwrap();
         assert_eq!(
-            hub.calibrate_trainer().await.unwrap_err(),
+            hub.calibrate(DeviceRole::Trainer).await.unwrap_err(),
             "Trainer calibration is unavailable during a workout"
         );
     }
@@ -1318,7 +1201,7 @@ mod tests {
     async fn calibration_rejects_disconnected_and_unsupported_trainers() {
         let hub = super::super::DeviceHub::default();
         assert_eq!(
-            hub.calibrate_trainer().await.unwrap_err(),
+            hub.calibrate(DeviceRole::Trainer).await.unwrap_err(),
             "Connect a trainer before calibrating"
         );
         hub.connect(DeviceRole::Trainer, simulated_devices().remove(0))
@@ -1328,7 +1211,7 @@ mod tests {
             .calibration_supported
             .store(false, Ordering::Relaxed);
         assert_eq!(
-            hub.calibrate_trainer().await.unwrap_err(),
+            hub.calibrate(DeviceRole::Trainer).await.unwrap_err(),
             "This trainer does not advertise FTMS spin-down calibration"
         );
     }

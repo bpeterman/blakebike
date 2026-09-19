@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::{
     default_workouts::{DEFAULT_WORKOUTS_VERSION, default_workouts, is_legacy_sample},
-    devices::{KnownDevice, SourcePreferences},
+    devices::{CalibrationRecord, KnownDevice, SourcePreferences},
     distance::estimate_distance,
     domain::{
         DistanceSource, DistanceUnit, Profile, SessionDetail, SessionSummary, Telemetry,
@@ -344,6 +344,13 @@ impl Storage {
             "REAL NOT NULL DEFAULT 84.0",
         )?;
         ensure_column(&connection, "sessions", "recording_warning", "TEXT")?;
+        // Its own column, so a reconnect's payload upsert cannot wipe it.
+        ensure_column(
+            &connection,
+            "known_devices",
+            "last_calibration_json",
+            "TEXT",
+        )?;
         let reader = Connection::open(path).map_err(|error| error.to_string())?;
         let storage = Self {
             connection: Mutex::new(connection),
@@ -628,20 +635,53 @@ impl Storage {
         Ok(())
     }
 
+    /// Record a device's latest calibration. Only touches its own column, so
+    /// `remember_device` can keep replacing the payload on every connect.
+    /// A device that was never remembered has nowhere to keep it; that is
+    /// reported so the caller can log it, not an error worth failing the
+    /// calibration over.
+    pub fn record_calibration(&self, id: &str, record: &CalibrationRecord) -> Result<bool, String> {
+        let json = serde_json::to_string(record).map_err(|error| error.to_string())?;
+        let updated = self
+            .connection()?
+            .execute(
+                "UPDATE known_devices SET last_calibration_json = ?2 WHERE id = ?1",
+                params![id, json],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(updated > 0)
+    }
+
     /// Remembered devices, most recently connected first.
     pub fn known_devices(&self) -> Result<Vec<KnownDevice>, String> {
         let connection = self.reader()?;
         let mut statement = connection
-            .prepare("SELECT payload_json FROM known_devices ORDER BY last_connected_at DESC")
+            .prepare(
+                "SELECT payload_json, last_calibration_json FROM known_devices
+                 ORDER BY last_connected_at DESC",
+            )
             .map_err(|error| error.to_string())?;
         let rows = statement
-            .query_map([], |row| row.get::<_, String>(0))
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })
             .map_err(|error| error.to_string())?;
         let mut devices = Vec::new();
         for row in rows {
-            let json = row.map_err(|error| error.to_string())?;
+            let (json, calibration_json) = row.map_err(|error| error.to_string())?;
             match serde_json::from_str::<KnownDevice>(&json) {
-                Ok(device) => devices.push(device),
+                Ok(mut device) => {
+                    // The column is the source of truth; the payload's copy is
+                    // whatever the hub knew when it last connected.
+                    device.last_calibration = calibration_json.and_then(|json| {
+                        serde_json::from_str::<CalibrationRecord>(&json)
+                            .inspect_err(|error| {
+                                tracing::warn!(id = %device.id, error = %error, "Skipping unreadable calibration record")
+                            })
+                            .ok()
+                    });
+                    devices.push(device);
+                }
                 Err(error) => tracing::warn!(error = %error, "Skipping unreadable known device"),
             }
         }
@@ -1490,6 +1530,7 @@ mod tests {
             manufacturer: Some("Garmin".into()),
             model: None,
             last_connected_at: Utc::now() - chrono::Duration::minutes(5),
+            last_calibration: None,
         };
         let trainer = KnownDevice {
             id: "kickr".into(),
@@ -1501,6 +1542,7 @@ mod tests {
             manufacturer: Some("Wahoo".into()),
             model: Some("KICKR CORE".into()),
             last_connected_at: Utc::now(),
+            last_calibration: None,
         };
         storage.remember_device(&strap).unwrap();
         storage.remember_device(&trainer).unwrap();
@@ -1525,6 +1567,66 @@ mod tests {
         assert_eq!(storage.known_devices().unwrap().len(), 1);
         assert_eq!(storage.forget_all_devices().unwrap(), 1);
         assert!(storage.known_devices().unwrap().is_empty());
+    }
+
+    #[test]
+    fn calibration_records_survive_reconnects_and_only_attach_to_remembered_devices() {
+        use crate::devices::{CalibrationKind, Capability, DeviceRole};
+        let storage = Storage::in_memory().unwrap();
+        let meter = KnownDevice {
+            id: "pm".into(),
+            name: "Assioma".into(),
+            transport: Default::default(),
+            role: DeviceRole::Power,
+            capabilities: vec![Capability::CyclingPower],
+            simulated: false,
+            manufacturer: Some("Favero".into()),
+            model: None,
+            last_connected_at: Utc::now(),
+            last_calibration: None,
+        };
+        let record = CalibrationRecord {
+            at: Utc::now(),
+            kind: CalibrationKind::ZeroOffset,
+            offset_raw: Some(1_023),
+        };
+        // Nothing remembered yet: nowhere to keep it, reported as such.
+        assert!(!storage.record_calibration("pm", &record).unwrap());
+        storage.remember_device(&meter).unwrap();
+        assert!(storage.record_calibration("pm", &record).unwrap());
+        assert_eq!(
+            storage.known_devices().unwrap()[0].last_calibration,
+            Some(record.clone())
+        );
+        // Reconnecting rewrites the payload (with whatever the hub knew, here
+        // nothing) but must not lose the record.
+        storage
+            .remember_device(&KnownDevice {
+                last_connected_at: Utc::now() + Duration::minutes(1),
+                model: Some("Assioma DUO".into()),
+                ..meter.clone()
+            })
+            .unwrap();
+        let known = storage.known_devices().unwrap();
+        assert_eq!(known[0].model.as_deref(), Some("Assioma DUO"));
+        assert_eq!(known[0].last_calibration, Some(record.clone()));
+        // A later zero replaces it.
+        let newer = CalibrationRecord {
+            offset_raw: Some(1_019),
+            ..record.clone()
+        };
+        storage.record_calibration("pm", &newer).unwrap();
+        assert_eq!(
+            storage.known_devices().unwrap()[0]
+                .last_calibration
+                .as_ref()
+                .and_then(|record| record.offset_raw),
+            Some(1_019)
+        );
+        // Forgetting drops it with the device.
+        storage.forget_device("pm").unwrap();
+        storage.remember_device(&meter).unwrap();
+        assert_eq!(storage.known_devices().unwrap()[0].last_calibration, None);
     }
 
     #[test]

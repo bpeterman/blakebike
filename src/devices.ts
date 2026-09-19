@@ -1,4 +1,5 @@
 import type {
+  CalibrationRecord,
   Capability,
   DeviceInfo,
   DeviceLogLine,
@@ -11,6 +12,76 @@ import type {
   DeviceTransport,
 } from "./types";
 import { deviceRoleLabel } from "./types";
+
+/** What the calibration button and dialog call the procedure for a role. */
+export const calibrationVerb: Record<DeviceRole, string> = {
+  trainer: "Calibrate",
+  power: "Zero offset",
+  heartRate: "Calibrate",
+  cadence: "Calibrate",
+};
+
+/** Why a role's calibration button is disabled, or null when it is usable. */
+export function calibrationUnavailable(
+  role: DeviceRole,
+  state: DeviceState,
+  stats: { calibrationSupported: boolean; calibrating: boolean },
+  rideActive = false,
+): string | null {
+  if (state.status === "controlling") return "Calibration is unavailable during a workout";
+  if (state.status !== "ready") return null;
+  if (!stats.calibrationSupported) {
+    return role === "power"
+      ? "This power meter does not advertise offset compensation"
+      : "This trainer does not advertise FTMS spin-down calibration";
+  }
+  if (rideActive) {
+    return role === "power" ? "Zero offset is unavailable during a ride" : "Calibration is unavailable during a workout";
+  }
+  return null;
+}
+
+/** "Zeroed 2 h ago · offset 1023" / "Spin-down 3 days ago" for a card line. */
+export function calibrationSummary(record: CalibrationRecord | null | undefined, now = Date.now()): string | null {
+  if (!record) return null;
+  const when = formatRelativeDate(record.at, now);
+  if (record.kind === "zeroOffset") {
+    return record.offsetRaw === null ? `Zeroed ${when}` : `Zeroed ${when} · offset ${record.offsetRaw}`;
+  }
+  return `Spin-down ${when}`;
+}
+
+export type Drift = {
+  delta: number;
+  /** Share of the previous value, absolute. */
+  ratio: number;
+  /** Small drift is normal; a large one points at a cleat, crank or battery problem. */
+  tone: "steady" | "large";
+};
+
+/**
+ * How far a new zero moved from the last one. Vendors treat a few percent as
+ * ordinary temperature drift; beyond that they tell you to check the
+ * hardware and zero again. The absolute value means nothing on its own.
+ */
+export function offsetDrift(offsetRaw: number, previousOffsetRaw: number | null | undefined): Drift | null {
+  if (previousOffsetRaw === null || previousOffsetRaw === undefined) return null;
+  const delta = offsetRaw - previousOffsetRaw;
+  const ratio = previousOffsetRaw === 0 ? (delta === 0 ? 0 : Infinity) : Math.abs(delta / previousOffsetRaw);
+  return { delta, ratio, tone: ratio > 0.02 ? "large" : "steady" };
+}
+
+export function driftLabel(drift: Drift): string {
+  const sign = drift.delta > 0 ? "+" : drift.delta < 0 ? "−" : "±";
+  return `${sign}${Math.abs(drift.delta)}`;
+}
+
+/** Whether a power meter should be nudged towards a zero before riding. */
+export function zeroOffsetIsDue(record: CalibrationRecord | null | undefined, now = Date.now(), maxAgeMs = 24 * 3_600_000): boolean {
+  if (!record) return true;
+  const then = Date.parse(record.at);
+  return Number.isNaN(then) || now - then > maxAgeMs;
+}
 
 /** Which advertised services qualify a device for a role (mirrors the backend). */
 export const roleCapabilities: Record<DeviceRole, Capability[]> = {
@@ -205,6 +276,8 @@ export function emptySlot(role: DeviceRole): DeviceSlot {
       lastReading: null,
       calibrationSupported: false,
       calibrating: false,
+      calibrationRequested: false,
+      lastCalibration: null,
     },
     log: [],
   };

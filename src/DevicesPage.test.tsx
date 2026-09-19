@@ -199,6 +199,88 @@ describe("DevicesPage", () => {
     expect(screen.getByText(/does not advertise FTMS spin-down/)).toBeInTheDocument();
   });
 
+  it("offers zero offset on a connected power meter, with its last zero and the meter's own request", () => {
+    const onCalibrate = vi.fn();
+    const twoHoursAgo = new Date(Date.now() - 2 * 3_600_000).toISOString();
+    const meter: DeviceSlot = {
+      role: "power",
+      state: { status: "ready", device: { id: "pm", name: "Assioma", simulated: false, rssi: -50, capabilities: ["cyclingPower"] } },
+      stats: {
+        ...idleStats,
+        samples: 30,
+        lastSampleMs: Date.now() - 300,
+        rateHz: 1,
+        rssi: -50,
+        manufacturer: "Favero",
+        connectedSinceMs: Date.now() - 30_000,
+        lastReading: "0 W · 0 rpm",
+        calibrationSupported: true,
+        calibrationRequested: true,
+        lastCalibration: { at: twoHoursAgo, kind: "zeroOffset", offsetRaw: 1023 },
+      },
+      log: [],
+    };
+    const withMeter: DevicesSnapshot = {
+      ...snapshot,
+      slots: snapshot.slots.map((slot) => (slot.role === "power" ? meter : slot)),
+    };
+    const view = render(
+      <DevicesPage hub={withMeter} sources={withMeter.sources} onConnect={vi.fn()} onCalibrate={onCalibrate} onSourcePreference={vi.fn()} perform={perform} />,
+    );
+    expect(screen.getByText("Zeroed 2 h ago · offset 1023")).toBeInTheDocument();
+    expect(screen.getByText("Meter requests zeroing")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Zero offset" }));
+    expect(onCalibrate).toHaveBeenCalledWith("power");
+
+    // During a ride the button is off with a reason; while zeroing it says so.
+    view.rerender(
+      <DevicesPage hub={withMeter} sources={withMeter.sources} onConnect={vi.fn()} onCalibrate={onCalibrate} onSourcePreference={vi.fn()} rideActive perform={perform} />,
+    );
+    expect(screen.getByRole("button", { name: "Zero offset" })).toBeDisabled();
+    expect(screen.getByText("Zero offset is unavailable during a ride.")).toBeInTheDocument();
+
+    const zeroing: DevicesSnapshot = {
+      ...withMeter,
+      slots: withMeter.slots.map((slot) =>
+        slot.role === "power" ? { ...slot, stats: { ...slot.stats, calibrating: true } } : slot,
+      ),
+    };
+    view.rerender(
+      <DevicesPage hub={zeroing} sources={zeroing.sources} onConnect={vi.fn()} onCalibrate={onCalibrate} onSourcePreference={vi.fn()} perform={perform} />,
+    );
+    expect(screen.getByRole("button", { name: "Zeroing…" })).toBeDisabled();
+
+    const unsupported: DevicesSnapshot = {
+      ...withMeter,
+      slots: withMeter.slots.map((slot) =>
+        slot.role === "power" ? { ...slot, stats: { ...slot.stats, calibrationSupported: false, calibrationRequested: false } } : slot,
+      ),
+    };
+    view.rerender(
+      <DevicesPage hub={unsupported} sources={unsupported.sources} onConnect={vi.fn()} onCalibrate={onCalibrate} onSourcePreference={vi.fn()} perform={perform} />,
+    );
+    expect(screen.getByRole("button", { name: "Zero offset" })).toBeDisabled();
+    expect(screen.getByText(/does not advertise offset compensation/)).toBeInTheDocument();
+    // Heart rate and cadence cards never offer calibration.
+    expect(screen.getAllByRole("button", { name: /Calibrate|Zero offset/ })).toHaveLength(2);
+  });
+
+  it("shows when a remembered device was last zeroed", async () => {
+    vi.mocked(api.knownDevices).mockResolvedValueOnce([
+      {
+        ...knownDevices[1],
+        id: "pm",
+        name: "Assioma",
+        role: "power",
+        capabilities: ["cyclingPower"],
+        manufacturer: "Favero",
+        lastCalibration: { at: new Date(Date.now() - 3 * 86_400_000).toISOString(), kind: "zeroOffset", offsetRaw: 1019 },
+      },
+    ]);
+    render(<DevicesPage hub={snapshot} sources={snapshot.sources} onConnect={vi.fn()} onCalibrate={vi.fn()} onSourcePreference={vi.fn()} perform={perform} />);
+    expect(await screen.findByText(/Zeroed 3 days ago · offset 1019/)).toBeInTheDocument();
+  });
+
   it("lists known devices with make, offers one-click connect and forget", async () => {
     const onOfferUndo = vi.fn();
     render(<DevicesPage hub={snapshot} sources={snapshot.sources} onConnect={vi.fn()} onCalibrate={vi.fn()} onSourcePreference={vi.fn()} onOfferUndo={onOfferUndo} perform={perform} />);

@@ -14,6 +14,9 @@ import {
 } from "lucide-react";
 import { api } from "./api";
 import {
+  calibrationSummary,
+  calibrationUnavailable,
+  calibrationVerb,
   connectAllSummary,
   deviceName,
   emptySlot,
@@ -40,7 +43,7 @@ import type {
   SourceChoice,
   TelemetrySources,
 } from "./types";
-import { deviceRoleLabel, deviceRoles } from "./types";
+import { calibratableRoles, deviceRoleLabel, deviceRoles } from "./types";
 import { Stat } from "./DeviceStats";
 import { useNowTick } from "./useNowTick";
 import { SourceSelect } from "./SourceSelect";
@@ -68,25 +71,30 @@ export function DevicesPage({
   onSourcePreference,
   onOfferUndo = () => undefined,
   onNotice = () => undefined,
+  rideActive = false,
   perform,
 }: {
   hub: DevicesSnapshot | null;
   sources: TelemetrySources | undefined;
   onConnect: (role: DeviceRole) => void;
-  onCalibrate: () => void;
+  onCalibrate: (role: DeviceRole) => void;
   onSourcePreference: (metric: Metric, choice: SourceChoice) => void;
   onOfferUndo?: (message: string, action: () => Promise<void>) => void;
   /** A calm, dismissable line that is not an error. */
   onNotice?: (message: string) => void;
+  /** A ride is recording: calibration is off the table until it ends. */
+  rideActive?: boolean;
   perform: (action: () => Promise<unknown>, label?: string) => Promise<void>;
 }) {
   const [known, setKnown] = useState<KnownDevice[]>([]);
   const refreshKnown = useCallback(() => {
     api.knownDevices().then(setKnown).catch(() => undefined);
   }, []);
-  // Reload whenever a slot's connection state changes: a fresh connect adds
-  // or refreshes a row.
-  const connectionKey = (hub?.slots ?? []).map((slot) => slot.state.status).join("|");
+  // Reload whenever a slot's connection state changes (a fresh connect adds
+  // or refreshes a row) or a calibration lands (its record shows on the row).
+  const connectionKey = (hub?.slots ?? [])
+    .map((slot) => `${slot.state.status}:${slot.stats.lastCalibration?.at ?? ""}`)
+    .join("|");
   useEffect(() => {
     refreshKnown();
   }, [refreshKnown, connectionKey]);
@@ -183,7 +191,15 @@ export function DevicesPage({
                       {device.simulated && " · simulated"}
                     </span>
                   </div>
-                  <span className="known-when">{connectedHere ? "connected now" : `last used ${formatRelativeDate(device.lastConnectedAt, now)}`}</span>
+                  <span className="known-when">
+                    {connectedHere ? "connected now" : `last used ${formatRelativeDate(device.lastConnectedAt, now)}`}
+                    {calibrationSummary(device.lastCalibration, now) && (
+                      <>
+                        <br />
+                        {calibrationSummary(device.lastCalibration, now)}
+                      </>
+                    )}
+                  </span>
                   {connectedHere ? (
                     <button className="secondary" onClick={() => void perform(() => api.disconnectDevice(device.role), `disconnect ${device.role}`)}>
                       Disconnect
@@ -227,9 +243,10 @@ export function DevicesPage({
             now={now}
             feeding={metricsFedBy(slot.role, liveSources)}
             onConnect={() => onConnect(slot.role)}
-            onCalibrate={onCalibrate}
+            onCalibrate={() => onCalibrate(slot.role)}
             onDisconnect={() => void perform(() => api.disconnectDevice(slot.role), `disconnect ${slot.role}`)}
             supportsAnt={slot.role === "heartRate" && antReady}
+            rideActive={rideActive}
           />
         ))}
       </div>
@@ -316,6 +333,7 @@ function DeviceCard({
   onCalibrate,
   onDisconnect,
   supportsAnt,
+  rideActive,
 }: {
   slot: DeviceSlot;
   now: number;
@@ -324,10 +342,14 @@ function DeviceCard({
   onCalibrate: () => void;
   onDisconnect: () => void;
   supportsAnt: boolean;
+  rideActive: boolean;
 }) {
   const [showLog, setShowLog] = useState(false);
   const Icon = roleIcon[slot.role];
   const connected = isConnected(slot.state);
+  const calibratable = calibratableRoles.includes(slot.role);
+  const calibrationBlocked = calibratable ? calibrationUnavailable(slot.role, slot.state, slot.stats, rideActive) : null;
+  const lastCalibration = connected ? calibrationSummary(slot.stats.lastCalibration, now) : null;
   const activeDevice = connected && (slot.state.status === "ready" || slot.state.status === "controlling")
     ? slot.state.device
     : null;
@@ -381,6 +403,10 @@ function DeviceCard({
                 feeding {feeding.map((metric) => metricLabel[metric].toLowerCase()).join(", ")}
               </span>
             )}
+            {lastCalibration && <span className="calibration-line">{lastCalibration}</span>}
+            {slot.stats.calibrationRequested && (
+              <span className="calibration-line calibration-requested">Meter requests zeroing</span>
+            )}
           </>
         ) : (
           <>
@@ -393,24 +419,14 @@ function DeviceCard({
       <div className="card-actions device-actions">
         {connected ? (
           <>
-            {slot.role === "trainer" && (
+            {calibratable && (
               <button
-                className="secondary"
+                className={`secondary ${slot.stats.calibrationRequested && !calibrationBlocked ? "attention" : ""}`}
                 onClick={onCalibrate}
-                disabled={
-                  slot.state.status !== "ready" ||
-                  !slot.stats.calibrationSupported ||
-                  slot.stats.calibrating
-                }
-                title={
-                  slot.state.status === "controlling"
-                    ? "Calibration is unavailable during a workout"
-                    : !slot.stats.calibrationSupported
-                      ? "This trainer does not advertise FTMS spin-down calibration"
-                      : undefined
-                }
+                disabled={calibrationBlocked !== null || slot.stats.calibrating}
+                title={calibrationBlocked ?? undefined}
               >
-                <Gauge size={15} /> {slot.stats.calibrating ? "Calibrating…" : "Calibrate"}
+                <Gauge size={15} /> {slot.stats.calibrating ? (slot.role === "power" ? "Zeroing…" : "Calibrating…") : calibrationVerb[slot.role]}
               </button>
             )}
             <button className="secondary" onClick={onConnect}>Change</button>
@@ -431,11 +447,8 @@ function DeviceCard({
           {slot.log.length > 0 && <span className="log-count">{slot.log.length}</span>}
         </button>
       </div>
-      {connected && slot.role === "trainer" && slot.state.status === "controlling" && (
-        <small className="calibration-unavailable">Calibration is unavailable during a workout.</small>
-      )}
-      {connected && slot.role === "trainer" && slot.state.status === "ready" && !slot.stats.calibrationSupported && (
-        <small className="calibration-unavailable">This trainer does not advertise FTMS spin-down calibration.</small>
+      {connected && calibrationBlocked && (
+        <small className="calibration-unavailable">{calibrationBlocked}.</small>
       )}
 
       {showLog && (

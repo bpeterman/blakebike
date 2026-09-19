@@ -42,7 +42,7 @@ For each of Trainer, Heart rate, Power meter, Cadence sensor:
 - [ ] **D2 · Power meter asleep.** Stop pedalling long enough for the meter to sleep (or pull a battery). Expected within ~3 s: Power "falling back to <trainer>", Cadence falls to the cadence sensor (still Auto) — the trainer should not steal cadence while the dedicated sensor is alive.
 - [ ] **D3 · Reconnect manually.** Wake the device, press Reconnect on its card (or Connect in Known devices). Expected: log shows "Looking for remembered device" → "Device found" → normal connect steps, sources return to the dedicated sensor, no duplicate rows in Known devices.
 - [ ] **D4 · Trainer drop mid-ride.** Power-cycle the trainer during a free ride. Expected: the ride clock keeps running and other sensors keep recording; the ride screen shows "Trainer link lost" and the trainer card "Link lost · reconnecting (attempt n)"; the app reconnects on its own once the trainer is back (log: "Reconnect attempt" → normal connect steps → "Automatic reconnect succeeded"), then sends Start/Resume and the current target; the banner clears. No "Workout aborted" in the log; the ride ends normally with a complete History entry and FIT file.
-- [ ] **D5 · Fault rehearsal without hardware (debug builds).** With the simulator connected and a ride running, invoke `debug_inject_trainer_fault` with `failWrites` (count 3) and then `dropLink`. Expected: "Trainer not acknowledging targets" then clear; "Trainer link lost" then the simulator reconnects within a few seconds and the banner clears.
+- [ ] **D5 · Fault rehearsal without hardware (debug builds).** With the simulator connected and a ride running, invoke `debug_inject_device_fault` with `failWrites` (count 3) and then `dropLink`. Expected: "Trainer not acknowledging targets" then clear; "Trainer link lost" then the simulator reconnects within a few seconds and the banner clears.
 
 ## E. Known devices and persistence
 
@@ -67,6 +67,21 @@ For each of Trainer, Heart rate, Power meter, Cadence sensor:
 - [ ] **G5 · Disconnect cancellation.** Start calibration, then disconnect or power off the trainer. Expected: calibration exits with a cancellation/link error rather than hanging, and reconnect remains available.
 - [ ] **G6 · Workout exclusion.** Start a free ride or workout so the card reads ERG control. Expected: Calibrate is disabled with an in-workout explanation and calibration cannot interrupt target-power commands.
 - [ ] **G7 · Simulator.** Connect BlakeBike Simulator and run calibration. Expected: accelerate → stop pedalling → success completes deterministically without hardware.
+
+## H. Power meter zero offset
+
+Needs a Bluetooth power meter connected in the Power role (the Assioma first). "Zero offset" is the button on the Power meter card; the dialog it opens is the same one the trainer uses for its spin-down.
+
+- [ ] **H1 · Features read.** Connect the meter. Card log shows "Cycling Power Control Point", "Features · offset compensation supported …" and "Control point armed"; the Zero offset button is enabled. If the log says "not advertised" (button disabled with that reason) but the vendor app can zero the pedals, note the raw feature bytes from the log line: the gate believes a clear bit 9 and may need relaxing for that meter.
+- [ ] **H2 · Clean zero.** Unclip, bike still, Zero offset → Begin. Expect "Hold still" within a second and "Zero offset complete" within ~5 s with an offset number; the card line reads "Zeroed just now · offset …". Zero again twice: the value should move by only a few counts and the dialog says "steady". Compare the number against what the vendor app reports for the same pedals.
+- [ ] **H3 · Moving meter.** Turn the cranks and press Begin: refused at once with the "still moving (… rpm)" message, no "Control write" line in the log. Stand on a pedal without turning: refused with the "still reads … W" message.
+- [ ] **H4 · Loaded meter.** Hold a pedal down hard with a hand and zero: note whether the meter answers "refused the zero" (operation failed) or a wildly different offset; in the latter case the dialog must flag "large change" and the amber advice.
+- [ ] **H5 · Persistence.** Relaunch. Known devices lists the meter with "Zeroed … · offset …" before connecting; after connecting the card shows the same line. Zero again: the dialog compares against the stored value and the card updates.
+- [ ] **H6 · Ride guard.** Start a free ride with the meter feeding power: the button disables with "Zero offset is unavailable during a ride". End the ride; it re-enables.
+- [ ] **H7 · Pre-ride nudge.** With the meter connected, Auto power source, and its last zero older than a day (or never), the Ride page shows "Zero your power meter before riding?" with a Zero offset button that opens the dialog; the line disappears once a zero succeeds. Pin power to the trainer: the line disappears.
+- [ ] **H8 · Trainer unaffected.** The trainer spin-down still works end to end on the real trainer and the simulator, and its card now says "Spin-down just now" afterwards.
+- [ ] **H9 · Indicator.** Connect the meter cold from the garage: if it sets the offset-compensation indicator the card shows "Meter requests zeroing" and the button is highlighted; both clear after a successful zero.
+- [ ] **H10 · Simulator (developer mode).** The Simulated Power Meter asks to be zeroed on connect, answers a zero after ~1.5 s with a drifting offset, and `debug_inject_device_fault` with role `power` and `refuseWith` 4 / `ackDelayMs` 40000 produces the refused and timed-out messages; Cancel during the wait closes the dialog and the card stops saying "Zeroing…".
 
 ## Reporting
 
