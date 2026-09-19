@@ -22,6 +22,15 @@ Conventions:
 ### Added
 
 - Drag across the power or heart-rate chart in a ride's detail view to highlight a section and see its average, maximum, and minimum power and heart rate. Click the chart, press Clear, or press Escape to dismiss it.
+- The workout builder shows a live picture of the workout as you edit it: blocks are coloured by power zone, ramps slope, free ride is hatched, and an FTP line, time axis, and repeat brackets show the shape at a glance. A stats strip gives duration, average intensity, estimated training stress, and block count. Hover a block or a row to see its counterpart, and click a block to jump to its row.
+
+### Changed
+
+- Workout thumbnails on the home page, in the library, and in the ride picker, along with the live-ride timeline, are drawn by the same renderer as the builder preview, so ramps, free ride, and watt targets look the same everywhere and long interval sets stay proportional.
+
+### Fixed
+
+- Editing a workout step that targets watts no longer converts it to a percentage of FTP.
 
 ## [0.1.0] - 2026-09-19
 
