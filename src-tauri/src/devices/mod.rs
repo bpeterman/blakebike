@@ -25,6 +25,7 @@ use std::{
     time::Duration,
 };
 
+use btleplug::{api::Peripheral as _, platform::Peripheral};
 use futures::FutureExt;
 
 use chrono::Utc;
@@ -508,6 +509,45 @@ pub(crate) fn spawn_link_worker(
             }
         };
         link_lost(&slot, &fuser, role, name, samples).await;
+    })
+}
+
+/// Some Bluetooth backends leave notification streams open after disconnect.
+/// Check the transport independently; a quiet but connected sensor is healthy.
+async fn monitor_connection<F, Fut>(mut connected: F) -> String
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<bool, String>>,
+{
+    loop {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        match tokio::time::timeout(Duration::from_secs(4), connected()).await {
+            Ok(Ok(true)) => {}
+            Ok(Ok(false)) => return "Bluetooth connection closed".into(),
+            Ok(Err(error)) => return format!("Bluetooth connection check failed: {error}"),
+            Err(_) => return "Bluetooth connection check timed out".into(),
+        }
+    }
+}
+
+pub(crate) fn spawn_ble_link_worker(
+    slot: Arc<DeviceSlot>,
+    fuser: Arc<TelemetryFuser>,
+    role: DeviceRole,
+    name: String,
+    peripheral: Peripheral,
+    body: impl Future<Output = u64> + Send + 'static,
+) -> JoinHandle<()> {
+    spawn_link_worker(slot.clone(), fuser, role, name, async move {
+        tokio::select! {
+            samples = body => samples,
+            reason = monitor_connection(|| async {
+                peripheral.is_connected().await.map_err(|error| error.to_string())
+            }) => {
+                slot.note("error", "Bluetooth connection lost", Some(reason));
+                slot.stats().samples
+            }
+        }
     })
 }
 
@@ -1015,10 +1055,38 @@ impl DeviceHub {
         self.trainer.begin_control().await
     }
 
+    /// Persistent command failures must re-open the transport, not just retry
+    /// commands on a dead handle. Do not supersede a manual connect/disconnect.
+    pub async fn reconnect_trainer(&self) {
+        let Ok(_serialized) = self.connect_lock.try_lock() else {
+            return;
+        };
+        if self.link(DeviceRole::Trainer).last_device().is_none() {
+            return;
+        }
+        let slot = self.slot(DeviceRole::Trainer);
+        let Some(device) = slot.state().await.device().cloned() else {
+            return;
+        };
+        slot.abort_worker().await;
+        link_lost(
+            slot,
+            &self.fuser,
+            DeviceRole::Trainer,
+            device.name,
+            slot.stats().samples,
+        )
+        .await;
+    }
+
     /// Request Control + Start/Resume again, for a trainer that answered
     /// ControlNotPermitted mid-ride.
     pub async fn reacquire_control(&self) -> Result<(), ControlError> {
         self.trainer.reacquire_control().await
+    }
+
+    pub async fn request_control(&self) -> Result<(), ControlError> {
+        self.trainer.request_control().await
     }
 
     pub async fn set_target_power(
@@ -1058,6 +1126,11 @@ async fn reconnect_supervisor(hub: Arc<DeviceHub>, role: DeviceRole) {
             return;
         }
         let Some(device) = hub.link(role).last_device() else {
+            // A manual disconnect can cancel recovery while the slot still
+            // briefly says Reconnecting. Wait instead of spinning on it.
+            if state_rx.changed().await.is_err() {
+                return;
+            }
             continue;
         };
         let generation = *hub.link(role).generation.borrow();
@@ -1464,5 +1537,64 @@ mod tests {
         )
         .unwrap();
         assert_eq!(device.transport, DeviceTransport::Ble);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_disconnected_transport_enters_normal_recovery() {
+        let hub = Arc::new(DeviceHub::default());
+        DeviceHub::spawn_reconnect_supervisors(&hub);
+        hub.connect(DeviceRole::Trainer, trainer::simulated_devices().remove(0))
+            .await
+            .unwrap();
+        let slot = hub.slot(DeviceRole::Trainer).clone();
+        slot.abort_worker().await;
+        let worker = spawn_link_worker(
+            slot.clone(),
+            hub.fuser.clone(),
+            DeviceRole::Trainer,
+            "Silent trainer".into(),
+            async {
+                // The notification stream never produces EOF. The transport check
+                // must be sufficient to hand it to the reconnect supervisor.
+                tokio::select! {
+                    n = std::future::pending::<u64>() => n,
+                    _ = monitor_connection(|| async { Ok(false) }) => 0,
+                }
+            },
+        );
+        slot.set_worker(worker).await;
+        wait_until(async || slot.stats().drops > 0).await;
+        wait_until(async || slot.state().await.is_connected()).await;
+        assert_eq!(reconnect_attempts(&hub, DeviceRole::Trainer), 1);
+        hub.disconnect().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn quiet_connected_sensors_are_not_reconnected() {
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                monitor_connection(|| async { Ok(true) })
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_connection_check_is_bounded() {
+        let reason = tokio::time::timeout(
+            Duration::from_secs(10),
+            monitor_connection(std::future::pending::<Result<bool, String>>),
+        )
+        .await
+        .unwrap();
+        assert!(reason.contains("timed out"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connection_check_errors_are_treated_as_link_loss() {
+        let reason = monitor_connection(|| async { Err("adapter unavailable".into()) }).await;
+        assert!(reason.contains("adapter unavailable"));
     }
 }

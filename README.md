@@ -106,6 +106,12 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 cargo test --manifest-path src-tauri/Cargo.toml
 ```
 
+Ride reliability checks cover silent Bluetooth disconnect detection, pause
+acknowledgement retries (including reconnecting while paused), and recording
+failures. Recording warnings appear during the ride and remain in History when
+measurements were lost; transient write failures clear after the buffered data
+is saved. Save failures do not report an unqualified successful completion.
+
 Hardware verification should cover discovery, control acquisition, steady and
 ramp targets, pause/resume, skip, disconnect, app quit, and ride recovery on
 both target operating-system families.

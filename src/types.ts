@@ -197,6 +197,7 @@ export type RunnerState =
       overrideActive: boolean;
       biasPercent: number;
       control?: ControlStatus;
+      recordingWarning?: string | null;
     }
   | {
       status: "paused";
@@ -212,8 +213,9 @@ export type RunnerState =
       overrideActive: boolean;
       biasPercent: number;
       control?: ControlStatus;
+      recordingWarning?: string | null;
     }
-  | { status: "finished"; sessionId: string; completed: boolean }
+  | { status: "finished"; sessionId: string; completed: boolean; saveWarning?: string | null }
   | { status: "error"; message: string; sessionId: string | null };
 
 export type SessionSummary = {
@@ -230,6 +232,7 @@ export type SessionSummary = {
   distanceSource: "trainer" | "power" | "mixed" | null;
   distanceWeightKg: number;
   completed: boolean;
+  recordingWarning?: string | null;
 };
 
 export type SessionDetail = {
