@@ -9,7 +9,7 @@ import {
   repeatSpans,
   shapesWithin,
   timeAxisTicks,
-} from "./workoutProfile";
+} from "./workoutProfileModel";
 
 const FTP = 200;
 

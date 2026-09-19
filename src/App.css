@@ -562,3 +562,23 @@ textarea { min-height: 70px; resize: vertical; }
 .release-section { display: grid; gap: 6px; }
 .release-section ul { margin: 0; padding-left: 18px; display: grid; gap: 5px; }
 .release-section li { color: #b9c2b3; font-size: 13px; }
+
+/* Workout profile: the one drawing of a workout (editor preview, cards, ride picker) */
+.workout-profile { display: block; width: 100%; height: var(--profile-height, 150px); margin: 0; }
+.workout-profile[data-variant="compact"] { height: 100%; }
+.workout-profile-canvas { position: relative; width: 100%; height: 100%; }
+.workout-profile svg { display: block; overflow: visible; }
+.workout-profile-block { opacity: .88; transition: opacity .12s ease; }
+.workout-profile[data-interactive="true"] .workout-profile-block { cursor: pointer; }
+.workout-profile-block[data-dimmed="true"] { opacity: .35; }
+.workout-profile-block[data-highlighted="true"] { opacity: 1; stroke: #c8ff32; stroke-width: 1.5; }
+.workout-profile-hatch { stroke: #7ed5ca; }
+.workout-profile-block[data-kind="freeRide"] { stroke: #3f5a57; stroke-width: 1; }
+.workout-profile-progress { fill: rgba(200,255,50,.35); pointer-events: none; }
+.workout-profile-baseline, .workout-profile-tick { stroke: #3a4137; }
+.workout-profile-ftp { stroke: #8f9988; stroke-dasharray: 3 4; }
+.workout-profile-label { fill: #7f887a; font-size: 9px; font-weight: 700; letter-spacing: .06em; }
+.workout-profile-tick-label { fill: #7f887a; font-size: 9px; font-variant-numeric: tabular-nums; }
+.workout-profile-repeat { stroke: #8f9988; fill: none; }
+.workout-profile-repeat-label { fill: #aeb7a8; font-size: 9px; font-weight: 700; }
+.workout-profile-empty { display: grid; place-items: center; height: 100%; border: 1px dashed #3a4137; border-radius: 9px; color: #788174; font-size: 11px; text-align: center; }

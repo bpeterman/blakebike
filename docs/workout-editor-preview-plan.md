@@ -108,7 +108,7 @@ Move `zoneColors` out of `App.tsx` and add
 the same `zoneIndex` + modulo rule the time-in-zone chart uses today. `App.tsx`
 imports from here; nothing else about zones changes.
 
-### 3. `src/workoutProfile.ts` — statistics and geometry (pure)
+### 3. `src/workoutProfileModel.ts` — statistics and geometry (pure)
 
 ```ts
 export type ProfileSegment = ExpandedStep & {
@@ -265,7 +265,7 @@ Each phase is a commit that leaves `pnpm check` and `pnpm test` green. Phases
    `compileWorkoutIntervals` and `workoutDuration` onto it; export
    `targetWatts`. Tests.
 2. `zones.ts`: move palette, add `zoneColor`. Tests.
-3. `workoutProfile.ts`: segments, stats, scale, shapes, ticks, repeat spans.
+3. `workoutProfileModel.ts`: segments, stats, scale, shapes, ticks, repeat spans.
    Tests, including the 30/30 proportionality case.
 4. `WorkoutProfile.tsx` + `useElementWidth` + `ResizeObserver` stub + CSS.
    Component tests.
