@@ -3,6 +3,7 @@
 //! Everything downstream (workout runner, ride recorder, ride screen) consumes
 //! a single fused `Telemetry` stream published by the hub.
 
+pub mod ant;
 pub mod ble;
 pub mod cadence;
 pub mod crank;
@@ -24,6 +25,7 @@ use std::{
     time::Duration,
 };
 
+use btleplug::{api::Peripheral as _, platform::Peripheral};
 use futures::FutureExt;
 
 use chrono::Utc;
@@ -34,7 +36,7 @@ use tokio::{
     task::JoinHandle,
 };
 
-pub use ble::{Capability, DeviceInfo};
+pub use ble::{Capability, DeviceInfo, DeviceTransport};
 pub use fuser::{SourcePreferences, TelemetrySources};
 pub use log::DeviceLogLine;
 pub use trainer::ControlError;
@@ -140,6 +142,8 @@ pub struct SlotStats {
     pub rate_hz: f32,
     pub rssi: Option<i16>,
     pub battery_percent: Option<u8>,
+    pub battery_status: Option<String>,
+    pub battery_voltage: Option<f32>,
     pub manufacturer: Option<String>,
     pub model: Option<String>,
     pub firmware: Option<String>,
@@ -171,6 +175,7 @@ pub struct SlotSnapshot {
 pub struct DevicesSnapshot {
     pub scanning: bool,
     pub scan_error: Option<ScanError>,
+    pub ant_adapter: ant::AdapterStatus,
     pub slots: Vec<SlotSnapshot>,
     pub source_preferences: SourcePreferences,
     pub sources: TelemetrySources,
@@ -190,6 +195,8 @@ pub struct ScanError {
 pub struct KnownDevice {
     pub id: String,
     pub name: String,
+    #[serde(default)]
+    pub transport: DeviceTransport,
     pub role: DeviceRole,
     #[serde(default)]
     pub capabilities: Vec<Capability>,
@@ -373,6 +380,46 @@ impl DeviceSlot {
         inner.stats.last_reading = Some(summary);
     }
 
+    /// Update battery information delivered after connection (for example,
+    /// the optional ANT+ HRM page 7) and immediately refresh the device card.
+    /// Returns true when the displayed value changed.
+    pub fn record_battery(
+        &self,
+        battery_percent: Option<u8>,
+        battery_status: Option<String>,
+        battery_voltage: Option<f32>,
+    ) -> bool {
+        let changed = {
+            let mut inner = self
+                .stats
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if inner.stats.battery_percent == battery_percent
+                && inner.stats.battery_status == battery_status
+                && inner.stats.battery_voltage == battery_voltage
+            {
+                false
+            } else {
+                inner.stats.battery_percent = battery_percent;
+                inner.stats.battery_status = battery_status;
+                inner.stats.battery_voltage = battery_voltage;
+                true
+            }
+        };
+        if changed {
+            self.emit(
+                "devices://slot",
+                SlotSnapshot {
+                    role: self.role,
+                    state: self.state.borrow().clone(),
+                    stats: self.stats(),
+                    log: self.log.tail(log::TAIL),
+                },
+            );
+        }
+        changed
+    }
+
     pub async fn set_calibration(&self, supported: Option<bool>, calibrating: Option<bool>) {
         {
             let mut inner = self
@@ -407,6 +454,8 @@ impl DeviceSlot {
         inner.stats.connected_since_ms = Some(Utc::now().timestamp_millis());
         inner.stats.rssi = rssi;
         inner.stats.battery_percent = details.battery_percent;
+        inner.stats.battery_status = None;
+        inner.stats.battery_voltage = None;
         inner.stats.manufacturer = details.manufacturer.clone();
         inner.stats.model = details.model.clone();
         inner.stats.firmware = details.firmware.clone();
@@ -507,6 +556,45 @@ pub(crate) fn spawn_link_worker(
     })
 }
 
+/// Some Bluetooth backends leave notification streams open after disconnect.
+/// Check the transport independently; a quiet but connected sensor is healthy.
+async fn monitor_connection<F, Fut>(mut connected: F) -> String
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<bool, String>>,
+{
+    loop {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        match tokio::time::timeout(Duration::from_secs(4), connected()).await {
+            Ok(Ok(true)) => {}
+            Ok(Ok(false)) => return "Bluetooth connection closed".into(),
+            Ok(Err(error)) => return format!("Bluetooth connection check failed: {error}"),
+            Err(_) => return "Bluetooth connection check timed out".into(),
+        }
+    }
+}
+
+pub(crate) fn spawn_ble_link_worker(
+    slot: Arc<DeviceSlot>,
+    fuser: Arc<TelemetryFuser>,
+    role: DeviceRole,
+    name: String,
+    peripheral: Peripheral,
+    body: impl Future<Output = u64> + Send + 'static,
+) -> JoinHandle<()> {
+    spawn_link_worker(slot.clone(), fuser, role, name, async move {
+        tokio::select! {
+            samples = body => samples,
+            reason = monitor_connection(|| async {
+                peripheral.is_connected().await.map_err(|error| error.to_string())
+            }) => {
+                slot.note("error", "Bluetooth connection lost", Some(reason));
+                slot.stats().samples
+            }
+        }
+    })
+}
+
 /// What every device worker does when its stream ends: record the drop, stop
 /// feeding the fuser, and mark the slot as needing a reconnect.
 pub(crate) async fn link_lost(
@@ -579,12 +667,14 @@ impl RoleLink {
 /// Owns every slot, the Bluetooth adapter and the fused telemetry stream.
 pub struct DeviceHub {
     ble: Arc<ble::Ble>,
+    ant: ant::Ant,
     scanning: AtomicBool,
     scan_error: std::sync::Mutex<Option<ScanError>>,
     telemetry: broadcast::Sender<Telemetry>,
     fuser: Arc<fuser::TelemetryFuser>,
     trainer: trainer::Trainer,
     heart_rate: sensor::Sensor,
+    ant_heart_rate: ant::receiver::HeartRateReceiver,
     power: sensor::Sensor,
     cadence: sensor::Sensor,
     /// Serializes connects: BlueZ misbehaves when several GATT connections
@@ -616,31 +706,42 @@ impl DeviceHub {
             ble::Ble::disabled()
         });
         let fuser = Arc::new(fuser::TelemetryFuser::new(app.clone(), telemetry.clone()));
+        let ant = if app.is_some() {
+            ant::Ant::new(true)
+        } else {
+            ant::Ant::disabled()
+        };
+        let trainer_slot = DeviceSlot::new(DeviceRole::Trainer, app.clone());
+        let heart_rate_slot = DeviceSlot::new(DeviceRole::HeartRate, app.clone());
+        let power_slot = DeviceSlot::new(DeviceRole::Power, app.clone());
+        let cadence_slot = DeviceSlot::new(DeviceRole::Cadence, app.clone());
         Self {
-            trainer: trainer::Trainer::new(
-                DeviceSlot::new(DeviceRole::Trainer, app.clone()),
-                ble.clone(),
-                fuser.clone(),
-            ),
+            trainer: trainer::Trainer::new(trainer_slot, ble.clone(), fuser.clone()),
             heart_rate: sensor::Sensor::new(
-                DeviceSlot::new(DeviceRole::HeartRate, app.clone()),
+                heart_rate_slot.clone(),
                 ble.clone(),
                 fuser.clone(),
                 heart_rate::decoder,
             ),
+            ant_heart_rate: ant::receiver::HeartRateReceiver::new(
+                heart_rate_slot,
+                ant.clone(),
+                fuser.clone(),
+            ),
             power: sensor::Sensor::new(
-                DeviceSlot::new(DeviceRole::Power, app.clone()),
+                power_slot,
                 ble.clone(),
                 fuser.clone(),
                 cycling_power::decoder,
             ),
             cadence: sensor::Sensor::new(
-                DeviceSlot::new(DeviceRole::Cadence, app.clone()),
+                cadence_slot,
                 ble.clone(),
                 fuser.clone(),
                 cadence::decoder,
             ),
             ble,
+            ant,
             scanning: AtomicBool::new(false),
             scan_error: std::sync::Mutex::new(None),
             telemetry,
@@ -735,6 +836,7 @@ impl DeviceHub {
         DevicesSnapshot {
             scanning: self.is_scanning(),
             scan_error: self.scan_error(),
+            ant_adapter: self.ant.status(),
             slots,
             source_preferences: self.source_preferences(),
             sources: self.telemetry_sources(),
@@ -757,14 +859,21 @@ impl DeviceHub {
 
     /// Scan for every kind of sensor. Simulators are listed first.
     pub async fn scan(&self) -> Result<Vec<DeviceInfo>, String> {
-        tracing::info!("Scanning for Bluetooth sensors");
+        tracing::info!("Scanning for Bluetooth and ANT+ sensors");
         self.scanning.store(true, Ordering::Relaxed);
         self.set_scan_error(None);
         let started = std::time::Instant::now();
-        let result = self.ble.scan().await;
+        let (ble_result, ant_result) = tokio::join!(self.ble.scan(), self.ant.scan_heart_rate());
         self.scanning.store(false, Ordering::Relaxed);
-        match result {
-            Err(message) => {
+        let ant_found = match ant_result {
+            Ok(found) => found,
+            Err(error) => {
+                tracing::warn!(error = %error, "ANT scan unavailable");
+                Vec::new()
+            }
+        };
+        match ble_result {
+            Err(message) if ant_found.is_empty() => {
                 tracing::error!(error = %message, "Scan failed");
                 self.set_scan_error(Some(ScanError {
                     message: message.clone(),
@@ -772,9 +881,21 @@ impl DeviceHub {
                 }));
                 Err(message)
             }
-            Ok(found) => {
+            ble_result => {
+                let found = match ble_result {
+                    Ok(found) => found,
+                    Err(message) => {
+                        tracing::warn!(error = %message, "Bluetooth scan unavailable; keeping ANT results");
+                        self.set_scan_error(Some(ScanError {
+                            message,
+                            guidance: ble::platform_guidance(),
+                        }));
+                        Vec::new()
+                    }
+                };
                 tracing::info!(
-                    found = found.len(),
+                    ble_found = found.len(),
+                    ant_found = ant_found.len(),
                     elapsed_ms = started.elapsed().as_millis() as u64,
                     "Scan finished"
                 );
@@ -783,6 +904,7 @@ impl DeviceHub {
                 devices.push(cycling_power::simulated_device());
                 devices.push(cadence::simulated_device());
                 devices.extend(found);
+                devices.extend(ant_found);
                 Ok(devices)
             }
         }
@@ -845,7 +967,10 @@ impl DeviceHub {
             }
         }
         // A remembered device was not part of the last scan: look for it now.
-        let device = if !device.simulated && self.ble.peripheral(&device.id).await.is_none() {
+        let device = if !device.simulated
+            && device.transport == DeviceTransport::Ble
+            && self.ble.peripheral(&device.id).await.is_none()
+        {
             let slot = self.slot(role);
             slot.set_state(DeviceState::Connecting {
                 name: device.name.clone(),
@@ -892,7 +1017,14 @@ impl DeviceHub {
         };
         let result = match role {
             DeviceRole::Trainer => self.trainer.connect(device.clone()).await,
-            DeviceRole::HeartRate => self.heart_rate.connect(device.clone()).await,
+            DeviceRole::HeartRate if device.transport == DeviceTransport::Ant => {
+                self.heart_rate.disconnect().await;
+                self.ant_heart_rate.connect(device.clone()).await
+            }
+            DeviceRole::HeartRate => {
+                self.ant_heart_rate.disconnect().await;
+                self.heart_rate.connect(device.clone()).await
+            }
             DeviceRole::Power => self.power.connect(device.clone()).await,
             DeviceRole::Cadence => self.cadence.connect(device.clone()).await,
         };
@@ -912,6 +1044,7 @@ impl DeviceHub {
         Some(KnownDevice {
             id: device.id,
             name: device.name,
+            transport: device.transport,
             role,
             capabilities: device.capabilities,
             simulated: device.simulated,
@@ -930,7 +1063,10 @@ impl DeviceHub {
         let _serialized = self.connect_lock.lock().await;
         match role {
             DeviceRole::Trainer => self.trainer.disconnect().await,
-            DeviceRole::HeartRate => self.heart_rate.disconnect().await,
+            DeviceRole::HeartRate => {
+                self.ant_heart_rate.disconnect().await;
+                self.heart_rate.disconnect().await;
+            }
             DeviceRole::Power => self.power.disconnect().await,
             DeviceRole::Cadence => self.cadence.disconnect().await,
         }
@@ -963,10 +1099,38 @@ impl DeviceHub {
         self.trainer.begin_control().await
     }
 
+    /// Persistent command failures must re-open the transport, not just retry
+    /// commands on a dead handle. Do not supersede a manual connect/disconnect.
+    pub async fn reconnect_trainer(&self) {
+        let Ok(_serialized) = self.connect_lock.try_lock() else {
+            return;
+        };
+        if self.link(DeviceRole::Trainer).last_device().is_none() {
+            return;
+        }
+        let slot = self.slot(DeviceRole::Trainer);
+        let Some(device) = slot.state().await.device().cloned() else {
+            return;
+        };
+        slot.abort_worker().await;
+        link_lost(
+            slot,
+            &self.fuser,
+            DeviceRole::Trainer,
+            device.name,
+            slot.stats().samples,
+        )
+        .await;
+    }
+
     /// Request Control + Start/Resume again, for a trainer that answered
     /// ControlNotPermitted mid-ride.
     pub async fn reacquire_control(&self) -> Result<(), ControlError> {
         self.trainer.reacquire_control().await
+    }
+
+    pub async fn request_control(&self) -> Result<(), ControlError> {
+        self.trainer.request_control().await
     }
 
     pub async fn set_target_power(
@@ -1006,6 +1170,11 @@ async fn reconnect_supervisor(hub: Arc<DeviceHub>, role: DeviceRole) {
             return;
         }
         let Some(device) = hub.link(role).last_device() else {
+            // A manual disconnect can cancel recovery while the slot still
+            // briefly says Reconnecting. Wait instead of spinning on it.
+            if state_rx.changed().await.is_err() {
+                return;
+            }
             continue;
         };
         let generation = *hub.link(role).generation.borrow();
@@ -1212,6 +1381,11 @@ mod tests {
         assert_eq!(stats.samples, 2);
         assert_eq!(stats.last_raw_hex.as_deref(), Some("10 5a"));
         assert!(stats.rate_hz > 0.0);
+        assert!(slot.record_battery(Some(82), Some("Good".into()), Some(2.5)));
+        assert!(!slot.record_battery(Some(82), Some("Good".into()), Some(2.5)));
+        assert_eq!(slot.stats().battery_percent, Some(82));
+        assert_eq!(slot.stats().battery_status.as_deref(), Some("Good"));
+        assert_eq!(slot.stats().battery_voltage, Some(2.5));
         slot.record_drop();
         assert_eq!(slot.stats().drops, 1);
         assert_eq!(slot.stats().rate_hz, 0.0);
@@ -1245,6 +1419,7 @@ mod tests {
         let strap = DeviceInfo {
             id: "hr".into(),
             name: "Strap".into(),
+            transport: Default::default(),
             simulated: false,
             rssi: None,
             capabilities: vec![Capability::HeartRate],
@@ -1260,6 +1435,7 @@ mod tests {
         let meter = DeviceInfo {
             id: "pm".into(),
             name: "Crank".into(),
+            transport: Default::default(),
             simulated: false,
             rssi: None,
             capabilities: vec![Capability::CyclingPower],
@@ -1401,5 +1577,73 @@ mod tests {
     fn state_serializes_with_status_tag() {
         let json = serde_json::to_string(&DeviceState::Connecting { name: "K".into() }).unwrap();
         assert_eq!(json, r#"{"status":"connecting","name":"K"}"#);
+    }
+
+    #[test]
+    fn old_device_json_defaults_to_ble_transport() {
+        let device: DeviceInfo = serde_json::from_str(
+            r#"{"id":"legacy","name":"Old strap","simulated":false,"rssi":null,"capabilities":["heartRate"]}"#,
+        )
+        .unwrap();
+        assert_eq!(device.transport, DeviceTransport::Ble);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_disconnected_transport_enters_normal_recovery() {
+        let hub = Arc::new(DeviceHub::default());
+        DeviceHub::spawn_reconnect_supervisors(&hub);
+        hub.connect(DeviceRole::Trainer, trainer::simulated_devices().remove(0))
+            .await
+            .unwrap();
+        let slot = hub.slot(DeviceRole::Trainer).clone();
+        slot.abort_worker().await;
+        let worker = spawn_link_worker(
+            slot.clone(),
+            hub.fuser.clone(),
+            DeviceRole::Trainer,
+            "Silent trainer".into(),
+            async {
+                // The notification stream never produces EOF. The transport check
+                // must be sufficient to hand it to the reconnect supervisor.
+                tokio::select! {
+                    n = std::future::pending::<u64>() => n,
+                    _ = monitor_connection(|| async { Ok(false) }) => 0,
+                }
+            },
+        );
+        slot.set_worker(worker).await;
+        wait_until(async || slot.stats().drops > 0).await;
+        wait_until(async || slot.state().await.is_connected()).await;
+        assert_eq!(reconnect_attempts(&hub, DeviceRole::Trainer), 1);
+        hub.disconnect().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn quiet_connected_sensors_are_not_reconnected() {
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                monitor_connection(|| async { Ok(true) })
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_connection_check_is_bounded() {
+        let reason = tokio::time::timeout(
+            Duration::from_secs(10),
+            monitor_connection(std::future::pending::<Result<bool, String>>),
+        )
+        .await
+        .unwrap();
+        assert!(reason.contains("timed out"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connection_check_errors_are_treated_as_link_loss() {
+        let reason = monitor_connection(|| async { Err("adapter unavailable".into()) }).await;
+        assert!(reason.contains("adapter unavailable"));
     }
 }

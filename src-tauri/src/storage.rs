@@ -337,6 +337,7 @@ impl Storage {
             "distance_weight_kg",
             "REAL NOT NULL DEFAULT 84.0",
         )?;
+        ensure_column(&connection, "sessions", "recording_warning", "TEXT")?;
         let reader = Connection::open(path).map_err(|error| error.to_string())?;
         let storage = Self {
             connection: Mutex::new(connection),
@@ -693,6 +694,7 @@ impl Storage {
             distance_source: None,
             distance_weight_kg,
             completed: false,
+            recording_warning: None,
         };
         self.connection()?
             .execute(
@@ -751,7 +753,7 @@ impl Storage {
                   average_power_watts = ?4, max_power_watts = ?5,
                   average_cadence_rpm = ?6, completed = ?7,
                   estimated_distance_meters = ?8, distance_source = ?9,
-                  distance_weight_kg = ?10 WHERE id = ?1",
+                  distance_weight_kg = ?10, recording_warning = ?11 WHERE id = ?1",
                 params![
                     summary.id.to_string(),
                     summary.ended_at.map(|date| date.to_rfc3339()),
@@ -763,7 +765,19 @@ impl Storage {
                     summary.estimated_distance_meters,
                     summary.distance_source.map(distance_source_value),
                     summary.distance_weight_kg,
+                    summary.recording_warning,
                 ],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    /// Retain a save problem in History, including failures after finalization.
+    pub fn save_recording_warning(&self, id: Uuid, warning: Option<&str>) -> Result<(), String> {
+        self.connection()?
+            .execute(
+                "UPDATE sessions SET recording_warning = ?2 WHERE id = ?1",
+                params![id.to_string(), warning],
             )
             .map_err(|error| error.to_string())?;
         Ok(())
@@ -901,7 +915,7 @@ impl Storage {
             .prepare(
                 "SELECT id, workout_id, workout_name, started_at, ended_at, elapsed_seconds,
                  average_power_watts, max_power_watts, average_cadence_rpm, completed,
-                 estimated_distance_meters, distance_source, distance_weight_kg
+                 estimated_distance_meters, distance_source, distance_weight_kg, recording_warning
                  FROM sessions ORDER BY started_at DESC",
             )
             .map_err(|error| error.to_string())?;
@@ -918,7 +932,7 @@ impl Storage {
             .query_row(
                 "SELECT id, workout_id, workout_name, started_at, ended_at, elapsed_seconds,
                  average_power_watts, max_power_watts, average_cadence_rpm, completed,
-                 estimated_distance_meters, distance_source, distance_weight_kg
+                 estimated_distance_meters, distance_source, distance_weight_kg, recording_warning
                  FROM sessions WHERE id = ?1",
                 [id.to_string()],
                 row_to_session,
@@ -969,6 +983,7 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionSummary> {
             .as_deref()
             .and_then(parse_distance_source),
         distance_weight_kg: row.get(12)?,
+        recording_warning: row.get(13)?,
     })
 }
 
@@ -1273,6 +1288,7 @@ mod tests {
         let strap = KnownDevice {
             id: "strap".into(),
             name: "HRM-Pro".into(),
+            transport: Default::default(),
             role: DeviceRole::HeartRate,
             capabilities: vec![Capability::HeartRate],
             simulated: false,
@@ -1283,6 +1299,7 @@ mod tests {
         let trainer = KnownDevice {
             id: "kickr".into(),
             name: "KICKR CORE".into(),
+            transport: Default::default(),
             role: DeviceRole::Trainer,
             capabilities: vec![Capability::Ftms, Capability::CyclingPower],
             simulated: false,

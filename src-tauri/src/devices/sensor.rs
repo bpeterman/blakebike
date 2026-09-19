@@ -14,7 +14,7 @@ use super::{
     DeviceInfo, DeviceRole, DeviceSlot, DeviceState,
     ble::{self, Ble, GATT_CONNECT_TIMEOUT, GATT_STEP_TIMEOUT, bluetooth_uuid, hex, with_timeout},
     fuser::{Reading, TelemetryFuser},
-    spawn_link_worker,
+    spawn_ble_link_worker, spawn_link_worker,
 };
 
 /// Kind-specific knowledge for one sensor role.
@@ -201,11 +201,12 @@ impl Sensor {
         let role = self.role();
         let reconnect_name = device.name.clone();
         let measurement_uuid = measurement.uuid;
-        let worker = spawn_link_worker(
+        let worker = spawn_ble_link_worker(
             slot.clone(),
             fuser.clone(),
             role,
             reconnect_name,
+            peripheral.clone(),
             async move {
                 let mut notifications = match peripheral.notifications().await {
                     Ok(stream) => stream,

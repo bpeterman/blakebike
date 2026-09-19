@@ -283,4 +283,39 @@ describe("Ride charts", () => {
     rerender(rideWith(runner));
     expect(screen.queryByRole("status")).not.toBeInTheDocument();
   });
+
+  it("shows recording warnings during and after a ride, and clears recovered warnings", () => {
+    const rideWith = (state: RunnerState) => (
+      <Ride workouts={[]} selectedWorkout={null} setSelectedWorkout={vi.fn()} connected
+        onConnect={vi.fn()} runner={state} telemetry={telemetry} telemetryHistory={[telemetry]}
+        powerSmoothing="instant" onPowerSmoothing={vi.fn()} sourcePreferences={defaultSourcePreferences}
+        onSourcePreference={vi.fn()} profile={profile} trainingZones={defaultTrainingZoneSettings}
+        displayPreferences={defaultRideDisplayPreferences} perform={async () => undefined} />
+    );
+    const message = "Ride data is not being saved. Retrying; check available disk space and keep the app open.";
+    const { rerender } = render(rideWith({ ...runner, recordingWarning: message }));
+    expect(screen.getByRole("alert")).toHaveTextContent(message);
+    rerender(rideWith({ ...runner, recordingWarning: null }));
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    rerender(rideWith({ status: "finished", sessionId: "session", completed: true, saveWarning: "No ride measurements were saved." }));
+    expect(screen.getByRole("alert")).toHaveTextContent("No ride measurements were saved.");
+    expect(screen.queryByText("Ride saved")).not.toBeInTheDocument();
+  });
+
+  it("makes unconfirmed pause visible until the trainer acknowledges it", () => {
+    const paused: RunnerState = { ...runner, status: "paused", control: "degraded" };
+    const props = { workouts: [], selectedWorkout: null, setSelectedWorkout: vi.fn(), connected: true,
+      onConnect: vi.fn(), telemetry, telemetryHistory: [telemetry], powerSmoothing: "instant" as const,
+      onPowerSmoothing: vi.fn(), sourcePreferences: defaultSourcePreferences, onSourcePreference: vi.fn(),
+      profile, trainingZones: defaultTrainingZoneSettings, displayPreferences: defaultRideDisplayPreferences,
+      perform: async () => undefined };
+    const { rerender } = render(<Ride {...props} runner={paused} />);
+    expect(screen.getByRole("status")).toHaveTextContent("Trainer pause not confirmed");
+    expect(screen.getByRole("status")).toHaveTextContent("trainer may still be applying resistance");
+    rerender(<Ride {...props} runner={{ ...paused, control: "lost" }} />);
+    expect(screen.getByRole("status")).toHaveTextContent("ride clock is paused");
+    rerender(<Ride {...props} runner={{ ...paused, control: "ok" }} />);
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+  });
+
 });

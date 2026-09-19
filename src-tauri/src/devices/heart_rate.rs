@@ -9,6 +9,7 @@ pub fn simulated_device() -> DeviceInfo {
     DeviceInfo {
         id: SIMULATED_HEART_RATE_ID.into(),
         name: "Simulated HR Strap".into(),
+        transport: Default::default(),
         simulated: true,
         rssi: Some(-40),
         capabilities: vec![Capability::HeartRate],
