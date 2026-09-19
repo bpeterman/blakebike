@@ -129,17 +129,68 @@ fn validate_zones(
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+const RIDE_CARD_IDS: [&str; 9] = [
+    "power",
+    "cadence",
+    "speed",
+    "heartRate",
+    "workoutTimeline",
+    "targetAndBias",
+    "powerChart",
+    "heartRateChart",
+    "timeInZone",
+];
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RideCardPreference {
+    pub id: String,
+    pub visible: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct RideDisplayPreferences {
-    pub show_time_in_zone: bool,
+    pub version: u8,
+    pub cards: Vec<RideCardPreference>,
 }
 
 impl Default for RideDisplayPreferences {
     fn default() -> Self {
         Self {
-            show_time_in_zone: false,
+            version: 2,
+            cards: RIDE_CARD_IDS
+                .iter()
+                .map(|id| RideCardPreference {
+                    id: (*id).to_owned(),
+                    visible: true,
+                })
+                .collect(),
         }
+    }
+}
+
+impl RideDisplayPreferences {
+    fn normalized(self) -> Self {
+        let mut cards = Vec::with_capacity(RIDE_CARD_IDS.len());
+        for card in self.cards {
+            if RIDE_CARD_IDS.contains(&card.id.as_str())
+                && !cards
+                    .iter()
+                    .any(|existing: &RideCardPreference| existing.id == card.id)
+            {
+                cards.push(card);
+            }
+        }
+        for id in RIDE_CARD_IDS {
+            if !cards.iter().any(|card| card.id == id) {
+                cards.push(RideCardPreference {
+                    id: id.to_owned(),
+                    visible: true,
+                });
+            }
+        }
+        Self { version: 2, cards }
     }
 }
 
@@ -455,15 +506,19 @@ impl Storage {
 
     pub fn ride_display_preferences(&self) -> Result<RideDisplayPreferences, String> {
         Ok(self
-            .setting(RIDE_DISPLAY_PREFERENCES_KEY)?
-            .unwrap_or_default())
+            .setting::<RideDisplayPreferences>(RIDE_DISPLAY_PREFERENCES_KEY)?
+            .unwrap_or_default()
+            .normalized())
     }
 
     pub fn save_ride_display_preferences(
         &self,
         preferences: &RideDisplayPreferences,
     ) -> Result<(), String> {
-        self.save_setting(RIDE_DISPLAY_PREFERENCES_KEY, preferences)
+        self.save_setting(
+            RIDE_DISPLAY_PREFERENCES_KEY,
+            &preferences.clone().normalized(),
+        )
     }
 
     /// Remember (or refresh) a device after a successful connection.
@@ -955,11 +1010,50 @@ mod tests {
         };
         storage.save_training_zones(&zones).unwrap();
         assert_eq!(storage.training_zones().unwrap(), zones);
-        let display = RideDisplayPreferences {
-            show_time_in_zone: true,
-        };
+        let mut display = RideDisplayPreferences::default();
+        display.cards.swap(0, 1);
+        display.cards[0].visible = false;
         storage.save_ride_display_preferences(&display).unwrap();
         assert_eq!(storage.ride_display_preferences().unwrap(), display);
+    }
+
+    #[test]
+    fn ride_display_preferences_migrate_and_normalize() {
+        let storage = Storage::in_memory().unwrap();
+        storage
+            .save_setting(
+                RIDE_DISPLAY_PREFERENCES_KEY,
+                &serde_json::json!({ "showTimeInZone": false }),
+            )
+            .unwrap();
+        assert_eq!(
+            storage.ride_display_preferences().unwrap(),
+            RideDisplayPreferences::default()
+        );
+
+        let partial = RideDisplayPreferences {
+            version: 1,
+            cards: vec![
+                RideCardPreference {
+                    id: "speed".into(),
+                    visible: false,
+                },
+                RideCardPreference {
+                    id: "speed".into(),
+                    visible: true,
+                },
+                RideCardPreference {
+                    id: "unknown".into(),
+                    visible: true,
+                },
+            ],
+        };
+        storage.save_ride_display_preferences(&partial).unwrap();
+        let normalized = storage.ride_display_preferences().unwrap();
+        assert_eq!(normalized.version, 2);
+        assert_eq!(normalized.cards.len(), RIDE_CARD_IDS.len());
+        assert_eq!(normalized.cards[0].id, "speed");
+        assert!(!normalized.cards[0].visible);
     }
 
     #[test]

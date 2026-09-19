@@ -1,10 +1,18 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import {
   Activity,
   Bike,
   Bluetooth,
   ChevronDown,
   ChevronRight,
+  ChevronUp,
   CircleStop,
   Download,
   Gauge,
@@ -42,6 +50,8 @@ import type {
   Metric as SourceMetric,
   PowerSmoothing,
   Profile,
+  RideCardId,
+  RideDisplayPreferences,
   RunnerState,
   SessionDetail,
   SessionSummary,
@@ -57,12 +67,14 @@ import {
   BIAS_STEP_PERCENT,
   clampBias,
   compileWorkoutIntervals,
+  defaultRideDisplayPreferences,
   defaultTrainingZoneSettings,
   deviceRoleLabel,
   deviceRoles,
   formatDistance,
   formatDuration,
   formatSpeed,
+  normalizeRideDisplayPreferences,
   downsampleTelemetry,
   effectiveHeartRateZones,
   effectivePowerZones,
@@ -107,6 +119,8 @@ function App() {
   const [trainingZones, setTrainingZones] = useState<TrainingZoneSettings>(
     defaultTrainingZoneSettings,
   );
+  const [rideDisplayPreferences, setRideDisplayPreferences] =
+    useState<RideDisplayPreferences>(defaultRideDisplayPreferences);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [devicePicker, setDevicePicker] = useState<DeviceRole | null>(null);
@@ -130,6 +144,7 @@ function App() {
         nextRunner,
         nextSmoothing,
         nextZones,
+        nextRideDisplayPreferences,
       ] =
         await Promise.all([
           api.profile(),
@@ -139,6 +154,7 @@ function App() {
           api.runnerState(),
           api.powerSmoothing(),
           api.trainingZones(),
+          api.rideDisplayPreferences(),
         ]);
       setProfile(nextProfile);
       setWorkouts(nextWorkouts);
@@ -148,6 +164,9 @@ function App() {
       runnerRef.current = nextRunner;
       setPowerSmoothing(nextSmoothing);
       setTrainingZones(nextZones);
+      setRideDisplayPreferences(
+        normalizeRideDisplayPreferences(nextRideDisplayPreferences),
+      );
       if (nextRunner.status === "running" || nextRunner.status === "paused") {
         liveSessionRef.current = nextRunner.sessionId;
         const session = await api.session(nextRunner.sessionId);
@@ -467,6 +486,7 @@ function App() {
             onSourcePreference={changeSourcePreference}
             profile={profile}
             trainingZones={trainingZones}
+            displayPreferences={rideDisplayPreferences}
             perform={perform}
           />
         )}
@@ -497,6 +517,7 @@ function App() {
           <SettingsPage
             profile={profile}
             trainingZones={trainingZones}
+            rideDisplayPreferences={rideDisplayPreferences}
             perform={perform}
             onProfileUpdate={setProfile}
             onTrainingZonesUpdate={setTrainingZones}
@@ -511,6 +532,13 @@ function App() {
                 await api.saveTrainingZones(zones);
                 setTrainingZones(zones);
               }, "save training zones")
+            }
+            onSaveRideDisplayPreferences={(preferences) =>
+              void perform(async () => {
+                const normalized = normalizeRideDisplayPreferences(preferences);
+                await api.saveRideDisplayPreferences(normalized);
+                setRideDisplayPreferences(normalized);
+              }, "save ride layout")
             }
             onForgetDevices={() => perform(() => api.forgetAllDevices(), "forget all devices")}
           />
@@ -732,6 +760,7 @@ export function Ride({
   onSourcePreference,
   profile,
   trainingZones,
+  displayPreferences,
   perform,
 }: {
   workouts: Workout[];
@@ -748,6 +777,7 @@ export function Ride({
   onSourcePreference: (metric: SourceMetric, choice: SourceChoice) => void;
   profile: Profile;
   trainingZones: TrainingZoneSettings;
+  displayPreferences: RideDisplayPreferences;
   perform: (action: () => Promise<unknown>, label?: string) => Promise<void>;
 }) {
   const [targetDraft, setTargetDraft] = useState("100");
@@ -851,6 +881,216 @@ export function Ride({
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [adjustable, biasPercent, perform, runner.status, structured]);
 
+  const cardContent = {
+    power: (
+      <div className="ride-card-compact">
+        <LiveMetric icon={Zap} label="POWER" value={displayedPower} unit="W" accent note={sourceNote(telemetry.sources?.power)}
+          control={
+            <span className="metric-control-group">
+              <SourceSelect
+                metric="power"
+                choice={sourcePreferences.power}
+                onChange={(choice) => onSourcePreference("power", choice)}
+              />
+              <label className="smoothing-select">
+                <span className="sr-only">Power smoothing</span>
+                <select value={powerSmoothing} onChange={(event) => onPowerSmoothing(event.target.value as PowerSmoothing)}>
+                  {powerSmoothingOptions.map((option) => (
+                    <option key={option} value={option}>{powerSmoothingLabel[option]}</option>
+                  ))}
+                </select>
+              </label>
+            </span>
+          } />
+      </div>
+    ),
+    cadence: (
+      <div className="ride-card-compact">
+        <LiveMetric
+          icon={RefreshCw}
+          label="CADENCE"
+          value={Math.round(telemetry.cadenceRpm ?? 0)}
+          unit="rpm"
+          note={sourceNote(telemetry.sources?.cadence)}
+          control={
+            <SourceSelect
+              metric="cadence"
+              choice={sourcePreferences.cadence}
+              onChange={(choice) => onSourcePreference("cadence", choice)}
+            />
+          }
+        />
+      </div>
+    ),
+    speed: (
+      <div className="ride-card-compact">
+        <LiveMetric icon={Gauge} label="SPEED" value={displayedSpeed.value} unit={displayedSpeed.unit} />
+      </div>
+    ),
+    heartRate: (
+      <div className="ride-card-compact">
+        <LiveMetric icon={HeartPulse} label="HEART RATE" value={telemetry.heartRateBpm ?? "—"} unit="bpm" note={sourceNote(telemetry.sources?.heartRate)} />
+      </div>
+    ),
+    workoutTimeline: structured && workoutIntervals.length > 0 ? (
+      <WorkoutTimeline
+        intervals={workoutIntervals}
+        workoutName={runner.workoutName}
+        currentIndex={runner.intervalIndex}
+        intervalElapsedSeconds={runner.intervalElapsedSeconds}
+        elapsedSeconds={elapsed}
+        totalSeconds={total ?? 0}
+        paused={runner.status === "paused"}
+        onSkip={() => void perform(() => api.skipInterval(), "skip interval")}
+      />
+    ) : null,
+    targetAndBias: (
+      <div className="card workout-controls-card">
+        <div className="workout-controls-heading">
+          <span className="label">TARGET &amp; BIAS</span>
+        </div>
+        <div className={adjustable ? "target-line editable" : "target-line"}>
+          <span>Target power</span>
+          {adjustable ? (
+            <div className="manual-erg-stepper">
+              <button className="secondary" disabled={runner.status !== "running"} onClick={() => void adjustPower(-5)}>− 5 W</button>
+              <label>
+                <span className="sr-only">Target power in watts</span>
+                <input
+                  type="number"
+                  min="1"
+                  max="65535"
+                  step="5"
+                  disabled={runner.status !== "running"}
+                  value={targetDraft}
+                  onChange={(event) => setTargetDraft(event.target.value)}
+                  onBlur={commitTargetPower}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") event.currentTarget.blur();
+                  }}
+                />
+                <strong>W</strong>
+              </label>
+              <button className="secondary" disabled={runner.status !== "running"} onClick={() => void adjustPower(5)}>+ 5 W</button>
+            </div>
+          ) : <strong>{targetPower ?? "Free"}{targetPower !== null ? " W" : ""}</strong>}
+          {adjustable && <span className="manual-erg-hint">{structured ? "Type watts or use ↑ / ↓ · Shift for bias" : "Type watts or use ↑ / ↓"}</span>}
+        </div>
+        {structured && (
+          <div className="plan-line">
+            <span className="plan-note">
+              {manualErg
+                ? "Free-ride block · manual ERG"
+                : plannedTarget === null
+                  ? "No target in this block"
+                  : overrideActive
+                    ? `Plan ${plannedTarget} W · overridden for this block`
+                    : biasPercent !== 100
+                      ? `Plan ${plannedTarget} W · ${biasPercent}% bias`
+                      : `Plan ${plannedTarget} W`}
+            </span>
+            {overrideActive && (
+              <button type="button" className="text-button" disabled={runner.status !== "running"} onClick={() => void backToPlan()}>
+                Back to plan
+              </button>
+            )}
+            <div className="bias-stepper" aria-label="Workout bias">
+              <span>Bias</span>
+              <button type="button" className="secondary" onClick={() => void adjustBias(-BIAS_STEP_PERCENT)}>−</button>
+              <strong className={biasPercent === 100 ? "" : "active"}>{biasPercent}%</strong>
+              <button type="button" className="secondary" onClick={() => void adjustBias(BIAS_STEP_PERCENT)}>+</button>
+              <button
+                type="button"
+                className={biasPercent === 100 ? "text-button bias-reset placeholder" : "text-button bias-reset"}
+                disabled={biasPercent === 100}
+                aria-hidden={biasPercent === 100}
+                tabIndex={biasPercent === 100 ? -1 : 0}
+                onClick={() => void perform(() => api.setBiasPercent(100), "reset workout bias")}
+              >
+                Reset
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    ),
+    powerChart: (
+      <div className="card live-chart">
+        <div className="chart-heading">
+          <div><span className="label">FULL SESSION</span><h3>Power</h3></div>
+          <button
+            type="button"
+            className="chart-collapse"
+            aria-expanded={powerChartExpanded}
+            aria-controls="ride-power-chart"
+            onClick={() => setPowerChartExpanded((expanded) => !expanded)}
+          >
+            {powerChartExpanded ? "Collapse" : "Expand"}
+            <ChevronDown size={17} />
+          </button>
+        </div>
+        {powerChartExpanded && (
+          <div id="ride-power-chart">
+            <SessionAreaChart
+              samples={chartHistory}
+              dataKey="displayPowerWatts"
+              unit="W"
+              color="#c8ff32"
+              name={powerSmoothing === "instant" ? "Power" : `Power (${powerSmoothingLabel[powerSmoothing]})`}
+              domain={[0, "dataMax + 50"]}
+            />
+            {openEnded
+              ? <div className="open-ended-time"><span>Elapsed</span><strong>{formatDuration(elapsed)}</strong><span>Open ended</span></div>
+              : <div className="progress-meta"><span>{formatDuration(elapsed)}</span><div className="progress"><i style={{ width: `${progress}%` }} /></div><span>-{formatDuration(Math.max(0, (total ?? 0) - elapsed))}</span></div>}
+          </div>
+        )}
+      </div>
+    ),
+    heartRateChart: (
+      <div className="card live-chart secondary-chart">
+        <div className="chart-heading">
+          <div><span className="label">FULL SESSION</span><h3>Heart rate</h3></div>
+          <button
+            type="button"
+            className="chart-collapse"
+            aria-expanded={heartRateChartExpanded}
+            aria-controls="ride-heart-rate-chart"
+            onClick={() => setHeartRateChartExpanded((expanded) => !expanded)}
+          >
+            {heartRateChartExpanded ? "Collapse" : "Expand"}
+            <ChevronDown size={17} />
+          </button>
+        </div>
+        {heartRateChartExpanded && (
+          <div id="ride-heart-rate-chart">
+            <SessionAreaChart
+              samples={chartHistory}
+              dataKey="heartRateBpm"
+              unit="bpm"
+              color="#ff6f7d"
+              name="Heart rate"
+              domain={["dataMin - 10", "dataMax + 10"]}
+            />
+          </div>
+        )}
+      </div>
+    ),
+    timeInZone: (
+      <div className="zone-chart-grid">
+        <TimeInZoneChart
+          title="Power zones"
+          zones={powerZones}
+          seconds={timeInZones(telemetryHistory, powerZones, "power")}
+        />
+        <TimeInZoneChart
+          title="Heart-rate zones"
+          zones={heartRateZones}
+          seconds={timeInZones(telemetryHistory, heartRateZones, "heartRate")}
+        />
+      </div>
+    ),
+  } satisfies Record<RideCardId, ReactNode>;
+
   return (
     <>
       {!active && <PageHeader eyebrow="TRAINING ROOM" title="Start a ride" />}
@@ -879,192 +1119,18 @@ export function Ride({
       ) : (
         <section className="live-ride">
           {runner.status === "countdown" && <div className="countdown">{runner.seconds}</div>}
-          <div className="metrics-grid">
-            <LiveMetric icon={Zap} label="POWER" value={displayedPower} unit="W" accent note={sourceNote(telemetry.sources?.power)}
-              control={
-                <span className="metric-control-group">
-                  <SourceSelect
-                    metric="power"
-                    choice={sourcePreferences.power}
-                    onChange={(choice) => onSourcePreference("power", choice)}
-                  />
-                  <label className="smoothing-select">
-                    <span className="sr-only">Power smoothing</span>
-                    <select value={powerSmoothing} onChange={(event) => onPowerSmoothing(event.target.value as PowerSmoothing)}>
-                      {powerSmoothingOptions.map((option) => (
-                        <option key={option} value={option}>{powerSmoothingLabel[option]}</option>
-                      ))}
-                    </select>
-                  </label>
-                </span>
-              } />
-            <LiveMetric
-              icon={RefreshCw}
-              label="CADENCE"
-              value={Math.round(telemetry.cadenceRpm ?? 0)}
-              unit="rpm"
-              note={sourceNote(telemetry.sources?.cadence)}
-              control={
-                <SourceSelect
-                  metric="cadence"
-                  choice={sourcePreferences.cadence}
-                  onChange={(choice) => onSourcePreference("cadence", choice)}
-                />
-              }
-            />
-            <LiveMetric icon={Gauge} label="SPEED" value={displayedSpeed.value} unit={displayedSpeed.unit} />
-            <LiveMetric icon={HeartPulse} label="HEART RATE" value={telemetry.heartRateBpm ?? "—"} unit="bpm" note={sourceNote(telemetry.sources?.heartRate)} />
-          </div>
-          {structured && workoutIntervals.length > 0 && (
-            <WorkoutTimeline
-              intervals={workoutIntervals}
-              workoutName={runner.workoutName}
-              currentIndex={runner.intervalIndex}
-              intervalElapsedSeconds={runner.intervalElapsedSeconds}
-              elapsedSeconds={elapsed}
-              totalSeconds={total ?? 0}
-              paused={runner.status === "paused"}
-              onSkip={() => void perform(() => api.skipInterval(), "skip interval")}
-            />
-          )}
-          <div className="card workout-controls-card">
-            <div className="workout-controls-heading">
-              <span className="label">TARGET &amp; BIAS</span>
-            </div>
-            <div className={adjustable ? "target-line editable" : "target-line"}>
-              <span>Target power</span>
-              {adjustable ? (
-                <div className="manual-erg-stepper">
-                  <button className="secondary" disabled={runner.status !== "running"} onClick={() => void adjustPower(-5)}>− 5 W</button>
-                  <label>
-                    <span className="sr-only">Target power in watts</span>
-                    <input
-                      type="number"
-                      min="1"
-                      max="65535"
-                      step="5"
-                      disabled={runner.status !== "running"}
-                      value={targetDraft}
-                      onChange={(event) => setTargetDraft(event.target.value)}
-                      onBlur={commitTargetPower}
-                      onKeyDown={(event) => {
-                        if (event.key === "Enter") {
-                          event.currentTarget.blur();
-                        }
-                      }}
-                    />
-                    <strong>W</strong>
-                  </label>
-                  <button className="secondary" disabled={runner.status !== "running"} onClick={() => void adjustPower(5)}>+ 5 W</button>
+          <div className="live-ride-grid">
+            {displayPreferences.cards.map((card) =>
+              card.visible ? (
+                <div
+                  className={card.id === "power" || card.id === "cadence" || card.id === "speed" || card.id === "heartRate" ? "ride-card-cell compact" : "ride-card-cell wide"}
+                  data-ride-card={card.id}
+                  key={card.id}
+                >
+                  {cardContent[card.id]}
                 </div>
-              ) : <strong>{targetPower ?? "Free"}{targetPower !== null ? " W" : ""}</strong>}
-              {adjustable && <span className="manual-erg-hint">{structured ? "Type watts or use ↑ / ↓ · Shift for bias" : "Type watts or use ↑ / ↓"}</span>}
-            </div>
-            {structured && (
-              <div className="plan-line">
-                <span className="plan-note">
-                  {manualErg
-                    ? "Free-ride block · manual ERG"
-                    : plannedTarget === null
-                      ? "No target in this block"
-                      : overrideActive
-                        ? `Plan ${plannedTarget} W · overridden for this block`
-                        : biasPercent !== 100
-                          ? `Plan ${plannedTarget} W · ${biasPercent}% bias`
-                          : `Plan ${plannedTarget} W`}
-                </span>
-                {overrideActive && (
-                  <button type="button" className="text-button" disabled={runner.status !== "running"} onClick={() => void backToPlan()}>
-                    Back to plan
-                  </button>
-                )}
-                <div className="bias-stepper" aria-label="Workout bias">
-                  <span>Bias</span>
-                  <button type="button" className="secondary" onClick={() => void adjustBias(-BIAS_STEP_PERCENT)}>−</button>
-                  <strong className={biasPercent === 100 ? "" : "active"}>{biasPercent}%</strong>
-                  <button type="button" className="secondary" onClick={() => void adjustBias(BIAS_STEP_PERCENT)}>+</button>
-                  <button
-                    type="button"
-                    className={biasPercent === 100 ? "text-button bias-reset placeholder" : "text-button bias-reset"}
-                    disabled={biasPercent === 100}
-                    aria-hidden={biasPercent === 100}
-                    tabIndex={biasPercent === 100 ? -1 : 0}
-                    onClick={() => void perform(() => api.setBiasPercent(100), "reset workout bias")}
-                  >
-                    Reset
-                  </button>
-                </div>
-              </div>
+              ) : null,
             )}
-          </div>
-          <div className="card live-chart">
-            <div className="chart-heading">
-              <div><span className="label">FULL SESSION</span><h3>Power</h3></div>
-              <button
-                type="button"
-                className="chart-collapse"
-                aria-expanded={powerChartExpanded}
-                aria-controls="ride-power-chart"
-                onClick={() => setPowerChartExpanded((expanded) => !expanded)}
-              >
-                {powerChartExpanded ? "Collapse" : "Expand"}
-                <ChevronDown size={17} />
-              </button>
-            </div>
-            {powerChartExpanded && (
-              <div id="ride-power-chart">
-                <SessionAreaChart
-                  samples={chartHistory}
-                  dataKey="displayPowerWatts"
-                  unit="W"
-                  color="#c8ff32"
-                  name={powerSmoothing === "instant" ? "Power" : `Power (${powerSmoothingLabel[powerSmoothing]})`}
-                  domain={[0, "dataMax + 50"]}
-                />
-                {openEnded
-                  ? <div className="open-ended-time"><span>Elapsed</span><strong>{formatDuration(elapsed)}</strong><span>Open ended</span></div>
-                  : <div className="progress-meta"><span>{formatDuration(elapsed)}</span><div className="progress"><i style={{ width: `${progress}%` }} /></div><span>-{formatDuration(Math.max(0, (total ?? 0) - elapsed))}</span></div>}
-              </div>
-            )}
-          </div>
-          <div className="card live-chart secondary-chart">
-            <div className="chart-heading">
-              <div><span className="label">FULL SESSION</span><h3>Heart rate</h3></div>
-              <button
-                type="button"
-                className="chart-collapse"
-                aria-expanded={heartRateChartExpanded}
-                aria-controls="ride-heart-rate-chart"
-                onClick={() => setHeartRateChartExpanded((expanded) => !expanded)}
-              >
-                {heartRateChartExpanded ? "Collapse" : "Expand"}
-                <ChevronDown size={17} />
-              </button>
-            </div>
-            {heartRateChartExpanded && (
-              <div id="ride-heart-rate-chart">
-                <SessionAreaChart
-                  samples={chartHistory}
-                  dataKey="heartRateBpm"
-                  unit="bpm"
-                  color="#ff6f7d"
-                  name="Heart rate"
-                  domain={["dataMin - 10", "dataMax + 10"]}
-                />
-              </div>
-            )}
-          </div>
-          <div className="zone-chart-grid">
-            <TimeInZoneChart
-              title="Power zones"
-              zones={powerZones}
-              seconds={timeInZones(telemetryHistory, powerZones, "power")}
-            />
-            <TimeInZoneChart
-              title="Heart-rate zones"
-              zones={heartRateZones}
-              seconds={timeInZones(telemetryHistory, heartRateZones, "heartRate")}
-            />
           </div>
         </section>
       )}
@@ -1092,6 +1158,18 @@ function HistoryPage({ sessions, selected, profile, trainingZones, onSelect, onC
 
 const KG_PER_LB = 0.45359237;
 
+const rideCardLabels: Record<RideCardId, string> = {
+  power: "Power",
+  cadence: "Cadence",
+  speed: "Speed",
+  heartRate: "Heart rate",
+  workoutTimeline: "Workout timeline",
+  targetAndBias: "Target & bias",
+  powerChart: "Power chart",
+  heartRateChart: "Heart-rate chart",
+  timeInZone: "Time in zone",
+};
+
 function displayedWeight(kg: number, unit: Profile["weightUnit"]) {
   return Number((unit === "lb" ? kg / KG_PER_LB : kg).toFixed(1));
 }
@@ -1103,24 +1181,31 @@ function storedWeight(value: number, unit: Profile["weightUnit"]) {
 export function SettingsPage({
   profile,
   trainingZones,
+  rideDisplayPreferences,
   perform,
   onProfileUpdate,
   onTrainingZonesUpdate,
   onSave,
   onSaveTrainingZones,
+  onSaveRideDisplayPreferences,
   onForgetDevices,
 }: {
   profile: Profile;
   trainingZones: TrainingZoneSettings;
+  rideDisplayPreferences: RideDisplayPreferences;
   perform: (action: () => Promise<unknown>, label?: string) => Promise<void>;
   onProfileUpdate: (profile: Profile) => void;
   onTrainingZonesUpdate: (zones: TrainingZoneSettings) => void;
   onSave: (profile: Profile) => void;
   onSaveTrainingZones: (zones: TrainingZoneSettings) => void;
+  onSaveRideDisplayPreferences: (preferences: RideDisplayPreferences) => void;
   onForgetDevices: () => Promise<void>;
 }) {
   const [draft, setDraft] = useState(profile);
   const [zoneDraft, setZoneDraft] = useState(trainingZones);
+  const [rideDisplayDraft, setRideDisplayDraft] = useState(
+    rideDisplayPreferences,
+  );
   const [logPath, setLogPath] = useState("Loading log location…");
   const [rideFilesPath, setRideFilesPath] = useState("Loading ride files location…");
   const [apiKey, setApiKey] = useState("");
@@ -1136,6 +1221,18 @@ export function SettingsPage({
   }, [perform]);
   useEffect(() => setDraft(profile), [profile]);
   useEffect(() => setZoneDraft(trainingZones), [trainingZones]);
+  useEffect(
+    () => setRideDisplayDraft(rideDisplayPreferences),
+    [rideDisplayPreferences],
+  );
+
+  const moveRideCard = (index: number, direction: -1 | 1) => {
+    const nextIndex = index + direction;
+    if (nextIndex < 0 || nextIndex >= rideDisplayDraft.cards.length) return;
+    const cards = [...rideDisplayDraft.cards];
+    [cards[index], cards[nextIndex]] = [cards[nextIndex], cards[index]];
+    setRideDisplayDraft({ version: 2, cards });
+  };
 
   const saveIntervalsKey = async () => {
     setIntervalsBusy("save");
@@ -1186,6 +1283,79 @@ export function SettingsPage({
         <div className="form-row"><label>Rider weight ({draft.weightUnit})<input type="number" step="0.1" min={draft.weightUnit === "lb" ? 66 : 30} max={draft.weightUnit === "lb" ? 551 : 250} value={displayedWeight(draft.riderWeightKg, draft.weightUnit)} onChange={(event) => setDraft({ ...draft, riderWeightKg: storedWeight(Number(event.target.value), draft.weightUnit) })}/></label><label>Bike weight ({draft.weightUnit})<input type="number" step="0.1" min={draft.weightUnit === "lb" ? 7 : 3} max={draft.weightUnit === "lb" ? 88 : 40} value={displayedWeight(draft.bikeWeightKg, draft.weightUnit)} onChange={(event) => setDraft({ ...draft, bikeWeightKg: storedWeight(Number(event.target.value), draft.weightUnit) })}/></label></div>
         <button className="primary" type="submit">Save settings</button>
       </form></section>
+      <section className="card settings-card">
+        <div>
+          <span className="label">RIDE LAYOUT</span>
+          <h2>Live ride cards</h2>
+          <p>Choose which cards appear during a ride and arrange them in the order you want.</p>
+        </div>
+        <div className="ride-layout-settings">
+          <div className="ride-card-list">
+            {rideDisplayDraft.cards.map((card, index) => (
+              <div className="ride-card-setting" key={card.id}>
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={card.visible}
+                    onChange={(event) => {
+                      const cards = rideDisplayDraft.cards.map((current) =>
+                        current.id === card.id
+                          ? { ...current, visible: event.target.checked }
+                          : current,
+                      );
+                      setRideDisplayDraft({ version: 2, cards });
+                    }}
+                  />
+                  <span>{rideCardLabels[card.id]}</span>
+                </label>
+                <div className="ride-card-order">
+                  <button
+                    type="button"
+                    className="icon-button"
+                    aria-label={`Move ${rideCardLabels[card.id]} up`}
+                    disabled={index === 0}
+                    onClick={() => moveRideCard(index, -1)}
+                  >
+                    <ChevronUp size={17} />
+                  </button>
+                  <button
+                    type="button"
+                    className="icon-button"
+                    aria-label={`Move ${rideCardLabels[card.id]} down`}
+                    disabled={index === rideDisplayDraft.cards.length - 1}
+                    onClick={() => moveRideCard(index, 1)}
+                  >
+                    <ChevronDown size={17} />
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+          <div className="settings-actions">
+            <button
+              type="button"
+              className="secondary"
+              onClick={() =>
+                setRideDisplayDraft({
+                  version: 2,
+                  cards: defaultRideDisplayPreferences.cards.map((card) => ({
+                    ...card,
+                  })),
+                })
+              }
+            >
+              Reset to default
+            </button>
+            <button
+              type="button"
+              className="primary"
+              onClick={() => onSaveRideDisplayPreferences(rideDisplayDraft)}
+            >
+              Save ride layout
+            </button>
+          </div>
+        </div>
+      </section>
       <section className="card settings-card">
         <div>
           <span className="label">TRAINING ZONES</span>

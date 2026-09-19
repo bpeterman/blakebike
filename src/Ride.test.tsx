@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { Ride } from "./App";
 import { defaultSourcePreferences } from "./sourcePreferences";
 import {
+  defaultRideDisplayPreferences,
   defaultTrainingZoneSettings,
   type Profile,
   type RunnerState,
@@ -95,6 +96,7 @@ describe("Ride charts", () => {
         onSourcePreference={vi.fn()}
         profile={profile}
         trainingZones={defaultTrainingZoneSettings}
+        displayPreferences={defaultRideDisplayPreferences}
         perform={async () => undefined}
       />,
     );
@@ -144,6 +146,7 @@ describe("Ride charts", () => {
       onSourcePreference: vi.fn(),
       profile,
       trainingZones: defaultTrainingZoneSettings,
+      displayPreferences: defaultRideDisplayPreferences,
       perform: async () => undefined,
     };
     const { rerender } = render(<Ride {...commonProps} runner={structuredRunner} />);
@@ -156,9 +159,9 @@ describe("Ride charts", () => {
     expect(screen.getByLabelText("Block 3 of 5, upcoming")).toHaveAttribute("data-state", "upcoming");
     expect(screen.getByText("0:20")).toBeInTheDocument();
     expect(screen.getByText("1:20")).toBeInTheDocument();
-    const timeline = screen.getByRole("button", { name: "Skip block" }).closest(".workout-timeline");
-    const controls = screen.getByText("TARGET & BIAS").closest(".workout-controls-card");
-    const powerChart = screen.getAllByText("FULL SESSION")[0].closest(".live-chart");
+    const timeline = screen.getByRole("button", { name: "Skip block" }).closest("[data-ride-card]");
+    const controls = screen.getByText("TARGET & BIAS").closest("[data-ride-card]");
+    const powerChart = screen.getAllByText("FULL SESSION")[0].closest("[data-ride-card]");
     expect(timeline?.nextElementSibling).toBe(controls);
     expect(controls?.nextElementSibling).toBe(powerChart);
     expect(screen.queryByRole("button", { name: "Pause" })).not.toBeInTheDocument();
@@ -172,5 +175,48 @@ describe("Ride charts", () => {
     rerender(<Ride {...commonProps} runner={pausedRunner} />);
     expect(screen.getByText("200 W · Paused")).toBeInTheDocument();
     expect(screen.getByText("0:20")).toBeInTheDocument();
+  });
+
+  it("hides cards and renders visible cards in the saved order", () => {
+    const displayPreferences = {
+      version: 2 as const,
+      cards: [
+        { id: "heartRate" as const, visible: true },
+        { id: "power" as const, visible: false },
+        { id: "speed" as const, visible: true },
+        ...defaultRideDisplayPreferences.cards.filter(
+          ({ id }) => !["heartRate", "power", "speed"].includes(id),
+        ).map((card) => ({ ...card, visible: false })),
+      ],
+    };
+    const { container } = render(
+      <Ride
+        workouts={[]}
+        selectedWorkout={null}
+        setSelectedWorkout={vi.fn()}
+        connected
+        onConnect={vi.fn()}
+        runner={runner}
+        telemetry={telemetry}
+        telemetryHistory={[telemetry]}
+        powerSmoothing="instant"
+        onPowerSmoothing={vi.fn()}
+        sourcePreferences={defaultSourcePreferences}
+        onSourcePreference={vi.fn()}
+        profile={profile}
+        trainingZones={defaultTrainingZoneSettings}
+        displayPreferences={displayPreferences}
+        perform={async () => undefined}
+      />,
+    );
+
+    expect(screen.queryByText("POWER")).not.toBeInTheDocument();
+    expect(screen.getByText("HEART RATE")).toBeInTheDocument();
+    expect(screen.getByText("SPEED")).toBeInTheDocument();
+    expect(
+      [...container.querySelectorAll("[data-ride-card]")].map((card) =>
+        card.getAttribute("data-ride-card"),
+      ),
+    ).toEqual(["heartRate", "speed"]);
   });
 });

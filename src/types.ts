@@ -226,8 +226,28 @@ export type TrainingZoneSettings = {
   heartRateZones: ZoneDefinition[];
 };
 
+export const rideCardIds = [
+  "power",
+  "cadence",
+  "speed",
+  "heartRate",
+  "workoutTimeline",
+  "targetAndBias",
+  "powerChart",
+  "heartRateChart",
+  "timeInZone",
+] as const;
+
+export type RideCardId = (typeof rideCardIds)[number];
+
+export type RideCardPreference = {
+  id: RideCardId;
+  visible: boolean;
+};
+
 export type RideDisplayPreferences = {
-  showTimeInZone: boolean;
+  version: 2;
+  cards: RideCardPreference[];
 };
 
 export const defaultTrainingZoneSettings: TrainingZoneSettings = {
@@ -240,8 +260,25 @@ export const defaultTrainingZoneSettings: TrainingZoneSettings = {
 };
 
 export const defaultRideDisplayPreferences: RideDisplayPreferences = {
-  showTimeInZone: false,
+  version: 2,
+  cards: rideCardIds.map((id) => ({ id, visible: true })),
 };
+
+export function normalizeRideDisplayPreferences(
+  preferences: RideDisplayPreferences,
+): RideDisplayPreferences {
+  const known = new Set<RideCardId>(rideCardIds);
+  const seen = new Set<RideCardId>();
+  const cards = preferences.cards.filter((card) => {
+    if (!known.has(card.id) || seen.has(card.id)) return false;
+    seen.add(card.id);
+    return true;
+  });
+  for (const id of rideCardIds) {
+    if (!seen.has(id)) cards.push({ id, visible: true });
+  }
+  return { version: 2, cards };
+}
 
 const zoneNames = (count: number) =>
   Array.from({ length: count }, (_, index) => `Zone ${index + 1}`);
