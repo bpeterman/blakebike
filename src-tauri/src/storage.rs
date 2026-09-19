@@ -227,7 +227,11 @@ pub struct RecoveryReport {
 }
 
 pub struct Storage {
+    /// The writer. Every mutation goes through here.
     connection: Mutex<Connection>,
+    /// A second connection for reads: WAL lets it run alongside the writer,
+    /// so a long History query never holds up the ride recorder.
+    reader: Mutex<Connection>,
 }
 
 impl Storage {
@@ -333,8 +337,10 @@ impl Storage {
             "distance_weight_kg",
             "REAL NOT NULL DEFAULT 84.0",
         )?;
+        let reader = Connection::open(path).map_err(|error| error.to_string())?;
         let storage = Self {
             connection: Mutex::new(connection),
+            reader: Mutex::new(reader),
         };
         storage.seed()?;
         Ok(storage)
@@ -350,6 +356,12 @@ impl Storage {
         self.connection
             .lock()
             .map_err(|_| "Database lock was poisoned".to_string())
+    }
+
+    fn reader(&self) -> Result<MutexGuard<'_, Connection>, String> {
+        self.reader
+            .lock()
+            .map_err(|_| "Database read lock was poisoned".to_string())
     }
 
     fn seed(&self) -> Result<(), String> {
@@ -390,7 +402,7 @@ impl Storage {
     }
 
     pub fn profile(&self) -> Result<Profile, String> {
-        self.connection()?
+        self.reader()?
             .query_row(
                 "SELECT id, name, ftp_watts, max_power_watts, rider_weight_kg, bike_weight_kg,
                  weight_unit, distance_unit, max_heart_rate_bpm
@@ -477,7 +489,7 @@ impl Storage {
 
     fn save_setting<T: serde::Serialize>(&self, key: &str, value: &T) -> Result<(), String> {
         let json = serde_json::to_string(value).map_err(|error| error.to_string())?;
-        self.connection()?
+        self.reader()?
             .execute(
                 "INSERT INTO settings(key, value_json) VALUES(?1, ?2)
                  ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json",
@@ -569,7 +581,7 @@ impl Storage {
 
     /// Remembered devices, most recently connected first.
     pub fn known_devices(&self) -> Result<Vec<KnownDevice>, String> {
-        let connection = self.connection()?;
+        let connection = self.reader()?;
         let mut statement = connection
             .prepare("SELECT payload_json FROM known_devices ORDER BY last_connected_at DESC")
             .map_err(|error| error.to_string())?;
@@ -601,7 +613,7 @@ impl Storage {
     }
 
     pub fn workouts(&self) -> Result<Vec<Workout>, String> {
-        let connection = self.connection()?;
+        let connection = self.reader()?;
         let mut statement = connection
             .prepare("SELECT payload_json FROM workouts ORDER BY updated_at DESC")
             .map_err(|error| error.to_string())?;
@@ -633,7 +645,7 @@ impl Storage {
     pub fn save_workout(&self, workout: &Workout) -> Result<(), String> {
         workout.validate()?;
         let payload = serde_json::to_string(workout).map_err(|error| error.to_string())?;
-        self.connection()?
+        self.reader()?
             .execute(
                 "INSERT INTO workouts(id, name, source, version, payload_json, created_at, updated_at)
                  VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
@@ -760,7 +772,7 @@ impl Storage {
     /// Sessions that never got a summary: the app died, or a ride aborted
     /// before it was closed out.
     pub fn unfinished_sessions(&self) -> Result<Vec<Uuid>, String> {
-        let connection = self.connection()?;
+        let connection = self.reader()?;
         let mut statement = connection
             .prepare("SELECT id FROM sessions WHERE ended_at IS NULL ORDER BY started_at")
             .map_err(|error| error.to_string())?;
@@ -884,7 +896,7 @@ impl Storage {
     }
 
     pub fn sessions(&self) -> Result<Vec<SessionSummary>, String> {
-        let connection = self.connection()?;
+        let connection = self.reader()?;
         let mut statement = connection
             .prepare(
                 "SELECT id, workout_id, workout_name, started_at, ended_at, elapsed_seconds,
@@ -901,7 +913,7 @@ impl Storage {
     }
 
     pub fn session(&self, id: Uuid) -> Result<Option<SessionDetail>, String> {
-        let connection = self.connection()?;
+        let connection = self.reader()?;
         let summary = connection
             .query_row(
                 "SELECT id, workout_id, workout_name, started_at, ended_at, elapsed_seconds,
