@@ -355,7 +355,7 @@ export const effectiveHeartRateZones = (
     ? settings.heartRateZones
     : derivedHeartRateZones(maxHeartRateBpm);
 
-export const zoneIndex = (value: number, zones: ZoneDefinition[]): number =>
+export const zoneIndex = (value: number, zones: readonly ZoneDefinition[]): number =>
   zones.findIndex((zone) => zone.upperBound === null || value <= zone.upperBound);
 
 export const timeInZones = (

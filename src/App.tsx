@@ -111,6 +111,7 @@ import { defaultSourcePreferences, withSourcePreference } from "./sourcePreferen
 import { shouldPromptForPostRide } from "./postRide";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { useDialog } from "./useDialog";
+import { zoneColorAt } from "./zones";
 import "./App.css";
 
 type Page = "home" | "workouts" | "devices" | "ride" | "history" | "settings";
@@ -1915,19 +1916,6 @@ const chartTooltipLabelStyle = { color: "#c9d0c3", fontSize: 12, marginBottom: 4
 const chartTooltipItemStyle = { fontSize: 13, padding: 0 } as const;
 const chartTooltipCursor = { stroke: "#6b7566", strokeWidth: 1 } as const;
 
-const zoneColors = [
-  "#6ca8ff",
-  "#63d6c6",
-  "#c8ff32",
-  "#f4d35e",
-  "#ff9f43",
-  "#ff6f7d",
-  "#c77dff",
-  "#9d6b53",
-  "#d0d5ce",
-  "#ffffff",
-];
-
 const formatChartTime = (value: unknown) =>
   formatDuration(Math.max(0, Math.round(Number(value) / 1000)));
 
@@ -2054,7 +2042,7 @@ const TimeInZoneChart = memo(function TimeInZoneChart({
   const data = zones.map((zone, index) => ({
     name: zone.name,
     seconds: Math.round(seconds[index] ?? 0),
-    fill: zoneColors[index % zoneColors.length],
+    fill: zoneColorAt(index),
   }));
   return (
     <div className="card zone-chart">
@@ -2106,7 +2094,7 @@ function ZoneEditor({
       <div className="zone-boundaries">
         {zones.map((zone, index) => (
           <div className="zone-boundary" key={`${title}-${index}`}>
-            <i style={{ background: zoneColors[index % zoneColors.length] }} />
+            <i style={{ background: zoneColorAt(index) }} />
             <input
               aria-label={`${title} zone ${index + 1} name`}
               value={zone.name}
