@@ -67,9 +67,20 @@ changelog. Nothing is published unless the tag matches the committed version.
 ## What people download
 
 The dmg is **not signed or notarized** — there is no Apple Developer account
-behind it yet. On first launch macOS will refuse to open it, and the release
-notes tell people the workaround: right-click the app in Applications and choose
-**Open**. Gatekeeper only asks once.
+behind it yet, so the bundle carries only an ad-hoc signature and `spctl`
+rejects it with "no usable signature". On first launch macOS says it could not
+verify the app, and the release notes walk people through **System Settings >
+Privacy & Security > Open Anyway**. Gatekeeper only asks once.
+
+Control-clicking the app and choosing **Open** does not work: Apple removed that
+bypass in macOS Sequoia, and it never applied to ad-hoc-signed bundles. The
+fallback for anyone the Open Anyway button fails is
+`xattr -dr com.apple.quarantine /Applications/blake.bike.app`.
+
+Updates are manual. People download the newer dmg and replace the app; rides and
+settings live in `~/Library/Application Support/com.bpeterman.blakebike`, which
+replacing the bundle does not touch. Nothing in the app checks for new versions
+yet.
 
 To make it just work later: buy the $99/year Apple Developer membership, create
 a Developer ID Application certificate, add `APPLE_CERTIFICATE`,

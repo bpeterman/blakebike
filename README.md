@@ -19,9 +19,28 @@ FTMS smart trainers. The initial target platforms are macOS and Ubuntu/Pop!_OS
 ## Installing a release
 
 Downloads live on the [releases page](https://github.com/bpeterman/blakebike/releases).
-The macOS dmg is not notarized yet, so the first launch needs a nudge:
-right-click **blake.bike.app** in Applications and choose **Open**, then confirm.
-macOS only asks once.
+The dmg is universal, so one download covers Apple Silicon and Intel Macs.
+
+The build is not signed or notarized by Apple, so macOS blocks the first launch
+with "Apple could not verify blake.bike is free of malware". To allow it:
+
+1. Double-click **blake.bike** in Applications, then click **Done** on the warning.
+2. Open **System Settings > Privacy & Security** and scroll down to Security.
+3. Next to "blake.bike was blocked to protect your Mac", click **Open Anyway** and authenticate.
+4. Click **Open** in the confirmation dialog.
+
+macOS only asks once. Control-clicking the app and choosing **Open** does *not*
+work here — Apple removed that bypass. If the Open Anyway button never appears,
+clear the quarantine flag instead:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/blake.bike.app
+```
+
+To update later, quit the app and drag the newer copy over the one in
+Applications. Rides, workouts, and settings live in
+`~/Library/Application Support/com.bpeterman.blakebike`, so replacing the app
+leaves them alone, and Gatekeeper does not ask again.
 
 Every release is described in [CHANGELOG.md](CHANGELOG.md), and the same notes
 are visible in the app under Settings, on the About card.

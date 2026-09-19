@@ -40,8 +40,26 @@ jobs:
             echo
             echo '---'
             echo
-            echo 'This build is not signed or notarized by Apple. macOS will refuse to open it on the first try:'
-            echo 'right-click **blake.bike.app** in Applications and choose **Open**, then confirm.'
+            echo '## Installing'
+            echo
+            echo 'Open the dmg and drag **blake.bike** to Applications. The build is not signed or'
+            echo 'notarized, so macOS blocks the first launch with "Apple could not verify blake.bike'
+            echo 'is free of malware". To allow it:'
+            echo
+            echo '1. Double-click **blake.bike** in Applications, then click **Done** on the warning.'
+            echo '2. Open **System Settings > Privacy & Security** and scroll down to Security.'
+            echo '3. Next to "blake.bike was blocked to protect your Mac", click **Open Anyway** and authenticate.'
+            echo '4. Click **Open** in the confirmation dialog.'
+            echo
+            echo 'macOS only asks once. Control-clicking the app and choosing **Open** does *not* work.'
+            echo
+            echo '## Updating'
+            echo
+            echo 'Quit blake.bike, then drag the newer copy over the one in Applications. Rides,'
+            echo 'workouts and settings live in `~/Library/Application Support/com.bpeterman.blakebike`'
+            echo 'and are left alone.'
+            echo
+            echo 'The dmg is universal: native on both Apple Silicon and Intel Macs.'
             echo 'CHANGELOG_EOF'
           } >> "$GITHUB_OUTPUT"
 
