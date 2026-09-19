@@ -30,6 +30,7 @@ vi.mock("./api", () => ({
     disconnectDevice: vi.fn(() => Promise.resolve()),
     connectDevice: vi.fn(() => Promise.resolve()),
     knownDevices: vi.fn(() => Promise.resolve(knownDevices)),
+    connectKnownDevices: vi.fn(() => Promise.resolve([])),
     forgetDevice: vi.fn(() => Promise.resolve()),
     restoreKnownDevices: vi.fn(() => Promise.resolve()),
   },
@@ -218,6 +219,42 @@ describe("DevicesPage", () => {
     expect(onOfferUndo).toHaveBeenCalledWith("“HRM-Pro” forgotten.", expect.any(Function));
     await onOfferUndo.mock.calls[0][1]();
     expect(api.restoreKnownDevices).toHaveBeenCalledWith([knownDevices[1]]);
+  });
+
+  it("connects every remembered device at once and reports a sleeper softly", async () => {
+    vi.mocked(api.connectKnownDevices).mockResolvedValueOnce([
+      { role: "trainer", name: "KICKR CORE", status: "skipped", error: null },
+      { role: "heartRate", name: "HRM-Pro", status: "failed", error: "Device was not seen within 10s" },
+    ]);
+    const onNotice = vi.fn();
+    const outcomes: unknown[] = [];
+    const recordingPerform = async (action: () => Promise<unknown>) => {
+      outcomes.push(await action());
+    };
+    render(<DevicesPage hub={snapshot} sources={snapshot.sources} onConnect={vi.fn()} onCalibrate={vi.fn()} onSourcePreference={vi.fn()} onNotice={onNotice} perform={recordingPerform} />);
+    const button = await screen.findByRole("button", { name: "Connect all" });
+    // The strap's role is free, so there is something to do.
+    expect(button).toBeEnabled();
+    fireEvent.click(button);
+    await waitFor(() => expect(api.connectKnownDevices).toHaveBeenCalledOnce());
+    await waitFor(() => expect(onNotice).toHaveBeenCalledWith(expect.stringContaining("Heart rate (HRM-Pro) didn’t answer")));
+    // A soft outcome suppresses the generic success toast.
+    expect(outcomes).toEqual([null]);
+    expect(onNotice.mock.calls[0][0]).not.toContain("10s");
+    await waitFor(() => expect(screen.getByRole("button", { name: "Connect all" })).toBeEnabled());
+  });
+
+  it("has nothing to connect when every remembered role is already taken", async () => {
+    const allTaken: DevicesSnapshot = {
+      ...snapshot,
+      slots: snapshot.slots.map((slot) =>
+        slot.role === "heartRate"
+          ? { ...slot, state: { status: "ready", device: { id: "strap", name: "HRM-Pro", simulated: false, rssi: -60, capabilities: ["heartRate"] } } }
+          : slot,
+      ),
+    };
+    render(<DevicesPage hub={allTaken} sources={allTaken.sources} onConnect={vi.fn()} onCalibrate={vi.fn()} onSourcePreference={vi.fn()} perform={perform} />);
+    expect(await screen.findByRole("button", { name: "Connect all" })).toBeDisabled();
   });
 
   it("shows the ANT adapter card at the bottom and expands the HR connect action only when ready", () => {

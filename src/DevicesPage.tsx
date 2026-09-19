@@ -14,12 +14,14 @@ import {
 } from "lucide-react";
 import { api } from "./api";
 import {
+  connectAllSummary,
   deviceName,
   formatAge,
   formatClock,
   formatRelativeDate,
   formatUptime,
   isConnected,
+  knownToDeviceInfo,
   makeAndModel,
   transportLabel,
   metricsFedBy,
@@ -62,6 +64,7 @@ export function DevicesPage({
   onCalibrate,
   onSourcePreference,
   onOfferUndo = () => undefined,
+  onNotice = () => undefined,
   perform,
 }: {
   hub: DevicesSnapshot | null;
@@ -70,6 +73,8 @@ export function DevicesPage({
   onCalibrate: () => void;
   onSourcePreference: (metric: Metric, choice: SourceChoice) => void;
   onOfferUndo?: (message: string, action: () => Promise<void>) => void;
+  /** A calm, dismissable line that is not an error. */
+  onNotice?: (message: string) => void;
   perform: (action: () => Promise<unknown>, label?: string) => Promise<void>;
 }) {
   const [known, setKnown] = useState<KnownDevice[]>([]);
@@ -97,6 +102,31 @@ export function DevicesPage({
   const connectedCount = slots.filter((slot) => isConnected(slot.state)).length;
   const liveSources = sources ?? hub?.sources;
   const antReady = hub?.antAdapter.status === "ready";
+
+  // "Connect all" has work to do when some remembered role is free.
+  const [connectingAll, setConnectingAll] = useState(false);
+  const roleIsFree = (role: DeviceRole) => {
+    const status = slots.find((slot) => slot.role === role)?.state.status;
+    return status !== "ready" && status !== "controlling" && status !== "connecting";
+  };
+  const canConnectAll = !connectingAll && known.some((device) => roleIsFree(device.role));
+  const connectAll = async () => {
+    setConnectingAll(true);
+    try {
+      await perform(async () => {
+        const outcomes = await api.connectKnownDevices();
+        const summary = connectAllSummary(outcomes);
+        if (summary) {
+          onNotice(summary);
+          // Not a clean success: skip the "Connected and ready" toast.
+          return null;
+        }
+        return outcomes.some((outcome) => outcome.status === "connected") ? true : null;
+      }, "connect all known devices");
+    } finally {
+      setConnectingAll(false);
+    }
+  };
 
   return (
     <>
@@ -127,6 +157,14 @@ export function DevicesPage({
               <h2>Connect again with one click</h2>
             </div>
             <p>Remembered from earlier sessions. A device that drops out reconnects on its own: for as long as a ride is running, otherwise for about a minute.</p>
+            <button
+              className="primary"
+              disabled={!canConnectAll}
+              title="Connect the most recently used device for every role that has nothing connected"
+              onClick={() => void connectAll()}
+            >
+              {connectingAll ? "Connecting…" : "Connect all"}
+            </button>
           </div>
           <div className="known-list">
             {known.map((device) => {
@@ -155,14 +193,7 @@ export function DevicesPage({
                     <button
                       className="primary"
                       disabled={busy}
-                      onClick={() => void perform(() => api.connectDevice(device.role, {
-                        id: device.id,
-                        name: device.name,
-                        transport: device.transport,
-                        simulated: device.simulated,
-                        rssi: null,
-                        capabilities: device.capabilities,
-                      }), `connect known ${device.role}: ${device.name}`)}
+                      onClick={() => void perform(() => api.connectDevice(device.role, knownToDeviceInfo(device)), `connect known ${device.role}: ${device.name}`)}
                     >
                       {busy ? "Connecting…" : "Connect"}
                     </button>

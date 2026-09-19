@@ -12,8 +12,8 @@ use uuid::Uuid;
 use crate::{
     AppState,
     devices::{
-        DeviceInfo, DeviceLogLine, DeviceRole, DeviceState, DevicesSnapshot, KnownDevice,
-        SourcePreferences,
+        DeviceInfo, DeviceLogLine, DeviceRole, DeviceState, DevicesSnapshot, KnownConnectOutcome,
+        KnownConnectStatus, KnownDevice, SourcePreferences,
     },
     domain::{Profile, SessionDetail, SessionSummary, Workout},
     fit::ensure_ride_file,
@@ -115,17 +115,40 @@ pub async fn connect_device(
     Ok(())
 }
 
-#[tauri::command]
-pub fn known_devices(state: State<'_, AppState>) -> Result<Vec<KnownDevice>, String> {
+/// The remembered devices the rider can see right now. A simulator remembered
+/// from a developer-mode session should not offer itself once developer mode
+/// is off.
+fn visible_known_devices(state: &State<'_, AppState>) -> Result<Vec<KnownDevice>, String> {
     let dev_mode = state.storage.dev_mode()?;
     Ok(state
         .storage
         .known_devices()?
         .into_iter()
-        // A simulator remembered from a developer-mode session should not
-        // offer itself once developer mode is off.
         .filter(|device| dev_mode || !device.simulated)
         .collect())
+}
+
+#[tauri::command]
+pub fn known_devices(state: State<'_, AppState>) -> Result<Vec<KnownDevice>, String> {
+    visible_known_devices(&state)
+}
+
+/// "Connect all": bring back every remembered device whose role is free.
+/// Succeeds even when some devices do not answer; each outcome is in the
+/// result so the UI can stay calm about a sleeping sensor.
+#[tauri::command]
+pub async fn connect_known_devices(
+    state: State<'_, AppState>,
+) -> Result<Vec<KnownConnectOutcome>, String> {
+    tracing::info!("command connect_known_devices");
+    let known = visible_known_devices(&state)?;
+    let outcomes = state.devices.connect_known(&known).await;
+    for outcome in &outcomes {
+        if outcome.status == KnownConnectStatus::Connected {
+            remember(&state, outcome.role).await;
+        }
+    }
+    Ok(outcomes)
 }
 
 #[tauri::command]

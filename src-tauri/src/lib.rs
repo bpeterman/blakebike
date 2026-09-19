@@ -183,6 +183,7 @@ pub fn run() {
             commands::get_source_preferences,
             commands::set_source_preferences,
             commands::known_devices,
+            commands::connect_known_devices,
             commands::forget_device,
             commands::forget_all_devices,
             commands::restore_known_devices,

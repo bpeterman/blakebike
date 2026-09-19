@@ -49,6 +49,7 @@ For each of Trainer, Heart rate, Power meter, Cadence sensor:
 - [ ] **E1 · Remembered.** After connecting all four, quit and relaunch. Devices page lists all four under Known devices with make · model and "last used …", none connected.
 - [ ] **E2 · One-click connect.** Press Connect on a remembered device that is awake, without scanning first. Expected: connects within ~10 s via the targeted scan. Press Connect on one that is asleep: "Device not found" after 10 s with the wake-it-up guidance, card in Error state, no crash.
 - [ ] **E3 · Forget.** Forget one device: row disappears, the device stays connected if it was. Settings → Forget all devices: list empties. Reconnecting a forgotten device re-adds it.
+- [ ] **E5 · Connect all.** With four remembered devices and none connected, press Connect all. Expected: the roles connect one after another (trainer first), each card moving through Connecting → Connected; the button reads "Connecting…" meanwhile and is disabled once every remembered role is connected. Leave one sensor asleep: the others still connect, a calm line names the sleeping one ("… didn't answer, probably asleep …") with no red error banner, and pressing Connect on its card once it is awake works. A role that is already connected is left untouched.
 - [ ] **E4 · Source preference survives relaunch.** Pin a source, relaunch, check the selector still shows it.
 
 ## F. Recovery and shutdown

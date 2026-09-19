@@ -206,6 +206,40 @@ pub struct KnownDevice {
     pub last_connected_at: chrono::DateTime<Utc>,
 }
 
+impl KnownDevice {
+    /// The device as a connect needs it. A remembered device has no current
+    /// advertisement, so its signal strength is unknown.
+    pub fn to_device_info(&self) -> DeviceInfo {
+        DeviceInfo {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            transport: self.transport,
+            simulated: self.simulated,
+            rssi: None,
+            capabilities: self.capabilities.clone(),
+        }
+    }
+}
+
+/// What happened to one remembered device during a connect-all.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct KnownConnectOutcome {
+    pub role: DeviceRole,
+    pub name: String,
+    pub status: KnownConnectStatus,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum KnownConnectStatus {
+    Connected,
+    /// The role already had a device connected or connecting; left alone.
+    Skipped,
+    Failed,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeviceLogEvent {
@@ -1042,6 +1076,48 @@ impl DeviceHub {
         result
     }
 
+    /// Connect the most recently used remembered device of every role that
+    /// has nothing connected or connecting, in `DeviceRole::ALL` order. A
+    /// device that does not answer never stops the others; each outcome is
+    /// reported and the caller decides how loudly to surface it.
+    pub async fn connect_known(&self, known: &[KnownDevice]) -> Vec<KnownConnectOutcome> {
+        let mut outcomes = Vec::new();
+        for role in DeviceRole::ALL {
+            let Some(device) = known
+                .iter()
+                .filter(|device| device.role == role)
+                .max_by_key(|device| device.last_connected_at)
+            else {
+                continue;
+            };
+            let state = self.slot(role).state().await;
+            if state.is_connected() || matches!(state, DeviceState::Connecting { .. }) {
+                tracing::info!(?role, name = %device.name, "Connect all: role busy; skipped");
+                outcomes.push(KnownConnectOutcome {
+                    role,
+                    name: device.name.clone(),
+                    status: KnownConnectStatus::Skipped,
+                    error: None,
+                });
+                continue;
+            }
+            let (status, error) = match self.connect(role, device.to_device_info()).await {
+                Ok(()) => (KnownConnectStatus::Connected, None),
+                Err(error) => {
+                    tracing::warn!(?role, name = %device.name, error = %error, "Connect all: device did not answer");
+                    (KnownConnectStatus::Failed, Some(error))
+                }
+            };
+            outcomes.push(KnownConnectOutcome {
+                role,
+                name: device.name.clone(),
+                status,
+                error,
+            });
+        }
+        outcomes
+    }
+
     /// Build the record to remember after a successful connect: the device as
     /// connected plus whatever Device Information it exposed.
     pub async fn remember(&self, role: DeviceRole) -> Option<KnownDevice> {
@@ -1497,6 +1573,85 @@ mod tests {
         assert_eq!(known.model.as_deref(), Some("Simulator"));
         assert_eq!(known.capabilities, vec![Capability::Ftms]);
         hub.disconnect().await;
+    }
+
+    #[tokio::test]
+    async fn connect_known_takes_the_latest_per_role_and_carries_on_past_failures() {
+        let hub = DeviceHub::default();
+        let remembered = |device: DeviceInfo, role: DeviceRole, age_secs: i64| KnownDevice {
+            id: device.id,
+            name: device.name,
+            transport: device.transport,
+            role,
+            capabilities: device.capabilities,
+            simulated: device.simulated,
+            manufacturer: None,
+            model: None,
+            last_connected_at: Utc::now() - chrono::Duration::seconds(age_secs),
+        };
+        let real = |id: &str, name: &str, capability: Capability| DeviceInfo {
+            id: id.into(),
+            name: name.into(),
+            transport: DeviceTransport::Ble,
+            simulated: false,
+            rssi: None,
+            capabilities: vec![capability],
+        };
+        // The strap is already connected: connect-all must leave it alone.
+        hub.connect(DeviceRole::HeartRate, heart_rate::simulated_device())
+            .await
+            .unwrap();
+        let known = vec![
+            // An older real trainer listed first; the newer simulator must win.
+            remembered(
+                real("old-kickr", "Old KICKR", Capability::Ftms),
+                DeviceRole::Trainer,
+                3_600,
+            ),
+            remembered(
+                trainer::simulated_devices().remove(0),
+                DeviceRole::Trainer,
+                60,
+            ),
+            remembered(heart_rate::simulated_device(), DeviceRole::HeartRate, 60),
+            // Not reachable here (no adapter): fails, but the cadence sensor after it still connects.
+            remembered(
+                real("pm", "Assioma", Capability::CyclingPower),
+                DeviceRole::Power,
+                60,
+            ),
+            remembered(cadence::simulated_device(), DeviceRole::Cadence, 60),
+        ];
+        let outcomes = hub.connect_known(&known).await;
+        let statuses: Vec<_> = outcomes
+            .iter()
+            .map(|outcome| (outcome.role, outcome.status))
+            .collect();
+        assert_eq!(
+            statuses,
+            vec![
+                (DeviceRole::Trainer, KnownConnectStatus::Connected),
+                (DeviceRole::HeartRate, KnownConnectStatus::Skipped),
+                (DeviceRole::Power, KnownConnectStatus::Failed),
+                (DeviceRole::Cadence, KnownConnectStatus::Connected),
+            ]
+        );
+        assert_eq!(outcomes[0].name, "BlakeBike Simulator");
+        assert!(outcomes[2].error.is_some());
+        assert_eq!(
+            hub.slot(DeviceRole::Trainer)
+                .state()
+                .await
+                .device()
+                .unwrap()
+                .id,
+            trainer::SIMULATED_TRAINER_ID
+        );
+        assert!(hub.slot(DeviceRole::Cadence).state().await.is_connected());
+        // Nothing remembered for a role is simply not mentioned; nothing
+        // connected means nothing to do.
+        hub.disconnect().await;
+        assert!(hub.connect_known(&[]).await.is_empty());
     }
 
     #[tokio::test]
