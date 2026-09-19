@@ -12,8 +12,8 @@ use uuid::Uuid;
 use crate::{
     AppState,
     devices::{
-        DeviceInfo, DeviceLogLine, DeviceRole, DeviceState, DevicesSnapshot, KnownConnectOutcome,
-        KnownConnectStatus, KnownDevice, SourcePreferences,
+        CalibrationRecord, DeviceInfo, DeviceLogLine, DeviceRole, DeviceState, DevicesSnapshot,
+        KnownConnectOutcome, KnownConnectStatus, KnownDevice, SourcePreferences,
     },
     domain::{Profile, SessionDetail, SessionSummary, Workout},
     fit::ensure_ride_file,
@@ -72,13 +72,26 @@ pub async fn connect_trainer(state: State<'_, AppState>, device: DeviceInfo) -> 
     Ok(())
 }
 
-/// Persist a just-connected device so it shows up under Known devices. Never
-/// fails the connect: a storage hiccup is logged and the ride goes on.
+/// Persist a just-connected device so it shows up under Known devices, and
+/// hand the slot the calibration record kept for it so the card can say when
+/// it was last zeroed. Never fails the connect: a storage hiccup is logged
+/// and the ride goes on.
 async fn remember(state: &State<'_, AppState>, role: DeviceRole) {
-    if let Some(device) = state.devices.remember(role).await
-        && let Err(error) = state.storage.remember_device(&device)
-    {
+    let Some(device) = state.devices.remember(role).await else {
+        return;
+    };
+    if let Err(error) = state.storage.remember_device(&device) {
         tracing::warn!(?role, error = %error, "Could not remember device");
+    }
+    match state.storage.known_devices() {
+        Ok(known) => {
+            let record = known
+                .into_iter()
+                .find(|candidate| candidate.id == device.id)
+                .and_then(|candidate| candidate.last_calibration);
+            state.devices.slot(role).record_calibration(record).await;
+        }
+        Err(error) => tracing::warn!(?role, error = %error, "Could not load calibration record"),
     }
 }
 
@@ -185,6 +198,9 @@ pub fn restore_known_devices(
 ) -> Result<(), String> {
     for device in devices {
         state.storage.remember_device(&device)?;
+        if let Some(record) = &device.last_calibration {
+            state.storage.record_calibration(&device.id, record)?;
+        }
     }
     Ok(())
 }
@@ -196,10 +212,34 @@ pub async fn disconnect_device(state: State<'_, AppState>, role: DeviceRole) -> 
     Ok(())
 }
 
+/// Run the calibration a role's device offers (trainer spin-down, power
+/// meter zero offset) and keep the result with the remembered device. The
+/// record comes back so the dialog can show it without waiting on events.
 #[tauri::command]
-pub async fn calibrate_trainer(state: State<'_, AppState>) -> Result<(), String> {
-    tracing::info!("command calibrate_trainer");
-    state.devices.calibrate_trainer().await
+pub async fn calibrate_device(
+    state: State<'_, AppState>,
+    role: DeviceRole,
+) -> Result<CalibrationRecord, String> {
+    tracing::info!(?role, "command calibrate_device");
+    let record = state.devices.calibrate(role).await?;
+    if let Some(device) = state.devices.slot(role).state().await.device() {
+        match state.storage.record_calibration(&device.id, &record) {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!(?role, id = %device.id, "Calibrated a device that is not remembered; record not kept")
+            }
+            Err(error) => {
+                tracing::warn!(?role, error = %error, "Could not store calibration record")
+            }
+        }
+    }
+    Ok(record)
+}
+
+#[tauri::command]
+pub fn cancel_calibration(state: State<'_, AppState>, role: DeviceRole) -> Result<(), String> {
+    tracing::info!(?role, "command cancel_calibration");
+    state.devices.cancel_calibration(role)
 }
 
 #[tauri::command]
@@ -815,39 +855,63 @@ pub fn report_client_event(context: String, message: String) {
     tracing::info!(context = %context, detail = %message, "Frontend event");
 }
 
-/// Make the simulated trainer fail on purpose (debug builds only), so link
-/// loss and control failures can be rehearsed in the running app:
-/// `failWrites` with a count, or `dropLink`.
+/// Make a simulated device fail on purpose (debug builds only), so link loss,
+/// control failures and calibration refusals can be rehearsed in the running
+/// app. Trainer: `failWrites`, `writeDelayMs`, `ackDelayMs`, `refuseWith`,
+/// `failConnects`, `dropLink`. Sensors (power meter, heart rate, cadence):
+/// `refuseWith` (Cycling Power result code, 4 = operation failed) and
+/// `ackDelayMs` for the next procedure. `role` defaults to the trainer.
 #[tauri::command]
-pub fn debug_inject_trainer_fault(
+pub fn debug_inject_device_fault(
     state: State<'_, AppState>,
+    role: Option<DeviceRole>,
     kind: String,
     count: Option<u32>,
 ) -> Result<(), String> {
     if !cfg!(debug_assertions) {
         return Err("Fault injection is only available in debug builds".into());
     }
-    let faults = state.devices.simulated_faults();
-    match kind.as_str() {
-        "failWrites" => faults
-            .fail_writes
-            .store(count.unwrap_or(1), Ordering::Relaxed),
-        "writeDelayMs" => faults
-            .write_delay_ms
-            .store(u64::from(count.unwrap_or(0)), Ordering::Relaxed),
-        "ackDelayMs" => faults
-            .ack_delay_ms
-            .store(u64::from(count.unwrap_or(0)), Ordering::Relaxed),
-        "refuseWith" => faults
-            .refuse_with
-            .store(count.unwrap_or(4).min(255) as u8, Ordering::Relaxed),
-        "failConnects" => faults
-            .fail_connects
-            .store(count.unwrap_or(1), Ordering::Relaxed),
-        "dropLink" => faults.drop_link.notify_one(),
-        other => return Err(format!("Unknown trainer fault: {other}")),
+    let role = role.unwrap_or(DeviceRole::Trainer);
+    match role {
+        DeviceRole::Trainer => {
+            let faults = state.devices.simulated_faults();
+            match kind.as_str() {
+                "failWrites" => faults
+                    .fail_writes
+                    .store(count.unwrap_or(1), Ordering::Relaxed),
+                "writeDelayMs" => faults
+                    .write_delay_ms
+                    .store(u64::from(count.unwrap_or(0)), Ordering::Relaxed),
+                "ackDelayMs" => faults
+                    .ack_delay_ms
+                    .store(u64::from(count.unwrap_or(0)), Ordering::Relaxed),
+                "refuseWith" => faults
+                    .refuse_with
+                    .store(count.unwrap_or(4).min(255) as u8, Ordering::Relaxed),
+                "failConnects" => faults
+                    .fail_connects
+                    .store(count.unwrap_or(1), Ordering::Relaxed),
+                "dropLink" => faults.drop_link.notify_one(),
+                other => return Err(format!("Unknown trainer fault: {other}")),
+            }
+        }
+        sensor => {
+            let faults = state
+                .devices
+                .simulated_sensor_faults(sensor)
+                .ok_or_else(|| format!("{} has no simulated faults", sensor.label()))?;
+            match kind.as_str() {
+                "refuseWith" => faults
+                    .refuse_with
+                    .store(count.unwrap_or(4).min(255) as u8, Ordering::Relaxed),
+                "ackDelayMs" => faults
+                    .ack_delay_ms
+                    .store(u64::from(count.unwrap_or(0)), Ordering::Relaxed),
+                other => return Err(format!("Unknown sensor fault: {other}")),
+            }
+        }
     }
-    tracing::warn!(kind, count, "Injected simulated trainer fault");
+    tracing::warn!(?role, kind, count, "Injected simulated device fault");
     Ok(())
 }
 

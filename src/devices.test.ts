@@ -1,7 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
+  calibrationSummary,
+  calibrationUnavailable,
+  calibrationVerb,
   connectAllSummary,
   deviceFitsRole,
+  driftLabel,
+  offsetDrift,
+  zeroOffsetIsDue,
   deviceName,
   knownToDeviceInfo,
   formatAge,
@@ -15,7 +21,7 @@ import {
   deviceTransport,
   transportLabel,
 } from "./devices";
-import type { DeviceInfo, DeviceState, KnownConnectOutcome } from "./types";
+import type { CalibrationRecord, DeviceInfo, DeviceState, KnownConnectOutcome } from "./types";
 
 const device = (capabilities?: DeviceInfo["capabilities"]): DeviceInfo => ({
   id: "x",
@@ -153,5 +159,62 @@ describe("connect all", () => {
     expect(connectAllSummary([outcome("power", "Assioma", "failed"), outcome("cadence", "Wahoo RPM", "failed")])).toBe(
       "Power meter (Assioma) and cadence sensor (Wahoo RPM) didn’t answer, probably asleep. Wake them and press Connect on their card.",
     );
+  });
+});
+
+describe("calibration", () => {
+  const zero = (offsetRaw: number | null, ageMs = 0): CalibrationRecord => ({
+    at: new Date(Date.now() - ageMs).toISOString(),
+    kind: "zeroOffset",
+    offsetRaw,
+  });
+
+  it("names the procedure per role and explains why the button is off", () => {
+    expect(calibrationVerb.trainer).toBe("Calibrate");
+    expect(calibrationVerb.power).toBe("Zero offset");
+    const ready: DeviceState = { status: "ready", device: device(["cyclingPower"]) };
+    const stats = { calibrationSupported: true, calibrating: false };
+    expect(calibrationUnavailable("power", ready, stats)).toBeNull();
+    expect(calibrationUnavailable("power", ready, { ...stats, calibrationSupported: false })).toMatch(/offset compensation/);
+    expect(calibrationUnavailable("trainer", ready, { ...stats, calibrationSupported: false })).toMatch(/FTMS spin-down/);
+    expect(calibrationUnavailable("power", ready, stats, true)).toBe("Zero offset is unavailable during a ride");
+    expect(calibrationUnavailable("trainer", { status: "controlling", device: device(["ftms"]) }, stats)).toMatch(/during a workout/);
+    // Not connected: nothing to explain, the button is not shown anyway.
+    expect(calibrationUnavailable("power", { status: "idle" }, stats)).toBeNull();
+  });
+
+  it("summarises the last calibration for a card line", () => {
+    const now = Date.now();
+    expect(calibrationSummary(null, now)).toBeNull();
+    expect(calibrationSummary(zero(1023, 2 * 3_600_000), now)).toBe("Zeroed 2 h ago · offset 1023");
+    expect(calibrationSummary(zero(null, 30_000), now)).toBe("Zeroed just now");
+    expect(calibrationSummary({ at: new Date(now - 3 * 86_400_000).toISOString(), kind: "spinDown", offsetRaw: null }, now)).toBe("Spin-down 3 days ago");
+  });
+
+  it("measures drift against the previous zero and labels it", () => {
+    expect(offsetDrift(1023, null)).toBeNull();
+    expect(offsetDrift(1023, undefined)).toBeNull();
+    const steady = offsetDrift(1023, 1019)!;
+    expect(steady.delta).toBe(4);
+    expect(steady.tone).toBe("steady");
+    expect(driftLabel(steady)).toBe("+4");
+    const negative = offsetDrift(1000, 1019)!;
+    expect(driftLabel(negative)).toBe("−19");
+    expect(negative.tone).toBe("steady");
+    expect(driftLabel(offsetDrift(5, 5)!)).toBe("±0");
+    const large = offsetDrift(1100, 1000)!;
+    expect(large.tone).toBe("large");
+    expect(large.ratio).toBeCloseTo(0.1);
+    // A previous zero of exactly 0 cannot give a ratio; any move counts as large.
+    expect(offsetDrift(3, 0)!.tone).toBe("large");
+    expect(offsetDrift(0, 0)!.tone).toBe("steady");
+  });
+
+  it("nudges for a zero when there is no record or it is older than a day", () => {
+    const now = Date.now();
+    expect(zeroOffsetIsDue(null, now)).toBe(true);
+    expect(zeroOffsetIsDue(zero(1000, 3_600_000), now)).toBe(false);
+    expect(zeroOffsetIsDue(zero(1000, 25 * 3_600_000), now)).toBe(true);
+    expect(zeroOffsetIsDue({ ...zero(1000), at: "garbage" }, now)).toBe(true);
   });
 });

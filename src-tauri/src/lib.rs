@@ -178,7 +178,8 @@ pub fn run() {
             commands::scan_devices,
             commands::connect_device,
             commands::disconnect_device,
-            commands::calibrate_trainer,
+            commands::calibrate_device,
+            commands::cancel_calibration,
             commands::device_log,
             commands::get_source_preferences,
             commands::set_source_preferences,
@@ -229,7 +230,7 @@ pub fn run() {
             commands::reveal_log_file,
             commands::report_client_error,
             commands::report_client_event,
-            commands::debug_inject_trainer_fault,
+            commands::debug_inject_device_fault,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

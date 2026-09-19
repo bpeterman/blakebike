@@ -238,6 +238,12 @@ impl TelemetryFuser {
         Some(fused)
     }
 
+    /// One device's latest value for a metric, if it is still fresh. Used to
+    /// check that a power meter is at rest before zeroing it.
+    pub fn latest(&self, metric: Metric, role: DeviceRole, now_ms: i64) -> Option<f32> {
+        self.lock().fresh(metric, role, now_ms)
+    }
+
     /// Fuse without ingesting; used by tests and for a snapshot of the state.
     #[cfg(test)]
     pub fn current(&self, now_ms: i64) -> FusedTelemetry {

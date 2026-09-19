@@ -74,6 +74,7 @@ import type {
   SourceChoice,
   SourcePreferences,
   Telemetry,
+  TelemetrySources,
   TrainingZoneSettings,
   Workout,
   WorkoutInterval,
@@ -106,8 +107,8 @@ import {
 } from "./types";
 import { DevicePicker } from "./DevicePicker";
 import { DevicesPage } from "./DevicesPage";
-import { TrainerCalibrationModal } from "./TrainerCalibrationModal";
-import { isConnected as slotConnected, sourceNote } from "./devices";
+import { CalibrationModal } from "./CalibrationModal";
+import { isConnected as slotConnected, sourceNote, zeroOffsetIsDue } from "./devices";
 import { DeviceStatsCard } from "./DeviceStats";
 import { SourceSelect } from "./SourceSelect";
 import { defaultSourcePreferences, withSourcePreference } from "./sourcePreferences";
@@ -143,6 +144,19 @@ const emptyTelemetry: Telemetry = {
   targetPowerWatts: null,
 };
 
+/**
+ * The name of the power meter that will feed the ride and is due for a zero,
+ * or null when there is nothing to nudge about: no meter, the trainer is the
+ * power source, the meter cannot be zeroed, or it was zeroed recently.
+ */
+function zeroOffsetDueFor(hub: DevicesSnapshot | null, sources: TelemetrySources | undefined): string | null {
+  const slot = hub?.slots.find((candidate) => candidate.role === "power");
+  if (!slot || !slotConnected(slot.state) || !slot.stats.calibrationSupported) return null;
+  if ((sources ?? hub?.sources)?.power?.role !== "power") return null;
+  if (!zeroOffsetIsDue(slot.stats.lastCalibration)) return null;
+  return slot.state.status === "ready" || slot.state.status === "controlling" ? slot.state.device.name : null;
+}
+
 function App() {
   const [page, setPage] = useState<Page>("home");
   const [profile, setProfile] = useState<Profile | null>(null);
@@ -166,7 +180,7 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [devicePicker, setDevicePicker] = useState<DeviceRole | null>(null);
-  const [calibrationOpen, setCalibrationOpen] = useState(false);
+  const [calibrationRole, setCalibrationRole] = useState<DeviceRole | null>(null);
   const [editor, setEditor] = useState<Workout | null>(null);
   const [selectedWorkout, setSelectedWorkout] = useState<string | null>(null);
   const [selectedSession, setSelectedSession] = useState<SessionDetail | null>(
@@ -554,10 +568,11 @@ function App() {
             hub={hub}
             sources={telemetry.sources}
             onConnect={setDevicePicker}
-            onCalibrate={() => setCalibrationOpen(true)}
+            onCalibrate={setCalibrationRole}
             onSourcePreference={changeSourcePreference}
             onNotice={setNotice}
             onOfferUndo={offerUndo}
+            rideActive={riding}
             perform={perform}
           />
         )}
@@ -600,6 +615,8 @@ function App() {
             setSelectedWorkout={setSelectedWorkout}
             connected={connected}
             onConnect={() => setDevicePicker("trainer")}
+            zeroOffsetDue={zeroOffsetDueFor(hub, telemetry.sources)}
+            onZeroOffset={() => setCalibrationRole("power")}
             runner={runner}
             telemetry={telemetry}
             telemetryHistory={telemetryHistory}
@@ -744,10 +761,12 @@ function App() {
           perform={perform}
         />
       )}
-      {calibrationOpen && (
-        <TrainerCalibrationModal
+      {calibrationRole && (
+        <CalibrationModal
+          role={calibrationRole}
+          slot={hub?.slots.find((slot) => slot.role === calibrationRole)}
           speedKph={telemetry.speedKph}
-          close={() => setCalibrationOpen(false)}
+          close={() => setCalibrationRole(null)}
         />
       )}
       {editor && (
@@ -953,6 +972,8 @@ export function Ride({
   setSelectedWorkout,
   connected,
   onConnect,
+  zeroOffsetDue = null,
+  onZeroOffset = () => undefined,
   runner,
   telemetry,
   telemetryHistory,
@@ -972,6 +993,9 @@ export function Ride({
   setSelectedWorkout: (id: string) => void;
   connected: boolean;
   onConnect: () => void;
+  /** Name of the power meter feeding the ride that has not been zeroed lately; null when nothing to nudge about. */
+  zeroOffsetDue?: string | null;
+  onZeroOffset?: () => void;
   runner: RunnerState;
   telemetry: Telemetry;
   telemetryHistory: Telemetry[];
@@ -1327,6 +1351,16 @@ export function Ride({
       {riding && runner.recordingWarning && <RecordingWarning message={runner.recordingWarning} />}
       {runner.status === "finished" && runner.saveWarning && <RecordingWarning message={runner.saveWarning} />}
       {!connected && <div className="notice"><Bluetooth /><div><strong>No trainer connected</strong><p>Connect a trainer to begin.</p></div><button className="primary" onClick={onConnect}>Connect</button></div>}
+      {!active && zeroOffsetDue && (
+        <div className="notice soft" role="status">
+          <Zap />
+          <div>
+            <strong>Zero your power meter before riding?</strong>
+            <p>{zeroOffsetDue} feeds power for this ride and has not been zeroed in the last day. Unclip, keep the bike still, and it takes a few seconds.</p>
+          </div>
+          <button className="secondary" onClick={onZeroOffset}>Zero offset</button>
+        </div>
+      )}
       {riding && runner.control === "lost" && (
         <div className="notice" role="status">
           <Bluetooth />

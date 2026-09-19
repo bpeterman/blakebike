@@ -5,6 +5,7 @@ import { open, save } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import type {
   CalibrationProgress,
+  CalibrationRecord,
   ConnectProgress,
   DeviceInfo,
   DeviceLogLine,
@@ -54,7 +55,10 @@ export const api = {
     invoke<void>("connect_device", { role, device }),
   disconnectDevice: (role: DeviceRole) =>
     invoke<void>("disconnect_device", { role }),
-  calibrateTrainer: () => invoke<void>("calibrate_trainer"),
+  calibrateDevice: (role: DeviceRole) =>
+    invoke<CalibrationRecord>("calibrate_device", { role }),
+  cancelCalibration: (role: DeviceRole) =>
+    invoke<void>("cancel_calibration", { role }),
   deviceLog: (role: DeviceRole) => invoke<DeviceLogLine[]>("device_log", { role }),
   knownDevices: () => invoke<KnownDevice[]>("known_devices"),
   connectKnownDevices: () => invoke<KnownConnectOutcome[]>("connect_known_devices"),
@@ -180,7 +184,7 @@ export const api = {
   onConnectProgress: (handler: (progress: ConnectProgress) => void): Promise<UnlistenFn> =>
     listen<ConnectProgress>("trainer://connect-progress", ({ payload }) => handler(payload)),
   onCalibrationProgress: (handler: (progress: CalibrationProgress) => void): Promise<UnlistenFn> =>
-    listen<CalibrationProgress>("trainer://calibration", ({ payload }) => handler(payload)),
+    listen<CalibrationProgress>("devices://calibration", ({ payload }) => handler(payload)),
   onDeviceSlot: (handler: (slot: DeviceSlot) => void): Promise<UnlistenFn> =>
     listen<DeviceSlot>("devices://slot", ({ payload }) => handler(payload)),
   onDeviceLog: (handler: (event: { role: DeviceRole; line: DeviceLogLine }) => void): Promise<UnlistenFn> =>

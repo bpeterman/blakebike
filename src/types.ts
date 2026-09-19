@@ -98,9 +98,27 @@ export type SlotStats = {
   lastRawHex: string | null;
   /** Human summary of the latest decoded reading, e.g. "215 W · 88 rpm". */
   lastReading: string | null;
+  /** The device offers a procedure we can drive: spin-down or zero offset. */
   calibrationSupported: boolean;
   calibrating: boolean;
+  /** The device itself is asking to be calibrated (power meter indicator flag). */
+  calibrationRequested?: boolean;
+  /** Last calibration on record for this device, if any. */
+  lastCalibration?: CalibrationRecord | null;
 };
+
+export type CalibrationKind = "spinDown" | "zeroOffset";
+
+/** One completed calibration. `offsetRaw` is the meter's zero in its own units. */
+export type CalibrationRecord = {
+  /** RFC 3339 timestamp. */
+  at: string;
+  kind: CalibrationKind;
+  offsetRaw: number | null;
+};
+
+/** Roles whose device can offer a calibration procedure. */
+export const calibratableRoles: DeviceRole[] = ["trainer", "power"];
 
 export type DeviceSlot = {
   role: DeviceRole;
@@ -121,6 +139,7 @@ export type KnownDevice = {
   model: string | null;
   /** RFC 3339 timestamp of the last successful connection. */
   lastConnectedAt: string;
+  lastCalibration?: CalibrationRecord | null;
 };
 
 /** What happened to one remembered device during "Connect all". */
@@ -163,11 +182,27 @@ export type ConnectProgress = {
   level: "info" | "ok" | "warn";
 };
 
+export type CalibrationPhase =
+  | "preparing"
+  /** Spin-down: pedal into the target range. */
+  | "accelerate"
+  /** Spin-down: stop and let the flywheel coast. */
+  | "stopPedaling"
+  /** Zero offset: the meter is measuring; keep the bike still. */
+  | "holdStill"
+  | "success"
+  | "error";
+
+export type CalibrationDetail =
+  | { kind: "spinDown"; targetLowKph: number; targetHighKph: number }
+  | { kind: "zeroOffset"; offsetRaw: number; previousOffsetRaw: number | null };
+
+/** One step of a calibration, on `devices://calibration`. */
 export type CalibrationProgress = {
-  phase: "preparing" | "accelerate" | "stopPedaling" | "success" | "error";
-  targetLowKph: number | null;
-  targetHighKph: number | null;
+  role: DeviceRole;
+  phase: CalibrationPhase;
   message: string | null;
+  detail: CalibrationDetail | null;
 };
 
 export type DeviceState =

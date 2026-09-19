@@ -620,3 +620,17 @@ textarea { min-height: 70px; resize: vertical; }
 .workout-timeline .workout-profile-block-label[data-state="completed"] { opacity: .5; }
 .workout-timeline .workout-profile-block-label[data-state="upcoming"] { opacity: .8; }
 .workout-timeline .workout-profile-block.current { opacity: 1; stroke: #c8ff32; stroke-width: 2; }
+
+/* Calibration: power meter zero offset */
+.calibration-modal .calibration-gauge.zero-result strong { font-variant-numeric: tabular-nums; }
+.calibration-gauge em.drift.large { color: #ffc16b; }
+.calibration-message.warn { color: #ffc16b; }
+.calibration-previous { color: #8f9989; font-size: 12px; }
+.device-reading .calibration-line { color: #8f9989; font-size: 11px; }
+.device-reading .calibration-requested { color: #e6c36a; font-style: normal; font-weight: 700; }
+.device-actions .secondary.attention { border-color: #7a6a2c; color: #e6c36a; }
+.known-when { line-height: 1.5; }
+.notice.soft { border-color: #39422f; color: #bdc5b7; background: #171a15; }
+.notice.soft strong { color: #edf2e8; }
+.notice.soft svg { color: #c8ff32; }
+.calibration-gauge.meter-reading strong { font-size: 26px; text-align: center; }

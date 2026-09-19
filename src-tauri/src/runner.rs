@@ -1292,7 +1292,9 @@ async fn classify_failure(
             }
             ControlStatus::Degraded
         }
-        ControlError::Refused(_) | ControlError::Busy(_) => ControlStatus::Degraded,
+        ControlError::Refused(_) | ControlError::Busy(_) | ControlError::Unsupported(_) => {
+            ControlStatus::Degraded
+        }
         ControlError::Timeout | ControlError::Gatt(_) => {
             if failures >= FAILURES_BEFORE_LOST {
                 *started = false;

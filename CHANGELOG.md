@@ -22,6 +22,13 @@ Conventions:
 ### Added
 
 - A "Stats for nerds" card for the ride screen, showing what every connected device is actually reporting: its live reading, sample rate, last packet, uptime, signal, battery, drops and bad packets, plus which device is feeding power, cadence and heart rate, and whether a metric has fallen back to another device. It also names the roles with nothing connected. Turn it on under Settings → Live ride cards, where it is off by default and can be reordered like any other card.
+- Zero your power meter from its card on the Devices page. The app sends the standard Bluetooth offset-compensation command, refuses to start while the cranks are turning or the meter reads load, shows the offset it came back with and how far it drifted since last time, and remembers it per device so the card and the remembered-device list can say when it was last zeroed. A meter that asks to be zeroed (some raise a flag when they have drifted) is called out on its card.
+- Before a ride, if the power meter that will feed power has not been zeroed in the last day, the start screen offers to zero it.
+- The trainer's spin-down is remembered the same way, so its card says when it was last calibrated.
+
+### Changed
+
+- One calibration dialog serves both the trainer spin-down and the power meter zero offset, with copy, live readout and cancel behaviour per device. Cancelling a zero offset only stops waiting; cancelling a spin-down still disconnects the trainer, because the spin-down holds control of it.
 
 ## [0.2.0] - 2026-09-19
 
