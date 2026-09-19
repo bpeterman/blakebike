@@ -214,11 +214,15 @@ impl Storage {
         Ok(())
     }
 
-    pub fn start_session(&self, workout: &Workout) -> Result<SessionSummary, String> {
+    pub fn start_session(
+        &self,
+        workout_id: Option<Uuid>,
+        workout_name: &str,
+    ) -> Result<SessionSummary, String> {
         let summary = SessionSummary {
             id: Uuid::new_v4(),
-            workout_id: Some(workout.id),
-            workout_name: workout.name.clone(),
+            workout_id,
+            workout_name: workout_name.to_string(),
             started_at: Utc::now(),
             ended_at: None,
             elapsed_seconds: 0,
@@ -233,7 +237,7 @@ impl Storage {
                  VALUES(?1, ?2, ?3, ?4)",
                 params![
                     summary.id.to_string(),
-                    workout.id.to_string(),
+                    summary.workout_id.map(|id| id.to_string()),
                     summary.workout_name,
                     summary.started_at.to_rfc3339()
                 ],
@@ -408,5 +412,15 @@ mod tests {
         let workouts = storage.workouts().unwrap();
         assert_eq!(workouts.len(), 1);
         assert!(storage.workout(workouts[0].id).unwrap().is_some());
+    }
+
+    #[test]
+    fn stores_free_ride_without_a_workout() {
+        let storage = Storage::in_memory().unwrap();
+        let session = storage.start_session(None, "Free Ride").unwrap();
+        let stored = storage.session(session.id).unwrap().unwrap().summary;
+
+        assert_eq!(stored.workout_id, None);
+        assert_eq!(stored.workout_name, "Free Ride");
     }
 }

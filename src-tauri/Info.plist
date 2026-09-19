@@ -3,6 +3,6 @@
 <plist version="1.0">
 <dict>
   <key>NSBluetoothAlwaysUsageDescription</key>
-  <string>BlakeBike uses Bluetooth to connect to and control your smart trainer.</string>
+  <string>blake.bike uses Bluetooth to connect to and control your smart trainer.</string>
 </dict>
 </plist>

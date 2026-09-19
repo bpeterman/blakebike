@@ -47,8 +47,6 @@ impl From<u8> for ResponseCode {
 #[repr(u8)]
 pub enum ControlOpcode {
     RequestControl = 0x00,
-    Reset = 0x01,
-    SetTargetResistance = 0x04,
     SetTargetPower = 0x05,
     StartOrResume = 0x07,
     StopOrPause = 0x08,

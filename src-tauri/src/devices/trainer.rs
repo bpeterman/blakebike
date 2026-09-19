@@ -1,0 +1,663 @@
+//! The trainer slot: FTMS discovery steps, ERG control and the Indoor Bike
+//! Data notification worker, plus the built-in simulator.
+
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU16, Ordering},
+    },
+    time::Duration,
+};
+
+use btleplug::{
+    api::{Characteristic, Peripheral as _, WriteType},
+    platform::Peripheral,
+};
+use chrono::Utc;
+use futures::StreamExt;
+use tokio::sync::{Mutex, RwLock, broadcast};
+
+use super::{
+    Capability, DeviceInfo, DeviceSlot, DeviceState,
+    ble::{self, Ble, GATT_CONNECT_TIMEOUT, GATT_STEP_TIMEOUT, bluetooth_uuid, hex, with_timeout},
+};
+use crate::{
+    domain::Telemetry,
+    ftms::{
+        FITNESS_MACHINE_CONTROL_POINT, FITNESS_MACHINE_FEATURE, FITNESS_MACHINE_STATUS,
+        INDOOR_BIKE_DATA, SUPPORTED_POWER_RANGE, parse_control_response, parse_indoor_bike_data,
+        request_control, set_target_power, start_or_resume, stop_or_pause,
+    },
+};
+
+pub const SIMULATED_TRAINER_ID: &str = "simulated-trainer";
+
+/// Simulated devices offered at the top of every scan.
+pub fn simulated_devices() -> Vec<DeviceInfo> {
+    vec![DeviceInfo {
+        id: SIMULATED_TRAINER_ID.into(),
+        name: "BlakeBike Simulator".into(),
+        simulated: true,
+        rssi: Some(-30),
+        capabilities: vec![Capability::Ftms],
+    }]
+}
+
+pub struct Trainer {
+    slot: Arc<DeviceSlot>,
+    ble: Arc<Ble>,
+    telemetry: broadcast::Sender<Telemetry>,
+    peripheral: RwLock<Option<Peripheral>>,
+    control_point: RwLock<Option<Characteristic>>,
+    target_power: Arc<AtomicU16>,
+    min_power: AtomicU16,
+    max_power: AtomicU16,
+    command_lock: Mutex<()>,
+    control_responses: broadcast::Sender<Vec<u8>>,
+}
+
+impl Trainer {
+    pub fn new(
+        slot: Arc<DeviceSlot>,
+        ble: Arc<Ble>,
+        telemetry: broadcast::Sender<Telemetry>,
+    ) -> Self {
+        let (control_responses, _) = broadcast::channel(16);
+        Self {
+            slot,
+            ble,
+            telemetry,
+            peripheral: RwLock::new(None),
+            control_point: RwLock::new(None),
+            target_power: Arc::new(AtomicU16::new(100)),
+            min_power: AtomicU16::new(0),
+            max_power: AtomicU16::new(2_000),
+            command_lock: Mutex::new(()),
+            control_responses,
+        }
+    }
+
+    pub fn slot(&self) -> &Arc<DeviceSlot> {
+        &self.slot
+    }
+
+    pub async fn connect(&self, device: DeviceInfo) -> Result<(), String> {
+        tracing::info!(id = %device.id, name = %device.name, simulated = device.simulated, rssi = ?device.rssi, "Connecting to trainer");
+        let started = std::time::Instant::now();
+        let result = self.connect_inner(device.clone()).await;
+        match &result {
+            Ok(()) => tracing::info!(
+                name = %device.name,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "Trainer connected and control acquired"
+            ),
+            Err(error) => {
+                tracing::error!(
+                    id = %device.id,
+                    name = %device.name,
+                    error = %error,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "Trainer connection failed"
+                );
+                self.slot
+                    .progress("error", "Connection failed", Some(error.clone()));
+                // "Channel closed" means btleplug's CoreBluetooth/BlueZ event loop
+                // has died; the cached adapter and its peripherals are useless
+                // until recreated, so force a fresh one on the next scan.
+                if error.contains("Channel closed") {
+                    self.ble.reset().await;
+                }
+                self.slot
+                    .set_state(DeviceState::Error {
+                        message: error.clone(),
+                        guidance: ble::platform_guidance(),
+                    })
+                    .await;
+            }
+        }
+        result
+    }
+
+    async fn connect_inner(&self, device: DeviceInfo) -> Result<(), String> {
+        self.disconnect().await;
+        self.slot
+            .set_state(DeviceState::Connecting {
+                name: device.name.clone(),
+            })
+            .await;
+        if device.simulated {
+            self.slot
+                .progress("info", "Spinning up virtual flywheel", None);
+            tokio::time::sleep(Duration::from_millis(350)).await;
+            self.slot.progress(
+                "ok",
+                "Simulated FTMS service online",
+                Some("0 dBm · zero latency".into()),
+            );
+            self.connect_simulator(device).await;
+            return Ok(());
+        }
+        self.slot.progress(
+            "info",
+            "Locating trainer from last scan",
+            Some(device.id.clone()),
+        );
+        let peripheral = self
+            .ble
+            .peripheral(&device.id)
+            .await
+            .ok_or_else(|| "Trainer is no longer available; scan again".to_string())?;
+        self.slot.progress(
+            "info",
+            "Opening GATT link",
+            device.rssi.map(|rssi| format!("signal {rssi} dBm")),
+        );
+        let already_connected = peripheral.is_connected().await.ok();
+        tracing::debug!(already_connected = ?already_connected, "GATT connect");
+        with_timeout(GATT_CONNECT_TIMEOUT, "GATT connect", peripheral.connect())
+            .await
+            .map_err(|error| format!("Could not connect to trainer: {error}"))?;
+        tracing::debug!("GATT connected; discovering services");
+        self.slot.progress("ok", "Link established", None);
+        self.slot
+            .progress("info", "Discovering GATT services", None);
+        with_timeout(
+            GATT_STEP_TIMEOUT,
+            "service discovery",
+            peripheral.discover_services(),
+        )
+        .await
+        .map_err(|error| format!("Could not discover trainer services: {error}"))?;
+        let characteristics = peripheral.characteristics();
+        let services = peripheral.services();
+        tracing::debug!(
+            services = ?services.iter().map(|s| s.uuid).collect::<Vec<_>>(),
+            characteristics = ?characteristics.iter().map(|c| (c.uuid, c.properties)).collect::<Vec<_>>(),
+            "Services discovered"
+        );
+        self.slot.progress(
+            "ok",
+            "Services discovered",
+            Some(format!(
+                "{} services · {} characteristics",
+                services.len(),
+                characteristics.len()
+            )),
+        );
+        let indoor_data = characteristics
+            .iter()
+            .find(|characteristic| characteristic.uuid == bluetooth_uuid(INDOOR_BIKE_DATA))
+            .cloned()
+            .ok_or_else(|| "Trainer does not expose Indoor Bike Data".to_string())?;
+        self.slot.progress(
+            "ok",
+            "Indoor Bike Data characteristic",
+            Some("0x2AD2".into()),
+        );
+        let control = characteristics
+            .iter()
+            .find(|characteristic| {
+                characteristic.uuid == bluetooth_uuid(FITNESS_MACHINE_CONTROL_POINT)
+            })
+            .cloned()
+            .ok_or_else(|| "Trainer does not support FTMS control".to_string())?;
+        self.slot
+            .progress("ok", "Fitness Machine Control Point", Some("0x2AD9".into()));
+        if let Some(features) = characteristics
+            .iter()
+            .find(|characteristic| characteristic.uuid == bluetooth_uuid(FITNESS_MACHINE_FEATURE))
+        {
+            // Read once so capability discovery failures surface during connection.
+            let data = with_timeout(GATT_STEP_TIMEOUT, "feature read", peripheral.read(features))
+                .await
+                .map_err(|error| format!("Could not read trainer capabilities: {error}"))?;
+            tracing::debug!(features = ?data, "Fitness Machine Feature read");
+            self.slot
+                .progress("ok", "Read machine features", Some(hex(&data)));
+        } else {
+            tracing::debug!("Trainer does not expose Fitness Machine Feature");
+            self.slot
+                .progress("warn", "No Fitness Machine Feature characteristic", None);
+        }
+        if let Some(range) = characteristics
+            .iter()
+            .find(|characteristic| characteristic.uuid == bluetooth_uuid(SUPPORTED_POWER_RANGE))
+            && let Ok(data) = with_timeout(
+                GATT_STEP_TIMEOUT,
+                "power range read",
+                peripheral.read(range),
+            )
+            .await
+            && data.len() >= 4
+        {
+            self.min_power.store(
+                i16::from_le_bytes([data[0], data[1]]).max(0) as u16,
+                Ordering::Relaxed,
+            );
+            self.max_power.store(
+                i16::from_le_bytes([data[2], data[3]]).max(0) as u16,
+                Ordering::Relaxed,
+            );
+            let (min_watts, max_watts) = (
+                self.min_power.load(Ordering::Relaxed),
+                self.max_power.load(Ordering::Relaxed),
+            );
+            tracing::info!(min_watts, max_watts, "Supported power range read");
+            self.slot.progress(
+                "ok",
+                "Supported power range",
+                Some(format!("{min_watts}–{max_watts} W")),
+            );
+        } else {
+            tracing::debug!("Supported Power Range unavailable; using defaults");
+            self.slot.progress(
+                "warn",
+                "No power range advertised",
+                Some("using 0–2000 W".into()),
+            );
+        }
+        let details = ble::read_details(&peripheral).await;
+        match details.summary() {
+            Some(summary) => self
+                .slot
+                .progress("ok", "Device information", Some(summary)),
+            None => self
+                .slot
+                .progress("warn", "No battery or device information", None),
+        }
+        tracing::debug!("Subscribing to Indoor Bike Data and Control Point notifications");
+        self.slot
+            .progress("info", "Subscribing to telemetry stream", None);
+        with_timeout(
+            GATT_STEP_TIMEOUT,
+            "telemetry subscribe",
+            peripheral.subscribe(&indoor_data),
+        )
+        .await
+        .map_err(|error| format!("Could not subscribe to trainer data: {error}"))?;
+        self.slot
+            .progress("info", "Subscribing to control responses", None);
+        with_timeout(
+            GATT_STEP_TIMEOUT,
+            "control subscribe",
+            peripheral.subscribe(&control),
+        )
+        .await
+        .map_err(|error| format!("Could not subscribe to trainer control: {error}"))?;
+        self.slot.progress("ok", "Notifications armed", None);
+        if let Some(status) = characteristics
+            .iter()
+            .find(|characteristic| characteristic.uuid == bluetooth_uuid(FITNESS_MACHINE_STATUS))
+            && let Err(error) = peripheral.subscribe(status).await
+        {
+            tracing::debug!(error = %error, "Could not subscribe to Fitness Machine Status (non-fatal)");
+        }
+        *self.peripheral.write().await = Some(peripheral.clone());
+        *self.control_point.write().await = Some(control);
+        self.slot.record_connected(device.rssi, &details);
+        let slot = self.slot.clone();
+        let telemetry_tx = self.telemetry.clone();
+        let control_tx = self.control_responses.clone();
+        let reconnect_name = device.name.clone();
+        let worker = tokio::spawn(async move {
+            let mut notifications = match peripheral.notifications().await {
+                Ok(stream) => stream,
+                Err(error) => {
+                    tracing::error!(error = %error, "Could not open notification stream");
+                    slot.note(
+                        "error",
+                        "Could not open notification stream",
+                        Some(error.to_string()),
+                    );
+                    return;
+                }
+            };
+            tracing::debug!("Notification worker started");
+            let mut samples: u64 = 0;
+            let mut last_summary = std::time::Instant::now();
+            while let Some(notification) = notifications.next().await {
+                if notification.uuid == bluetooth_uuid(INDOOR_BIKE_DATA) {
+                    match parse_indoor_bike_data(&notification.value, Utc::now().timestamp_millis())
+                    {
+                        Ok(telemetry) => {
+                            samples += 1;
+                            slot.record_sample(Some(&notification.value));
+                            if samples == 1 {
+                                tracing::debug!(?telemetry, "First Indoor Bike Data sample");
+                                slot.note(
+                                    "ok",
+                                    "First sample received",
+                                    Some(format!(
+                                        "{} W · {} rpm",
+                                        telemetry.power_watts,
+                                        telemetry
+                                            .cadence_rpm
+                                            .map(|c| format!("{c:.0}"))
+                                            .unwrap_or_else(|| "—".into())
+                                    )),
+                                );
+                            } else if samples.is_multiple_of(120) {
+                                tracing::debug!(samples, ?telemetry, "Indoor Bike Data");
+                            }
+                            if last_summary.elapsed() >= Duration::from_secs(60) {
+                                last_summary = std::time::Instant::now();
+                                let stats = slot.stats();
+                                slot.note(
+                                    "info",
+                                    "Telemetry flowing",
+                                    Some(format!(
+                                        "{} samples · {:.1} Hz · {} parse failures",
+                                        stats.samples, stats.rate_hz, stats.parse_failures
+                                    )),
+                                );
+                            }
+                            let _ = telemetry_tx.send(telemetry.clone());
+                            slot.emit("trainer://telemetry", telemetry);
+                        }
+                        Err(error) => {
+                            let failures = slot.record_parse_failure(&notification.value);
+                            if failures <= 5 || failures.is_multiple_of(100) {
+                                tracing::warn!(failures, error = %error, raw = ?notification.value, "Could not parse Indoor Bike Data");
+                                slot.note(
+                                    "warn",
+                                    "Could not parse Indoor Bike Data",
+                                    Some(format!("{error} · {}", hex(&notification.value))),
+                                );
+                            }
+                        }
+                    }
+                } else if notification.uuid == bluetooth_uuid(FITNESS_MACHINE_CONTROL_POINT) {
+                    tracing::debug!(raw = ?notification.value, "Control Point response");
+                    let _ = control_tx.send(notification.value);
+                } else if notification.uuid == bluetooth_uuid(FITNESS_MACHINE_STATUS) {
+                    tracing::debug!(raw = ?notification.value, "Fitness Machine Status");
+                } else {
+                    tracing::trace!(uuid = %notification.uuid, raw = ?notification.value, "Other notification");
+                }
+            }
+            tracing::warn!(samples, "Notification stream ended; trainer link lost");
+            slot.record_drop();
+            slot.note(
+                "error",
+                "Link lost",
+                Some(format!("after {samples} samples")),
+            );
+            slot.set_state(DeviceState::Reconnecting {
+                name: reconnect_name,
+            })
+            .await;
+        });
+        self.slot.set_worker(worker).await;
+        tracing::debug!("Requesting FTMS control");
+        self.slot.progress(
+            "info",
+            "Requesting control",
+            Some("op 0x00 · Request Control".into()),
+        );
+        self.write_control(&request_control())
+            .await
+            .map_err(|error| format!("Could not request trainer control: {error}"))?;
+        self.slot
+            .progress("ok", "Control granted", Some("ERG mode available".into()));
+        self.slot.set_state(DeviceState::Ready { device }).await;
+        Ok(())
+    }
+
+    async fn connect_simulator(&self, device: DeviceInfo) {
+        tracing::info!("Starting simulated trainer");
+        self.slot.record_connected(
+            device.rssi,
+            &ble::DeviceDetails {
+                battery_percent: Some(100),
+                manufacturer: Some("BlakeBike".into()),
+                model: Some("Simulator".into()),
+                firmware: Some(env!("CARGO_PKG_VERSION").into()),
+            },
+        );
+        self.slot
+            .set_state(DeviceState::Ready {
+                device: device.clone(),
+            })
+            .await;
+        let target = self.target_power.clone();
+        let slot = self.slot.clone();
+        let telemetry_tx = self.telemetry.clone();
+        let worker = tokio::spawn(async move {
+            let mut power = 90.0_f32;
+            let mut tick = tokio::time::interval(Duration::from_millis(500));
+            let mut first = true;
+            loop {
+                tick.tick().await;
+                let requested = target.load(Ordering::Relaxed) as f32;
+                power += (requested - power) * 0.18;
+                let elapsed = Utc::now().timestamp_millis() as f32 / 1_000.0;
+                let wobble = elapsed.sin() * 3.0;
+                let telemetry = Telemetry {
+                    timestamp_ms: Utc::now().timestamp_millis(),
+                    power_watts: (power + wobble).max(0.0) as u16,
+                    cadence_rpm: Some(88.0 + wobble / 2.0),
+                    speed_kph: Some(30.0 + wobble / 3.0),
+                    heart_rate_bpm: Some((125.0 + requested / 20.0).min(185.0) as u8),
+                    target_power_watts: Some(requested as u16),
+                };
+                slot.record_sample(None);
+                if first {
+                    first = false;
+                    slot.note("ok", "First sample received", Some("simulated".into()));
+                }
+                let _ = telemetry_tx.send(telemetry.clone());
+                if !slot.emit("trainer://telemetry", telemetry) {
+                    tracing::warn!("UI gone; stopping simulated trainer");
+                    break;
+                }
+            }
+            slot.set_state(DeviceState::Idle).await;
+        });
+        self.slot.set_worker(worker).await;
+    }
+
+    pub async fn begin_control(&self) -> Result<(), String> {
+        let device = match self.slot.state().await {
+            DeviceState::Ready { device } | DeviceState::Controlling { device } => device,
+            other => {
+                tracing::warn!(state = ?other, "begin_control called without a connected trainer");
+                return Err("Connect a trainer before starting a workout".into());
+            }
+        };
+        tracing::info!(name = %device.name, "Starting/resuming trainer control");
+        self.write_control(&start_or_resume()).await?;
+        self.slot
+            .set_state(DeviceState::Controlling { device })
+            .await;
+        Ok(())
+    }
+
+    pub async fn set_target_power(&self, requested: u16, rider_max: u16) -> Result<u16, String> {
+        let clamped = requested.clamp(
+            self.min_power.load(Ordering::Relaxed),
+            self.max_power.load(Ordering::Relaxed).min(rider_max),
+        );
+        if clamped != requested {
+            tracing::debug!(requested, clamped, rider_max, "Target power clamped");
+        }
+        self.target_power.store(clamped, Ordering::Relaxed);
+        self.write_control(&set_target_power(clamped)).await?;
+        Ok(clamped)
+    }
+
+    pub async fn pause(&self) -> Result<(), String> {
+        tracing::info!("Pausing trainer");
+        self.write_control(&stop_or_pause(true)).await
+    }
+
+    pub async fn stop(&self) -> Result<(), String> {
+        tracing::info!("Stopping trainer");
+        self.target_power.store(0, Ordering::Relaxed);
+        self.write_control(&stop_or_pause(false)).await
+    }
+
+    async fn write_control(&self, payload: &[u8]) -> Result<(), String> {
+        let _guard = self.command_lock.lock().await;
+        let peripheral = self.peripheral.read().await.clone();
+        let control = self.control_point.read().await.clone();
+        if let (Some(peripheral), Some(control)) = (peripheral, control) {
+            let expected_opcode = payload
+                .first()
+                .copied()
+                .ok_or_else(|| "Cannot send an empty trainer command".to_string())?;
+            let mut responses = self.control_responses.subscribe();
+            tracing::debug!(opcode = format_args!("0x{expected_opcode:02x}"), payload = ?payload, "Writing control command");
+            let started = std::time::Instant::now();
+            with_timeout(
+                GATT_STEP_TIMEOUT,
+                "control write",
+                peripheral.write(&control, payload, WriteType::WithResponse),
+            )
+            .await
+            .map_err(|error| {
+                tracing::error!(opcode = format_args!("0x{expected_opcode:02x}"), error = %error, "Control write failed");
+                self.slot.note(
+                    "error",
+                    "Control write failed",
+                    Some(format!("op 0x{expected_opcode:02x} · {error}")),
+                );
+                format!("Trainer rejected control command: {error}")
+            })?;
+            let acknowledgement = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let response = responses
+                        .recv()
+                        .await
+                        .map_err(|error| format!("Lost trainer response: {error}"))?;
+                    if response.get(1) == Some(&expected_opcode) {
+                        return parse_control_response(&response, expected_opcode)
+                            .map_err(|error| error.to_string());
+                    }
+                    tracing::trace!(raw = ?response, "Ignoring response for another opcode");
+                }
+            })
+            .await
+            .map_err(|_| {
+                tracing::error!(
+                    opcode = format_args!("0x{expected_opcode:02x}"),
+                    "No control response within 5s"
+                );
+                self.slot.note(
+                    "error",
+                    "Control command timed out",
+                    Some(format!("op 0x{expected_opcode:02x} · no response in 5 s")),
+                );
+                "Trainer control command timed out".to_string()
+            })?;
+            match &acknowledgement {
+                Ok(()) => tracing::debug!(
+                    opcode = format_args!("0x{expected_opcode:02x}"),
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "Control command acknowledged"
+                ),
+                Err(error) => {
+                    tracing::error!(
+                        opcode = format_args!("0x{expected_opcode:02x}"),
+                        error = %error,
+                        "Trainer refused control command"
+                    );
+                    self.slot.note(
+                        "error",
+                        "Trainer refused control command",
+                        Some(format!("op 0x{expected_opcode:02x} · {error}")),
+                    );
+                }
+            }
+            acknowledgement?;
+        }
+        // Simulated trainers need no GATT write.
+        Ok(())
+    }
+
+    pub async fn disconnect(&self) {
+        let had_peripheral = self.peripheral.read().await.is_some();
+        if had_peripheral {
+            tracing::info!("Disconnecting trainer");
+        }
+        if let Err(error) = self.stop().await {
+            tracing::debug!(error = %error, "Stop before disconnect failed (ignored)");
+        }
+        if self.slot.abort_worker().await {
+            tracing::debug!("Trainer worker aborted");
+        }
+        if let Some(peripheral) = self.peripheral.write().await.take() {
+            match peripheral.disconnect().await {
+                Ok(()) => tracing::debug!("GATT disconnected"),
+                Err(error) => tracing::warn!(error = %error, "GATT disconnect failed"),
+            }
+        }
+        *self.control_point.write().await = None;
+        let was_connected = self.slot.state().await.is_connected();
+        if had_peripheral || was_connected {
+            self.slot.note("info", "Disconnected", None);
+        }
+        self.slot.record_disconnected();
+        if !matches!(self.slot.state().await, DeviceState::Idle) {
+            self.slot.set_state(DeviceState::Idle).await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opcodes_match_ftms() {
+        assert_eq!(crate::ftms::ControlOpcode::SetTargetPower as u8, 0x05);
+    }
+
+    #[test]
+    fn simulator_is_a_trainer() {
+        let devices = simulated_devices();
+        assert_eq!(devices.len(), 1);
+        assert!(devices[0].simulated);
+        assert!(devices[0].supports(Capability::Ftms));
+    }
+
+    #[tokio::test]
+    async fn simulated_target_power_respects_rider_limit() {
+        let (telemetry, _) = broadcast::channel(4);
+        let trainer = Trainer::new(
+            DeviceSlot::new(super::super::DeviceRole::Trainer, None),
+            Arc::new(Ble::default()),
+            telemetry,
+        );
+        assert_eq!(trainer.set_target_power(100, 800).await.unwrap(), 100);
+        assert_eq!(trainer.set_target_power(900, 800).await.unwrap(), 800);
+        assert_eq!(trainer.target_power.load(Ordering::Relaxed), 800);
+    }
+
+    #[tokio::test]
+    async fn simulator_connects_without_hardware() {
+        let hub = super::super::DeviceHub::default();
+        let mut telemetry = hub.subscribe();
+        let device = simulated_devices().remove(0);
+        hub.connect(super::super::DeviceRole::Trainer, device)
+            .await
+            .unwrap();
+        assert!(hub.state().await.is_connected());
+        let sample = tokio::time::timeout(Duration::from_secs(3), telemetry.recv())
+            .await
+            .expect("simulator emits telemetry")
+            .unwrap();
+        assert!(sample.cadence_rpm.is_some());
+        hub.begin_control().await.unwrap();
+        assert!(matches!(hub.state().await, DeviceState::Controlling { .. }));
+        assert_eq!(hub.set_target_power(250, 400).await.unwrap(), 250);
+        assert_eq!(hub.set_target_power(900, 400).await.unwrap(), 400);
+        hub.disconnect().await;
+        assert!(matches!(hub.state().await, DeviceState::Idle));
+        let log = hub.slot(super::super::DeviceRole::Trainer).log_lines();
+        assert!(
+            log.iter()
+                .any(|line| line.step == "Simulated FTMS service online")
+        );
+        assert!(log.iter().any(|line| line.step == "Disconnected"));
+    }
+}
