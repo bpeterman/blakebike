@@ -32,9 +32,9 @@ import {
 } from "recharts";
 import { api } from "./api";
 import type {
-  ConnectProgress,
-  DeviceInfo,
+  DeviceRole,
   DeviceState,
+  DevicesSnapshot,
   Profile,
   RunnerState,
   SessionDetail,
@@ -44,13 +44,20 @@ import type {
   WorkoutStep,
 } from "./types";
 import {
+  deviceRoleLabel,
+  deviceRoles,
   formatDuration,
   manualPowerDeltaForKey,
   workoutDuration,
 } from "./types";
+import { DevicePicker } from "./DevicePicker";
+import { DevicesPage } from "./DevicesPage";
+import { isConnected as slotConnected, sourceNote } from "./devices";
 import "./App.css";
 
-type Page = "home" | "workouts" | "ride" | "history" | "settings";
+type Page = "home" | "workouts" | "devices" | "ride" | "history" | "settings";
+
+const LOG_LINES_KEPT = 200;
 
 const emptyTelemetry: Telemetry = {
   timestampMs: 0,
@@ -66,12 +73,12 @@ function App() {
   const [profile, setProfile] = useState<Profile | null>(null);
   const [workouts, setWorkouts] = useState<Workout[]>([]);
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
-  const [deviceState, setDeviceState] = useState<DeviceState>({ status: "idle" });
+  const [hub, setHub] = useState<DevicesSnapshot | null>(null);
   const [runner, setRunner] = useState<RunnerState>({ status: "idle" });
   const [telemetry, setTelemetry] = useState(emptyTelemetry);
   const [telemetryHistory, setTelemetryHistory] = useState<Telemetry[]>([]);
   const [error, setError] = useState<string | null>(null);
-  const [devicePicker, setDevicePicker] = useState(false);
+  const [devicePicker, setDevicePicker] = useState<DeviceRole | null>(null);
   const [editor, setEditor] = useState<Workout | null>(null);
   const [selectedWorkout, setSelectedWorkout] = useState<string | null>(null);
   const [selectedSession, setSelectedSession] = useState<SessionDetail | null>(
@@ -81,18 +88,18 @@ function App() {
 
   const load = useCallback(async () => {
     try {
-      const [nextProfile, nextWorkouts, nextSessions, nextDevice, nextRunner] =
+      const [nextProfile, nextWorkouts, nextSessions, nextHub, nextRunner] =
         await Promise.all([
           api.profile(),
           api.workouts(),
           api.sessions(),
-          api.deviceState(),
+          api.devicesSnapshot(),
           api.runnerState(),
         ]);
       setProfile(nextProfile);
       setWorkouts(nextWorkouts);
       setSessions(nextSessions);
-      setDeviceState(nextDevice);
+      setHub(nextHub);
       setRunner(nextRunner);
       setSelectedWorkout((current) => current ?? nextWorkouts[0]?.id ?? null);
     } catch (cause) {
@@ -139,14 +146,50 @@ function App() {
     }).then((off) => {
       offRunner = off;
     });
+    // Devices hub: whole-slot updates on state/stats changes, plus individual
+    // log lines so the per-device logs grow live between snapshots.
+    let offSlot: (() => void) | undefined;
+    let offLog: (() => void) | undefined;
+    void api.onDeviceSlot((slot) => {
+      setHub((current) =>
+        current
+          ? { ...current, slots: current.slots.map((existing) => (existing.role === slot.role ? slot : existing)) }
+          : current,
+      );
+    }).then((off) => {
+      offSlot = off;
+    });
+    void api.onDeviceLog(({ role, line }) => {
+      setHub((current) =>
+        current
+          ? {
+              ...current,
+              slots: current.slots.map((existing) =>
+                existing.role === role
+                  ? { ...existing, log: [...existing.log.slice(-(LOG_LINES_KEPT - 1)), line] }
+                  : existing,
+              ),
+            }
+          : current,
+      );
+    }).then((off) => {
+      offLog = off;
+    });
     return () => {
       offTelemetry?.();
       offRunner?.();
+      offSlot?.();
+      offLog?.();
     };
   }, [load]);
 
+  const deviceState: DeviceState =
+    hub?.slots.find((slot) => slot.role === "trainer")?.state ?? { status: "idle" };
   const connected =
     deviceState.status === "ready" || deviceState.status === "controlling";
+  const connectedRoles = deviceRoles.filter((role) =>
+    slotConnected(hub?.slots.find((slot) => slot.role === role)?.state),
+  );
   const active =
     runner.status === "running" ||
     runner.status === "paused" ||
@@ -178,6 +221,7 @@ function App() {
   const navItems: Array<[Page, string, typeof Activity]> = [
     ["home", "Overview", Activity],
     ["workouts", "Workouts", Library],
+    ["devices", "Devices", Bluetooth],
     ["ride", "Ride", Bike],
     ["history", "History", History],
     ["settings", "Settings", Settings],
@@ -221,12 +265,26 @@ function App() {
             </button>
           ))}
         </nav>
-        <button className="connection-pill" onClick={() => setDevicePicker(true)}>
-          <span className={connected ? "status-dot online" : "status-dot"} />
+        <button className="connection-pill" onClick={() => setPage("devices")}>
+          <span className="role-dots">
+            {deviceRoles.map((role) => {
+              const state = hub?.slots.find((slot) => slot.role === role)?.state;
+              const tone =
+                slotConnected(state) ? "online"
+                : state?.status === "reconnecting" || state?.status === "error" ? "error"
+                : state?.status === "connecting" ? "busy"
+                : "";
+              return <span key={role} className={`status-dot ${tone}`} title={deviceRoleLabel[role]} />;
+            })}
+          </span>
           <span>
-            <small>TRAINER</small>
+            <small>DEVICES</small>
             <strong>
-              {connected ? deviceState.device.name : "Not connected"}
+              {connectedRoles.length === 0
+                ? "None connected"
+                : connected && connectedRoles.length === 1
+                  ? deviceState.device.name
+                  : `${connectedRoles.length} of ${deviceRoles.length} connected`}
             </strong>
           </span>
           <ChevronRight size={16} />
@@ -240,9 +298,17 @@ function App() {
             workouts={workouts}
             sessions={sessions}
             connected={connected}
-            onConnect={() => setDevicePicker(true)}
+            onConnect={() => setDevicePicker("trainer")}
             onRide={openRide}
             onNavigate={setPage}
+          />
+        )}
+        {page === "devices" && (
+          <DevicesPage
+            hub={hub}
+            sources={telemetry.sources}
+            onConnect={setDevicePicker}
+            perform={perform}
           />
         )}
         {page === "workouts" && (
@@ -268,7 +334,7 @@ function App() {
             selectedWorkout={selectedWorkout}
             setSelectedWorkout={setSelectedWorkout}
             connected={connected}
-            onConnect={() => setDevicePicker(true)}
+            onConnect={() => setDevicePicker("trainer")}
             runner={runner}
             telemetry={telemetry}
             telemetryHistory={telemetryHistory}
@@ -287,6 +353,12 @@ function App() {
             onClose={() => setSelectedSession(null)}
             onExport={(session) =>
               void perform(() => api.exportSessionCsv(session), "export csv")
+            }
+            onExportFit={(session) =>
+              void perform(() => api.exportSessionFit(session), "export fit")
+            }
+            onGarmin={(session) =>
+              void perform(() => api.prepareGarminUpload(session.id), "prepare Garmin upload")
             }
           />
         )}
@@ -311,9 +383,10 @@ function App() {
       )}
       {devicePicker && (
         <DevicePicker
-          state={deviceState}
-          setState={setDeviceState}
-          close={() => setDevicePicker(false)}
+          role={devicePicker}
+          slot={hub?.slots.find((slot) => slot.role === devicePicker)}
+          scanError={hub?.scanError ?? null}
+          close={() => setDevicePicker(null)}
           perform={perform}
         />
       )}
@@ -567,10 +640,10 @@ function Ride({
         <section className="live-ride">
           {runner.status === "countdown" && <div className="countdown">{runner.seconds}</div>}
           <div className="metrics-grid">
-            <LiveMetric icon={Zap} label="POWER" value={telemetry.powerWatts} unit="W" accent />
-            <LiveMetric icon={Gauge} label="CADENCE" value={Math.round(telemetry.cadenceRpm ?? 0)} unit="rpm" />
+            <LiveMetric icon={Zap} label="POWER" value={telemetry.powerWatts} unit="W" accent note={sourceNote(telemetry.sources?.power)} />
+            <LiveMetric icon={Gauge} label="CADENCE" value={Math.round(telemetry.cadenceRpm ?? 0)} unit="rpm" note={sourceNote(telemetry.sources?.cadence)} />
             <LiveMetric icon={Radio} label="SPEED" value={(telemetry.speedKph ?? 0).toFixed(1)} unit="km/h" />
-            <LiveMetric icon={HeartPulse} label="HEART RATE" value={telemetry.heartRateBpm ?? "—"} unit="bpm" />
+            <LiveMetric icon={HeartPulse} label="HEART RATE" value={telemetry.heartRateBpm ?? "—"} unit="bpm" note={sourceNote(telemetry.sources?.heartRate)} />
           </div>
           <div className="card live-chart">
             <div className={manualErg || openEnded ? "target-line editable" : "target-line"}>
@@ -619,7 +692,7 @@ function Ride({
   );
 }
 
-function HistoryPage({ sessions, selected, onSelect, onClose, onExport }: { sessions: SessionSummary[]; selected: SessionDetail | null; onSelect: (session: SessionSummary) => void; onClose: () => void; onExport: (session: SessionSummary) => void }) {
+function HistoryPage({ sessions, selected, onSelect, onClose, onExport, onExportFit, onGarmin }: { sessions: SessionSummary[]; selected: SessionDetail | null; onSelect: (session: SessionSummary) => void; onClose: () => void; onExport: (session: SessionSummary) => void; onExportFit: (session: SessionSummary) => void; onGarmin: (session: SessionSummary) => void }) {
   return (
     <>
       <PageHeader eyebrow={`${sessions.length} RECORDED RIDES`} title="Ride history" />
@@ -629,7 +702,7 @@ function HistoryPage({ sessions, selected, onSelect, onClose, onExport }: { sess
         <div className="history-title"><strong>{session.workoutName}</strong><span>{new Date(session.startedAt).toLocaleString()}</span></div>
         <Metric value={formatDuration(session.elapsedSeconds)} unit="duration" /><Metric value={`${session.averagePowerWatts}`} unit="W avg" /><Metric value={`${session.maxPowerWatts}`} unit="W max" /><ChevronRight />
       </button>)}</div>}
-      {selected && <div className="modal-backdrop"><div className="modal detail-modal"><button className="modal-close" onClick={onClose}><X /></button><span className="label">RIDE DETAIL</span><h2>{selected.summary.workoutName}</h2><p>{new Date(selected.summary.startedAt).toLocaleString()}</p><div className="detail-metrics"><Metric value={formatDuration(selected.summary.elapsedSeconds)} unit="duration" /><Metric value={`${selected.summary.averagePowerWatts}`} unit="W average" /><Metric value={`${selected.summary.maxPowerWatts}`} unit="W maximum" /><Metric value={`${Math.round(selected.summary.averageCadenceRpm ?? 0)}`} unit="rpm average" /></div><ResponsiveContainer width="100%" height={220}><AreaChart data={selected.samples}><CartesianGrid strokeDasharray="4 4" vertical={false}/><XAxis dataKey="timestampMs" hide/><YAxis width={42}/><Tooltip labelFormatter={() => ""}/><Area type="monotone" dataKey="powerWatts" stroke="#c8ff32" fill="#c8ff3233" isAnimationActive={false}/></AreaChart></ResponsiveContainer><button className="secondary" onClick={() => onExport(selected.summary)}><Download size={16}/> Export CSV</button></div></div>}
+      {selected && <div className="modal-backdrop"><div className="modal detail-modal"><button className="modal-close" onClick={onClose}><X /></button><span className="label">RIDE DETAIL</span><h2>{selected.summary.workoutName}</h2><p>{new Date(selected.summary.startedAt).toLocaleString()}</p><div className="detail-metrics"><Metric value={formatDuration(selected.summary.elapsedSeconds)} unit="duration" /><Metric value={`${selected.summary.averagePowerWatts}`} unit="W average" /><Metric value={`${selected.summary.maxPowerWatts}`} unit="W maximum" /><Metric value={`${Math.round(selected.summary.averageCadenceRpm ?? 0)}`} unit="rpm average" /></div><ResponsiveContainer width="100%" height={220}><AreaChart data={selected.samples}><CartesianGrid strokeDasharray="4 4" vertical={false}/><XAxis dataKey="timestampMs" hide/><YAxis width={42}/><Tooltip labelFormatter={() => ""}/><Area type="monotone" dataKey="powerWatts" stroke="#c8ff32" fill="#c8ff3233" isAnimationActive={false}/></AreaChart></ResponsiveContainer><div className="detail-actions"><button className="primary" onClick={() => onGarmin(selected.summary)}><Upload size={16}/> Upload to Garmin</button><button className="secondary" onClick={() => onExportFit(selected.summary)}><Download size={16}/> Export FIT</button><button className="secondary" onClick={() => onExport(selected.summary)}><Download size={16}/> Export CSV</button></div><p className="handoff-note">Garmin Connect and Finder will open. Drag the selected FIT file onto Garmin’s import page, then confirm the upload.</p></div></div>}
     </>
   );
 }
@@ -637,8 +710,10 @@ function HistoryPage({ sessions, selected, onSelect, onClose, onExport }: { sess
 function SettingsPage({ profile, onSave }: { profile: Profile; onSave: (profile: Profile) => void }) {
   const [draft, setDraft] = useState(profile);
   const [logPath, setLogPath] = useState("Loading log location…");
+  const [rideFilesPath, setRideFilesPath] = useState("Loading ride files location…");
   useEffect(() => {
     void api.logFilePath().then(setLogPath);
+    void api.rideFilesPath().then(setRideFilesPath);
   }, []);
   return (
     <>
@@ -648,97 +723,9 @@ function SettingsPage({ profile, onSave }: { profile: Profile; onSave: (profile:
         <div className="form-row"><label>FTP (watts)<input type="number" min="50" max="500" value={draft.ftpWatts} onChange={(event) => setDraft({ ...draft, ftpWatts: Number(event.target.value) })}/></label><label>Safety power limit<input type="number" min="100" max="2500" value={draft.maxPowerWatts} onChange={(event) => setDraft({ ...draft, maxPowerWatts: Number(event.target.value) })}/></label></div>
         <button className="primary" type="submit">Save settings</button>
       </form></section>
-      <section className="card settings-card"><div><span className="label">DATA & DIAGNOSTICS</span><h2>Local-first by design</h2><p>Profiles, workouts, and rides are stored locally. Errors are written to a persistent diagnostic log.</p></div><div className="log-location"><span>Log file</span><code>{logPath}</code><button className="secondary" onClick={() => void navigator.clipboard.writeText(logPath)}>Copy path</button><button className="secondary" onClick={() => void api.revealLogFile().catch(() => undefined)}>Show in folder</button></div></section>
+      <section className="card settings-card"><div><span className="label">DATA & DIAGNOSTICS</span><h2>Local-first by design</h2><p>Every finalized ride is stored in SQLite and as a persistent Garmin-compatible FIT file. Missing FIT files are regenerated automatically.</p></div><div className="data-locations"><div className="log-location"><span>Ride Files</span><code>{rideFilesPath}</code><button className="secondary" onClick={() => void api.revealRideFiles().catch(() => undefined)}>Show Ride Files</button></div><div className="log-location"><span>Log file</span><code>{logPath}</code><button className="secondary" onClick={() => void navigator.clipboard.writeText(logPath)}>Copy path</button><button className="secondary" onClick={() => void api.revealLogFile().catch(() => undefined)}>Show in folder</button></div></div></section>
     </>
   );
-}
-
-type ReadoutLine = ConnectProgress & { at: number; failed?: boolean };
-
-function DevicePicker({ state, setState, close, perform }: { state: DeviceState; setState: (state: DeviceState) => void; close: () => void; perform: (action: () => Promise<unknown>, label?: string) => Promise<void> }) {
-  const [devices, setDevices] = useState<DeviceInfo[]>([]);
-  const [scanning, setScanning] = useState(false);
-  const [connecting, setConnecting] = useState<DeviceInfo | null>(null);
-  const [readout, setReadout] = useState<ReadoutLine[]>([]);
-  const [outcome, setOutcome] = useState<"connected" | "failed" | null>(null);
-  const startedAt = useRef(0);
-  const scannedOnce = useRef(false);
-  const scan = useCallback(async () => {
-    setScanning(true);
-    await perform(async () => { setDevices(await api.scanTrainers()); setState(await api.deviceState()); }, "scan trainers");
-    setScanning(false);
-  }, [perform, setState]);
-  useEffect(() => {
-    if (!scannedOnce.current) {
-      scannedOnce.current = true;
-      void scan();
-    }
-  }, [scan]);
-  useEffect(() => {
-    let off: (() => void) | undefined;
-    void api.onConnectProgress((progress) => {
-      setReadout((lines) => [...lines, { ...progress, at: performance.now() - startedAt.current }]);
-    }).then((unlisten) => { off = unlisten; });
-    return () => off?.();
-  }, []);
-
-  const connect = async (device: DeviceInfo) => {
-    startedAt.current = performance.now();
-    setReadout([]);
-    setOutcome(null);
-    setConnecting(device);
-    void api.reportEvent("connect trainer", `${device.name} (${device.id})`).catch(() => undefined);
-    let ok = false;
-    await perform(async () => {
-      await api.connectTrainer(device);
-      ok = true;
-    }, `connect trainer: ${device.name}`);
-    setState(await api.deviceState());
-    if (ok) {
-      setOutcome("connected");
-      // Let the last line land before the modal disappears.
-      await new Promise((resolve) => setTimeout(resolve, 900));
-      setConnecting(null);
-      close();
-    } else {
-      setOutcome("failed");
-      setReadout((lines) => lines.length ? [...lines.slice(0, -1), { ...lines[lines.length - 1], failed: true }] : lines);
-    }
-  };
-
-  const connected = state.status === "ready" || state.status === "controlling";
-  const busy = connecting !== null && outcome === null;
-
-  return <div className="modal-backdrop"><div className="modal device-modal"><button className="modal-close" disabled={busy} onClick={close}><X /></button><div className="modal-icon">{busy ? <span className="spinner" /> : <Bluetooth />}</div><span className="label">BLUETOOTH FTMS</span>
-    <h2>{connecting ? (outcome === "connected" ? "Trainer connected" : outcome === "failed" ? "Connection failed" : `Connecting to ${connecting.name}…`) : connected ? "Trainer connected" : "Choose a trainer"}</h2>
-    {!connecting && <p>Make sure your trainer is awake and not paired with another app.</p>}
-    {connecting ? (
-      <div className={`readout ${outcome ?? "busy"}`}>
-        {readout.map((line, index) => (
-          <div key={index} className={`readout-line ${line.failed ? "fail" : line.level}`}>
-            <span className="readout-time">{(line.at / 1000).toFixed(2)}s</span>
-            <span className="readout-mark">{line.failed ? "✕" : line.level === "ok" ? "✓" : line.level === "warn" ? "!" : "›"}</span>
-            <span className="readout-step">{line.step}</span>
-            {line.detail && <span className="readout-detail">{line.detail}</span>}
-          </div>
-        ))}
-        {busy && <div className="readout-line info cursor"><span className="readout-time" /><span className="readout-mark">›</span><span className="readout-step">working<span className="dots" /></span></div>}
-        {outcome === "connected" && <div className="readout-line ok"><span className="readout-time">{((performance.now() - startedAt.current) / 1000).toFixed(2)}s</span><span className="readout-mark">✓</span><span className="readout-step">Ready to ride</span></div>}
-      </div>
-    ) : (
-      <>
-        {state.status === "error" && <div className="inline-error"><strong>{state.message}</strong><span>{state.guidance}</span></div>}
-        <div className="device-list">{devices.map((device) => <button key={device.id} onClick={() => void connect(device)}><span className="device-icon">{device.simulated ? <Activity /> : <Radio />}</span><span><strong>{device.name}</strong><small>{device.simulated ? "No hardware required" : `FTMS trainer · ${device.rssi ?? "—"} dBm`}</small></span><ChevronRight /></button>)}</div>
-      </>
-    )}
-    {outcome === "failed" && state.status === "error" && <div className="inline-error"><strong>{state.message}</strong><span>{state.guidance}</span></div>}
-    <div className="modal-actions">
-      {outcome === "failed"
-        ? <><button className="secondary" onClick={() => { setConnecting(null); setOutcome(null); }}>Back</button><button className="primary" onClick={() => connecting && void connect(connecting)}>Retry</button></>
-        : !connecting && <button className="secondary" disabled={scanning} onClick={() => void scan()}>{scanning ? "Scanning…" : "Scan again"}</button>}
-      {connected && !connecting && <button className="danger-button" onClick={() => void perform(async () => { await api.disconnectTrainer(); setState({ status: "idle" }); }, "disconnect trainer")}>Disconnect</button>}
-    </div>
-  </div></div>;
 }
 
 function WorkoutEditor({ initial, close, save }: { initial: Workout; close: () => void; save: (workout: Workout) => void }) {
@@ -777,8 +764,8 @@ function Metric({ value, unit }: { value: string; unit: string }) {
   return <div className="metric"><strong>{value}</strong><span>{unit}</span></div>;
 }
 
-function LiveMetric({ icon: Icon, label, value, unit, accent = false }: { icon: typeof Activity; label: string; value: string | number; unit: string; accent?: boolean }) {
-  return <div className={accent ? "live-metric accent" : "live-metric"}><span><Icon size={17}/>{label}</span><strong>{value}<small>{unit}</small></strong></div>;
+function LiveMetric({ icon: Icon, label, value, unit, accent = false, note }: { icon: typeof Activity; label: string; value: string | number; unit: string; accent?: boolean; note?: string | null }) {
+  return <div className={accent ? "live-metric accent" : "live-metric"}><span><Icon size={17}/>{label}</span><strong>{value}<small>{unit}</small></strong>{note && <em className="metric-source">{note}</em>}</div>;
 }
 
 function newWorkout(): Workout {

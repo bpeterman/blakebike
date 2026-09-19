@@ -10,7 +10,8 @@ FTMS smart trainers. The initial target platforms are macOS and Ubuntu/Pop!_OS
 - Built-in simulated trainer for development and hardware-free use
 - Structured workout editor with steady, ramp, free-ride, and imported repeat blocks
 - ZWO import/export, rider FTP and safety power limit
-- Crash-resistant SQLite ride recording, history charts, and CSV export
+- Crash-resistant SQLite ride recording, history charts, and CSV/FIT export
+- Persistent Garmin-compatible Ride Files with a guided Garmin Connect handoff
 
 ## Development
 
@@ -43,6 +44,12 @@ Everything the app does is written to a single log file, shown (with a
 
 - macOS: `~/Library/Logs/com.bpeterman.blakebike/blakebike.log`
 - Linux: `~/.local/share/com.bpeterman.blakebike/logs/blakebike.log`
+
+Every finalized ride is also written to the app data directory under
+`Ride Files/`. These FIT files are permanent local copies; missing files are
+regenerated from SQLite when the app starts. History → Ride Detail → Upload to
+Garmin opens Garmin Connect and reveals the selected FIT file in the system file
+manager. Drag that file onto Garmin's import page and confirm the upload.
 
 By default the app logs at `debug` for its own code and for btleplug's
 Bluetooth internals, and `info` for everything else. That covers every state

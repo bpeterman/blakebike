@@ -4,7 +4,13 @@
 //! a single fused `Telemetry` stream published by the hub.
 
 pub mod ble;
+pub mod cadence;
+pub mod crank;
+pub mod cycling_power;
+pub mod fuser;
+pub mod heart_rate;
 pub mod log;
+pub mod sensor;
 pub mod trainer;
 
 use std::{
@@ -24,6 +30,7 @@ use tokio::{
 };
 
 pub use ble::{Capability, DeviceInfo};
+pub use fuser::{SourcePreferences, TelemetrySources};
 pub use log::DeviceLogLine;
 
 use crate::domain::Telemetry;
@@ -123,6 +130,8 @@ pub struct SlotStats {
     /// Link losses since the app started.
     pub drops: u32,
     pub last_raw_hex: Option<String>,
+    /// Human summary of the latest decoded reading, e.g. "215 W · 88 rpm".
+    pub last_reading: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -140,6 +149,8 @@ pub struct DevicesSnapshot {
     pub scanning: bool,
     pub scan_error: Option<ScanError>,
     pub slots: Vec<SlotSnapshot>,
+    pub source_preferences: SourcePreferences,
+    pub sources: TelemetrySources,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -313,6 +324,14 @@ impl DeviceSlot {
         }
     }
 
+    pub fn record_reading(&self, summary: String) {
+        let mut inner = self
+            .stats
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.stats.last_reading = Some(summary);
+    }
+
     pub fn record_parse_failure(&self, raw: &[u8]) -> u64 {
         let mut inner = self
             .stats
@@ -403,10 +422,11 @@ pub struct DeviceHub {
     scanning: AtomicBool,
     scan_error: std::sync::Mutex<Option<ScanError>>,
     telemetry: broadcast::Sender<Telemetry>,
+    fuser: Arc<fuser::TelemetryFuser>,
     trainer: trainer::Trainer,
-    heart_rate: Arc<DeviceSlot>,
-    power: Arc<DeviceSlot>,
-    cadence: Arc<DeviceSlot>,
+    heart_rate: sensor::Sensor,
+    power: sensor::Sensor,
+    cadence: sensor::Sensor,
     /// Serializes connects: BlueZ misbehaves when several GATT connections
     /// start at once or while a scan is running.
     connect_lock: Mutex<()>,
@@ -426,19 +446,36 @@ impl DeviceHub {
     fn build(app: Option<AppHandle>) -> Self {
         let (telemetry, _) = broadcast::channel(64);
         let ble = Arc::new(ble::Ble::default());
+        let fuser = Arc::new(fuser::TelemetryFuser::new(app.clone(), telemetry.clone()));
         Self {
             trainer: trainer::Trainer::new(
                 DeviceSlot::new(DeviceRole::Trainer, app.clone()),
                 ble.clone(),
-                telemetry.clone(),
+                fuser.clone(),
             ),
-            heart_rate: DeviceSlot::new(DeviceRole::HeartRate, app.clone()),
-            power: DeviceSlot::new(DeviceRole::Power, app.clone()),
-            cadence: DeviceSlot::new(DeviceRole::Cadence, app.clone()),
+            heart_rate: sensor::Sensor::new(
+                DeviceSlot::new(DeviceRole::HeartRate, app.clone()),
+                ble.clone(),
+                fuser.clone(),
+                heart_rate::decoder,
+            ),
+            power: sensor::Sensor::new(
+                DeviceSlot::new(DeviceRole::Power, app.clone()),
+                ble.clone(),
+                fuser.clone(),
+                cycling_power::decoder,
+            ),
+            cadence: sensor::Sensor::new(
+                DeviceSlot::new(DeviceRole::Cadence, app.clone()),
+                ble.clone(),
+                fuser.clone(),
+                cadence::decoder,
+            ),
             ble,
             scanning: AtomicBool::new(false),
             scan_error: std::sync::Mutex::new(None),
             telemetry,
+            fuser,
             connect_lock: Mutex::new(()),
         }
     }
@@ -446,14 +483,27 @@ impl DeviceHub {
     pub fn slot(&self, role: DeviceRole) -> &Arc<DeviceSlot> {
         match role {
             DeviceRole::Trainer => self.trainer.slot(),
-            DeviceRole::HeartRate => &self.heart_rate,
-            DeviceRole::Power => &self.power,
-            DeviceRole::Cadence => &self.cadence,
+            DeviceRole::HeartRate => self.heart_rate.slot(),
+            DeviceRole::Power => self.power.slot(),
+            DeviceRole::Cadence => self.cadence.slot(),
         }
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<Telemetry> {
         self.telemetry.subscribe()
+    }
+
+    pub fn source_preferences(&self) -> SourcePreferences {
+        self.fuser.preferences()
+    }
+
+    pub fn set_source_preferences(&self, preferences: SourcePreferences) {
+        self.fuser.set_preferences(preferences);
+    }
+
+    /// Which device is currently feeding each metric.
+    pub fn telemetry_sources(&self) -> TelemetrySources {
+        self.fuser.sources()
     }
 
     pub fn is_scanning(&self) -> bool {
@@ -483,6 +533,8 @@ impl DeviceHub {
             scanning: self.is_scanning(),
             scan_error: self.scan_error(),
             slots,
+            source_preferences: self.source_preferences(),
+            sources: self.telemetry_sources(),
         }
     }
 
@@ -524,6 +576,9 @@ impl DeviceHub {
                     "Scan finished"
                 );
                 let mut devices = trainer::simulated_devices();
+                devices.push(heart_rate::simulated_device());
+                devices.push(cycling_power::simulated_device());
+                devices.push(cadence::simulated_device());
                 devices.extend(found);
                 Ok(devices)
             }
@@ -536,7 +591,7 @@ impl DeviceHub {
             .scan()
             .await?
             .into_iter()
-            .filter(|device| device.simulated || device.supports(Capability::Ftms))
+            .filter(|device| device.supports(Capability::Ftms))
             .collect())
     }
 
@@ -572,28 +627,18 @@ impl DeviceHub {
         }
         match role {
             DeviceRole::Trainer => self.trainer.connect(device).await,
-            other => {
-                let slot = self.slot(other);
-                slot.progress("warn", "Role not supported yet", Some(other.label().into()));
-                Err(format!(
-                    "{} support is coming in a later update",
-                    other.label()
-                ))
-            }
+            DeviceRole::HeartRate => self.heart_rate.connect(device).await,
+            DeviceRole::Power => self.power.connect(device).await,
+            DeviceRole::Cadence => self.cadence.connect(device).await,
         }
     }
 
     pub async fn disconnect_role(&self, role: DeviceRole) {
         match role {
             DeviceRole::Trainer => self.trainer.disconnect().await,
-            other => {
-                let slot = self.slot(other);
-                slot.abort_worker().await;
-                slot.record_disconnected();
-                if !matches!(slot.state().await, DeviceState::Idle) {
-                    slot.set_state(DeviceState::Idle).await;
-                }
-            }
+            DeviceRole::HeartRate => self.heart_rate.disconnect().await,
+            DeviceRole::Power => self.power.disconnect().await,
+            DeviceRole::Cadence => self.cadence.disconnect().await,
         }
     }
 
@@ -686,23 +731,133 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unsupported_role_is_rejected_and_logged() {
+    async fn mismatched_capabilities_are_rejected() {
         let hub = DeviceHub::default();
-        let device = DeviceInfo {
+        let strap = DeviceInfo {
             id: "hr".into(),
             name: "Strap".into(),
             simulated: false,
             rssi: None,
             capabilities: vec![Capability::HeartRate],
         };
-        assert!(
-            hub.connect(DeviceRole::HeartRate, device.clone())
-                .await
-                .is_err()
-        );
-        assert_eq!(hub.slot(DeviceRole::HeartRate).log_lines().len(), 1);
-        let wrong = hub.connect(DeviceRole::Trainer, device).await.unwrap_err();
+        let wrong = hub
+            .connect(DeviceRole::Trainer, strap.clone())
+            .await
+            .unwrap_err();
         assert!(wrong.contains("does not advertise"));
+        let wrong = hub.connect(DeviceRole::Cadence, strap).await.unwrap_err();
+        assert!(wrong.contains("does not advertise"));
+        // A power meter qualifies for both Power and Cadence.
+        let meter = DeviceInfo {
+            id: "pm".into(),
+            name: "Crank".into(),
+            simulated: false,
+            rssi: None,
+            capabilities: vec![Capability::CyclingPower],
+        };
+        // Not in the last scan, so connecting fails, but only after the
+        // capability check passed.
+        let missing = hub.connect(DeviceRole::Cadence, meter).await.unwrap_err();
+        assert!(missing.contains("no longer available"), "{missing}");
+    }
+
+    #[tokio::test]
+    async fn all_four_simulators_fuse_with_dedicated_sensors_winning() {
+        let hub = DeviceHub::default();
+        let mut telemetry = hub.subscribe();
+        hub.connect(DeviceRole::Trainer, trainer::simulated_devices().remove(0))
+            .await
+            .unwrap();
+        hub.connect(DeviceRole::HeartRate, heart_rate::simulated_device())
+            .await
+            .unwrap();
+        hub.connect(DeviceRole::Power, cycling_power::simulated_device())
+            .await
+            .unwrap();
+        hub.connect(DeviceRole::Cadence, cadence::simulated_device())
+            .await
+            .unwrap();
+        let mut settled = false;
+        for _ in 0..40 {
+            tokio::time::timeout(std::time::Duration::from_secs(3), telemetry.recv())
+                .await
+                .expect("telemetry flows")
+                .unwrap();
+            let sources = hub.telemetry_sources();
+            if sources.power.is_some_and(|s| s.role == DeviceRole::Power)
+                && sources
+                    .cadence
+                    .is_some_and(|s| s.role == DeviceRole::Cadence)
+                && sources
+                    .heart_rate
+                    .is_some_and(|s| s.role == DeviceRole::HeartRate)
+            {
+                settled = true;
+                break;
+            }
+        }
+        assert!(
+            settled,
+            "every metric should come from its dedicated sensor"
+        );
+        let snapshot = hub.snapshot().await;
+        assert!(snapshot.slots.iter().all(|slot| slot.state.is_connected()));
+        assert!(snapshot.slots[2].stats.last_reading.is_some());
+        hub.disconnect().await;
+        assert!(
+            hub.snapshot()
+                .await
+                .slots
+                .iter()
+                .all(|slot| matches!(slot.state, DeviceState::Idle))
+        );
+    }
+
+    #[tokio::test]
+    async fn simulated_strap_and_trainer_fuse_heart_rate() {
+        let hub = DeviceHub::default();
+        let mut telemetry = hub.subscribe();
+        hub.connect(DeviceRole::Trainer, trainer::simulated_devices().remove(0))
+            .await
+            .unwrap();
+        hub.connect(DeviceRole::HeartRate, heart_rate::simulated_device())
+            .await
+            .unwrap();
+        // Wait until both sources have reported at least once.
+        let mut fused = None;
+        for _ in 0..12 {
+            let sample = tokio::time::timeout(std::time::Duration::from_secs(3), telemetry.recv())
+                .await
+                .expect("telemetry flows")
+                .unwrap();
+            let sources = hub.telemetry_sources();
+            if sources
+                .heart_rate
+                .is_some_and(|s| s.role == DeviceRole::HeartRate)
+                && sources.power.is_some_and(|s| s.role == DeviceRole::Trainer)
+            {
+                fused = Some(sample);
+                break;
+            }
+        }
+        let sample = fused.expect("strap supplies heart rate, trainer supplies power");
+        // Simulated strap starts near 95 bpm; the simulated trainer's own HR field is ~130.
+        assert!(sample.heart_rate_bpm.unwrap() < 120);
+        let snapshot = hub.snapshot().await;
+        assert!(snapshot.slots[1].state.is_connected());
+        assert_eq!(snapshot.source_preferences, SourcePreferences::default());
+        hub.disconnect_role(DeviceRole::HeartRate).await;
+        assert!(matches!(
+            hub.slot(DeviceRole::HeartRate).state().await,
+            DeviceState::Idle
+        ));
+        assert!(
+            hub.slot(DeviceRole::HeartRate)
+                .log_lines()
+                .iter()
+                .any(|line| line.step == "Disconnected")
+        );
+        hub.disconnect().await;
     }
 
     #[test]

@@ -269,6 +269,7 @@ dependencies = [
  "btleplug",
  "chrono",
  "csv",
+ "fit-sdk-rust",
  "futures",
  "proptest",
  "quick-xml 0.38.4",
@@ -1157,6 +1158,17 @@ name = "find-msvc-tools"
 version = "0.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ef25905e51abafe4dcea6c15fec58c57b601cdbd0ee53d22ea1d3016c587d39b"
+
+[[package]]
+name = "fit-sdk-rust"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b96788152c6ada9557f700e67d50321dabb9aff5fab41ebe3e6da43cabebf35"
+dependencies = [
+ "chrono",
+ "smallvec",
+ "thiserror 2.0.20",
+]
 
 [[package]]
 name = "flate2"

@@ -1,6 +1,7 @@
 mod commands;
 mod devices;
 mod domain;
+mod fit;
 mod formats;
 mod ftms;
 mod runner;
@@ -19,6 +20,7 @@ pub struct AppState {
     runner: Arc<WorkoutRunner>,
     storage: Arc<Storage>,
     log_path: PathBuf,
+    ride_files_dir: PathBuf,
     _log_guard: tracing_appender::non_blocking::WorkerGuard,
 }
 
@@ -65,17 +67,39 @@ pub fn run() {
                 log_file = %log_path.display(),
                 "blake.bike started"
             );
-            let database_path = app.path().app_data_dir()?.join("blakebike.sqlite3");
+            let app_data_dir = app.path().app_data_dir()?;
+            let database_path = app_data_dir.join("blakebike.sqlite3");
+            let ride_files_dir = app_data_dir.join("Ride Files");
+            fs::create_dir_all(&ride_files_dir)?;
             tracing::info!(database = %database_path.display(), "Opening local storage");
             let storage = Storage::open(&database_path).map_err(|error| {
                 tracing::error!(error = %error, database = %database_path.display(), "Storage init failed");
                 format!("Could not initialize local storage: {error}")
             })?;
+            let reconciliation = fit::reconcile_ride_files(&ride_files_dir, &storage);
+            tracing::info!(
+                generated = reconciliation.generated,
+                existing = reconciliation.existing,
+                failures = reconciliation.failures.len(),
+                directory = %ride_files_dir.display(),
+                "Ride Files reconciled"
+            );
+            for (session_id, error) in reconciliation.failures {
+                tracing::warn!(%session_id, %error, "Could not backfill ride FIT file");
+            }
+            let devices = DeviceHub::new(app.handle().clone());
+            match storage.source_preferences() {
+                Ok(preferences) => devices.set_source_preferences(preferences),
+                Err(error) => {
+                    tracing::warn!(error = %error, "Could not load telemetry source preferences; using Auto")
+                }
+            }
             app.manage(AppState {
-                devices: Arc::new(DeviceHub::new(app.handle().clone())),
+                devices: Arc::new(devices),
                 runner: Arc::new(WorkoutRunner::default()),
                 storage: Arc::new(storage),
                 log_path,
+                ride_files_dir,
                 _log_guard: log_guard,
             });
             Ok(())
@@ -102,6 +126,8 @@ pub fn run() {
             commands::connect_device,
             commands::disconnect_device,
             commands::device_log,
+            commands::get_source_preferences,
+            commands::set_source_preferences,
             commands::get_profile,
             commands::save_profile,
             commands::list_workouts,
@@ -121,6 +147,10 @@ pub fn run() {
             commands::list_sessions,
             commands::get_session,
             commands::export_session_csv,
+            commands::export_session_fit,
+            commands::prepare_garmin_upload,
+            commands::get_ride_files_path,
+            commands::reveal_ride_files,
             commands::get_log_file_path,
             commands::reveal_log_file,
             commands::report_client_error,

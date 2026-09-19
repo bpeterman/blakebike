@@ -214,6 +214,7 @@ textarea { min-height: 70px; resize: vertical; }
 .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .settings-card .primary { justify-self: start; }
 .data-badge { align-self: center; justify-self: end; padding: 8px 11px; border: 1px solid #37402d; border-radius: 8px; color: #b7c2ab; background: #22291c; font-size: 12px; }
+.data-locations { min-width: 0; display: grid; gap: 18px; }
 .log-location { min-width: 0; display: grid; gap: 8px; align-self: center; }
 .log-location > span { color: #7f887a; font-size: 10px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; }
 .log-location code { overflow-wrap: anywhere; padding: 10px; border: 1px solid #343a31; border-radius: 7px; color: #b9c2b3; background: #131612; font-size: 11px; }
@@ -250,6 +251,8 @@ textarea { min-height: 70px; resize: vertical; }
 .editor-actions { justify-content: end; margin-top: 18px; }
 .detail-modal { width: min(760px, 95vw); }
 .detail-metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin: 20px 0; padding: 14px; border-radius: 9px; background: #222620; }
+.detail-actions { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 15px; }
+.handoff-note { margin: 10px 0 0; color: #7f887a; font-size: 11px; }
 
 .toast { position: fixed; z-index: 80; right: 25px; bottom: 25px; display: flex; align-items: center; gap: 14px; max-width: 430px; padding: 12px 14px; border-radius: 9px; box-shadow: 0 15px 40px rgba(0,0,0,.4); font-size: 12px; }
 .toast button { display: grid; place-items: center; padding: 0; border: 0; color: inherit; background: transparent; }
@@ -287,3 +290,59 @@ textarea { min-height: 70px; resize: vertical; }
 .dots::after { content: ""; animation: dots 1.2s steps(4, end) infinite; }
 @keyframes dots { 0% { content: ""; } 25% { content: "."; } 50% { content: ".."; } 75% { content: "..."; } }
 .modal-close:disabled { opacity: .35; }
+
+/* Devices hub */
+.role-dots { display: flex; gap: 4px; }
+.status-dot.busy { background: #e6c36a; box-shadow: 0 0 8px #e6c36a66; }
+.status-dot.error { background: #ff8a7a; box-shadow: 0 0 8px #ff8a7a66; }
+.devices-scan-error { margin-bottom: 16px; }
+.device-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 15px; }
+.device-card { display: grid; gap: 14px; padding: 20px; }
+.device-card.online { border-color: #3a4a25; }
+.device-card.error { border-color: #5a3a35; }
+.device-card-head { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 14px; }
+.device-card-head h3 { margin: 2px 0 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.status-chip { padding: 4px 9px; border-radius: 99px; font-size: 10px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: #8d9587; background: #242823; border: 1px solid #333930; }
+.status-chip.online { color: #c8ff32; background: #26301c; border-color: #4a5f22; }
+.status-chip.busy { color: #e6c36a; background: #2c2818; border-color: #554b25; }
+.status-chip.error { color: #ff8a7a; background: #2b1e1c; border-color: #663c36; }
+.device-strip { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.device-stat { display: grid; gap: 3px; padding: 9px 11px; border: 1px solid #2a2f28; border-radius: 9px; background: #151814; }
+.device-stat span { display: flex; align-items: center; gap: 5px; color: #737b6e; font-size: 9px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+.device-stat strong { font-size: 14px; letter-spacing: -.01em; }
+.device-reading { display: grid; gap: 4px; min-height: 66px; padding: 12px 14px; border-radius: 10px; background: #12150f; border: 1px solid #262b24; }
+.device-reading strong { font-size: 20px; letter-spacing: -.02em; color: #edf2e8; }
+.device-reading small { color: #737b6e; font-size: 11px; }
+.device-reading .feeding { color: #b6e935; font-size: 10px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
+.device-reading.muted strong { font-size: 13px; font-weight: 500; color: #8d9587; line-height: 1.5; }
+.device-reading.stale { border-color: #554b25; }
+.device-reading.stale strong { color: #e6c36a; }
+.device-actions { flex-wrap: wrap; }
+.device-actions .log-toggle { margin-left: auto; }
+.log-count { margin-left: 4px; padding: 1px 6px; border-radius: 99px; color: #8d9587; background: #242823; font-size: 10px; }
+.device-log { display: grid; gap: 10px; }
+.device-details { display: grid; grid-template-columns: auto 1fr; gap: 4px 14px; margin: 0; font-size: 11px; }
+.device-details dt { color: #737b6e; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; font-size: 9px; align-self: center; }
+.device-details dd { margin: 0; color: #d7ddd2; overflow-wrap: anywhere; }
+.device-details code { color: #b9c2b3; font-size: 10px; }
+.readout.hub-log { margin: 0; max-height: 260px; }
+.readout.hub-log .readout-line { grid-template-columns: 62px 16px auto 1fr; }
+.readout.empty { margin: 0; color: #687061; text-align: center; }
+.sources-card { display: grid; grid-template-columns: .8fr 1.2fr; gap: 40px; margin-top: 16px; padding: 24px; }
+.sources-list { display: grid; gap: 10px; align-content: start; }
+.source-row { display: grid; grid-template-columns: 90px 1fr auto; align-items: center; gap: 12px; }
+.source-metric { color: #d7ddd2; font-size: 12px; font-weight: 700; }
+.source-row select { padding: 9px 10px; }
+.source-active { color: #c8ff32; font-size: 11px; white-space: nowrap; }
+.source-active.fallback { color: #e6c36a; }
+.source-active.none { color: #687061; }
+.capability-chips { display: inline-flex; gap: 4px; margin-left: 8px; }
+.capability-chips i { padding: 1px 6px; border: 1px solid #333930; border-radius: 99px; color: #858e80; font-size: 9px; font-style: normal; letter-spacing: .04em; }
+.device-list-empty { padding: 16px; border: 1px dashed #3a4137; border-radius: 9px; color: #788174; font-size: 12px; text-align: center; }
+.metric-source { display: block; margin-top: 6px; color: #7f8f6a; font-size: 10px; font-style: normal; letter-spacing: .04em; }
+.live-metric.accent .metric-source { color: #9fbf3a; }
+
+@media (max-width: 1050px) {
+  .device-grid { grid-template-columns: 1fr; }
+  .sources-card { grid-template-columns: 1fr; gap: 18px; }
+}

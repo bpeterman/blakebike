@@ -8,13 +8,15 @@ use std::{
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::{sync::RwLock, task::JoinHandle};
 use uuid::Uuid;
 
 use crate::{
+    AppState,
     devices::DeviceHub,
     domain::{Interval, SessionSummary, Workout},
+    fit::ensure_ride_file,
     storage::Storage,
 };
 
@@ -571,6 +573,23 @@ async fn finish(
         tracing::error!(session_id = %summary.id, error = %error, "Could not persist session summary");
         error
     })?;
+    let ride_files_dir = app.state::<AppState>().ride_files_dir.clone();
+    match storage.session(summary.id) {
+        Ok(Some(detail)) => match ensure_ride_file(&ride_files_dir, &detail) {
+            Ok(path) => {
+                tracing::info!(session_id = %summary.id, file = %path.display(), "Ride FIT file saved")
+            }
+            Err(error) => {
+                tracing::warn!(session_id = %summary.id, %error, "Could not save ride FIT file; startup will retry")
+            }
+        },
+        Ok(None) => {
+            tracing::warn!(session_id = %summary.id, "Ride disappeared before FIT generation")
+        }
+        Err(error) => {
+            tracing::warn!(session_id = %summary.id, %error, "Could not reload ride for FIT generation")
+        }
+    }
     *state.write().await = RunnerState::Finished {
         session_id: summary.id,
         completed,
