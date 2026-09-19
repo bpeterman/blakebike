@@ -85,6 +85,8 @@ export type SlotStats = {
   firmware: string | null;
   connectedSinceMs: number | null;
   drops: number;
+  /** Automatic reconnect attempt in progress (0 or absent when none). */
+  reconnectAttempt?: number;
   lastRawHex: string | null;
   /** Human summary of the latest decoded reading, e.g. "215 W · 88 rpm". */
   lastReading: string | null;

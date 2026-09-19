@@ -170,6 +170,12 @@ impl Ble {
         self.discovered.lock().await.get(id).cloned()
     }
 
+    /// Drop a cached peripheral handle. After a link loss the handle is
+    /// stale; forgetting it makes the next connect do a fresh targeted scan.
+    pub async fn forget_peripheral(&self, id: &str) {
+        self.discovered.lock().await.remove(id);
+    }
+
     /// Scan until the peripheral with `id` is seen (or `FIND_TIMEOUT` passes),
     /// remembering it so a following connect can use it. Returns the device as
     /// currently advertised.

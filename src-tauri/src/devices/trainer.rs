@@ -980,20 +980,26 @@ impl Trainer {
     pub async fn disconnect(&self) {
         let _ = self.calibration_cancel.send(());
         let had_peripheral = self.peripheral.read().await.is_some();
+        let was_connected = self.slot.state().await.is_connected();
         if had_peripheral {
             tracing::info!("Disconnecting trainer");
-        }
-        if let Err(error) = self.stop().await {
-            tracing::debug!(error = %error, "Stop before disconnect failed (ignored)");
         }
         if self.slot.abort_worker().await {
             tracing::debug!("Trainer worker aborted");
         }
+        // Only a live trainer is told to stop; a lost one cannot hear it and
+        // waiting on it would only delay the reconnect.
+        if was_connected
+            && let Ok(Err(error)) = tokio::time::timeout(Duration::from_secs(3), self.stop()).await
+        {
+            tracing::debug!(error = %error, "Stop before disconnect failed (ignored)");
+        }
         self.simulated.store(false, Ordering::Relaxed);
         if let Some(peripheral) = self.peripheral.write().await.take() {
-            match peripheral.disconnect().await {
-                Ok(()) => tracing::debug!("GATT disconnected"),
-                Err(error) => tracing::warn!(error = %error, "GATT disconnect failed"),
+            match tokio::time::timeout(Duration::from_secs(3), peripheral.disconnect()).await {
+                Ok(Ok(())) => tracing::debug!("GATT disconnected"),
+                Ok(Err(error)) => tracing::warn!(error = %error, "GATT disconnect failed"),
+                Err(_) => tracing::warn!("GATT disconnect timed out"),
             }
         }
         *self.control_point.write().await = None;
@@ -1001,7 +1007,6 @@ impl Trainer {
         self.calibrating.store(false, Ordering::Relaxed);
         self.slot.set_calibration(Some(false), Some(false)).await;
         self.fuser.forget(DeviceRole::Trainer);
-        let was_connected = self.slot.state().await.is_connected();
         if had_peripheral || was_connected {
             self.slot.note("info", "Disconnected", None);
         }
