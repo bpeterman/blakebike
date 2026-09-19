@@ -219,4 +219,36 @@ describe("Ride charts", () => {
       ),
     ).toEqual(["heartRate", "speed"]);
   });
+
+  it("explains why a ride ended and that it was saved", () => {
+    const errored: RunnerState = {
+      status: "error",
+      message: "Trainer control command timed out",
+      sessionId: "session",
+    };
+    render(
+      <Ride
+        workouts={[]}
+        selectedWorkout={null}
+        setSelectedWorkout={vi.fn()}
+        connected
+        onConnect={vi.fn()}
+        runner={errored}
+        telemetry={telemetry}
+        telemetryHistory={[]}
+        powerSmoothing="instant"
+        onPowerSmoothing={vi.fn()}
+        sourcePreferences={defaultSourcePreferences}
+        onSourcePreference={vi.fn()}
+        profile={profile}
+        trainingZones={defaultTrainingZoneSettings}
+        displayPreferences={defaultRideDisplayPreferences}
+        perform={async () => undefined}
+      />,
+    );
+    const alert = screen.getByRole("alert");
+    expect(alert).toHaveTextContent("Ride ended: Trainer control command timed out.");
+    expect(alert).toHaveTextContent("Your ride was saved to History.");
+    expect(screen.getByText("Start a ride")).toBeInTheDocument();
+  });
 });
