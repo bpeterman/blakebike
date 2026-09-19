@@ -219,12 +219,11 @@ describe("Ride charts", () => {
       ),
     ).toEqual(["heartRate", "speed"]);
   });
-
-  it("explains why a ride ended and that it was saved", () => {
+  it("explains an error that ended before a ride could be saved", () => {
     const errored: RunnerState = {
       status: "error",
       message: "Trainer control command timed out",
-      sessionId: "session",
+      sessionId: null,
     };
     render(
       <Ride
@@ -248,7 +247,6 @@ describe("Ride charts", () => {
     );
     const alert = screen.getByRole("alert");
     expect(alert).toHaveTextContent("Ride ended: Trainer control command timed out.");
-    expect(alert).toHaveTextContent("Your ride was saved to History.");
     expect(screen.getByText("Start a ride")).toBeInTheDocument();
   });
 
