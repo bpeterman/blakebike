@@ -31,6 +31,7 @@ vi.mock("./api", () => ({
     connectDevice: vi.fn(() => Promise.resolve()),
     knownDevices: vi.fn(() => Promise.resolve(knownDevices)),
     forgetDevice: vi.fn(() => Promise.resolve()),
+    restoreKnownDevices: vi.fn(() => Promise.resolve()),
   },
 }));
 
@@ -195,7 +196,8 @@ describe("DevicesPage", () => {
   });
 
   it("lists known devices with make, offers one-click connect and forget", async () => {
-    render(<DevicesPage hub={snapshot} sources={snapshot.sources} onConnect={vi.fn()} onCalibrate={vi.fn()} onSourcePreference={vi.fn()} perform={perform} />);
+    const onOfferUndo = vi.fn();
+    render(<DevicesPage hub={snapshot} sources={snapshot.sources} onConnect={vi.fn()} onCalibrate={vi.fn()} onSourcePreference={vi.fn()} onOfferUndo={onOfferUndo} perform={perform} />);
     await waitFor(() => expect(screen.getByText("Connect again with one click")).toBeInTheDocument());
     // The trainer is connected right now; the strap was used two days ago.
     expect(screen.getByText("connected now")).toBeInTheDocument();
@@ -210,6 +212,9 @@ describe("DevicesPage", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Forget HRM-Pro" }));
     await waitFor(() => expect(api.forgetDevice).toHaveBeenCalledWith("strap"));
+    expect(onOfferUndo).toHaveBeenCalledWith("“HRM-Pro” forgotten.", expect.any(Function));
+    await onOfferUndo.mock.calls[0][1]();
+    expect(api.restoreKnownDevices).toHaveBeenCalledWith([knownDevices[1]]);
   });
 
   it("renders sensibly before the first snapshot arrives", () => {

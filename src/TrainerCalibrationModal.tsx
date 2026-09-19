@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { AlertTriangle, CheckCircle2, Gauge, X } from "lucide-react";
 import { api } from "./api";
 import type { CalibrationProgress } from "./types";
+import { useDialog } from "./useDialog";
 
 type Phase = "idle" | CalibrationProgress["phase"];
 
@@ -20,6 +21,7 @@ export function TrainerCalibrationModal({
   const [listening, setListening] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const active = activePhases.includes(phase);
+  const dialogRef = useDialog(close, !active);
 
   useEffect(() => {
     let mounted = true;
@@ -80,8 +82,10 @@ export function TrainerCalibrationModal({
               : "Calibrate trainer";
 
   return (
-    <div className="modal-backdrop" role="presentation">
-      <section className="modal calibration-modal" role="dialog" aria-modal="true" aria-labelledby="calibration-title">
+    <div className="modal-backdrop dialog-enter" role="presentation" onMouseDown={(event) => {
+      if (event.target === event.currentTarget && !active) close();
+    }}>
+      <section ref={dialogRef} className="modal calibration-modal" role="dialog" aria-modal="true" aria-labelledby="calibration-title" tabIndex={-1}>
         <button className="modal-close" onClick={close} disabled={active} aria-label="Close calibration">
           <X size={18} />
         </button>
