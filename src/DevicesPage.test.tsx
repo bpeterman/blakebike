@@ -108,7 +108,7 @@ describe("DevicesPage", () => {
 
   it("renders a card per role with live stats and the log on demand", () => {
     const onConnect = vi.fn();
-    render(<DevicesPage hub={snapshot} sources={snapshot.sources} onConnect={onConnect} perform={perform} />);
+    render(<DevicesPage hub={snapshot} sources={snapshot.sources} onConnect={onConnect} onSourcePreference={vi.fn()} perform={perform} />);
 
     expect(screen.getByText("1 of 4 connected")).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "KICKR CORE" })).toBeInTheDocument();
@@ -141,7 +141,8 @@ describe("DevicesPage", () => {
   });
 
   it("shows source selection, fallback state, and saves changes", () => {
-    render(<DevicesPage hub={snapshot} sources={snapshot.sources} onConnect={vi.fn()} perform={perform} />);
+    const onSourcePreference = vi.fn();
+    render(<DevicesPage hub={snapshot} sources={snapshot.sources} onConnect={vi.fn()} onSourcePreference={onSourcePreference} perform={perform} />);
     // Heart rate is pinned to the strap, which is down, so the trainer is a fallback.
     expect(screen.getByText("falling back to KICKR CORE")).toBeInTheDocument();
     expect(screen.getAllByText("from KICKR CORE")).toHaveLength(2);
@@ -149,15 +150,11 @@ describe("DevicesPage", () => {
     const selects = screen.getAllByRole("combobox");
     expect((selects[2] as HTMLSelectElement).value).toBe("heartRate");
     fireEvent.change(selects[0], { target: { value: "power" } });
-    expect(api.saveSourcePreferences).toHaveBeenCalledWith({
-      power: { mode: "role", role: "power" },
-      cadence: { mode: "auto" },
-      heartRate: { mode: "role", role: "heartRate" },
-    });
+    expect(onSourcePreference).toHaveBeenCalledWith("power", { mode: "role", role: "power" });
   });
 
   it("lists known devices with make, offers one-click connect and forget", async () => {
-    render(<DevicesPage hub={snapshot} sources={snapshot.sources} onConnect={vi.fn()} perform={perform} />);
+    render(<DevicesPage hub={snapshot} sources={snapshot.sources} onConnect={vi.fn()} onSourcePreference={vi.fn()} perform={perform} />);
     await waitFor(() => expect(screen.getByText("Connect again with one click")).toBeInTheDocument());
     // The trainer is connected right now; the strap was used two days ago.
     expect(screen.getByText("connected now")).toBeInTheDocument();
@@ -175,7 +172,7 @@ describe("DevicesPage", () => {
   });
 
   it("renders sensibly before the first snapshot arrives", () => {
-    render(<DevicesPage hub={null} sources={undefined} onConnect={vi.fn()} perform={perform} />);
+    render(<DevicesPage hub={null} sources={undefined} onConnect={vi.fn()} onSourcePreference={vi.fn()} perform={perform} />);
     expect(screen.getByText("0 of 4 connected")).toBeInTheDocument();
     expect(screen.getAllByRole("button", { name: /^Connect$/ }).length).toBeGreaterThanOrEqual(4);
   });

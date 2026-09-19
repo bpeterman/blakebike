@@ -14,6 +14,7 @@ import {
   Play,
   Plus,
   Radio,
+  RefreshCw,
   Settings,
   SkipForward,
   Trash2,
@@ -35,26 +36,37 @@ import type {
   DeviceRole,
   DeviceState,
   DevicesSnapshot,
+  Metric as SourceMetric,
+  PowerSmoothing,
   Profile,
   RunnerState,
   SessionDetail,
   SessionSummary,
+  SourceChoice,
+  SourcePreferences,
   Telemetry,
   Workout,
   WorkoutStep,
 } from "./types";
 import {
+  BIAS_STEP_PERCENT,
+  clampBias,
   deviceRoleLabel,
   deviceRoles,
   formatDistance,
   formatDuration,
   formatSpeed,
-  manualPowerDeltaForKey,
+  powerSmoothingLabel,
+  powerSmoothingOptions,
+  rideKeyAction,
+  withSmoothedPower,
   workoutDuration,
 } from "./types";
 import { DevicePicker } from "./DevicePicker";
 import { DevicesPage } from "./DevicesPage";
 import { isConnected as slotConnected, sourceNote } from "./devices";
+import { SourceSelect } from "./SourceSelect";
+import { defaultSourcePreferences, withSourcePreference } from "./sourcePreferences";
 import "./App.css";
 
 type Page = "home" | "workouts" | "devices" | "ride" | "history" | "settings";
@@ -79,6 +91,7 @@ function App() {
   const [runner, setRunner] = useState<RunnerState>({ status: "idle" });
   const [telemetry, setTelemetry] = useState(emptyTelemetry);
   const [telemetryHistory, setTelemetryHistory] = useState<Telemetry[]>([]);
+  const [powerSmoothing, setPowerSmoothing] = useState<PowerSmoothing>("instant");
   const [error, setError] = useState<string | null>(null);
   const [devicePicker, setDevicePicker] = useState<DeviceRole | null>(null);
   const [editor, setEditor] = useState<Workout | null>(null);
@@ -90,19 +103,21 @@ function App() {
 
   const load = useCallback(async () => {
     try {
-      const [nextProfile, nextWorkouts, nextSessions, nextHub, nextRunner] =
+      const [nextProfile, nextWorkouts, nextSessions, nextHub, nextRunner, nextSmoothing] =
         await Promise.all([
           api.profile(),
           api.workouts(),
           api.sessions(),
           api.devicesSnapshot(),
           api.runnerState(),
+          api.powerSmoothing(),
         ]);
       setProfile(nextProfile);
       setWorkouts(nextWorkouts);
       setSessions(nextSessions);
       setHub(nextHub);
       setRunner(nextRunner);
+      setPowerSmoothing(nextSmoothing);
       setSelectedWorkout((current) => current ?? nextWorkouts[0]?.id ?? null);
     } catch (cause) {
       const message = messageOf(cause);
@@ -197,7 +212,7 @@ function App() {
     runner.status === "paused" ||
     runner.status === "countdown";
 
-  const perform = async (action: () => Promise<unknown>, label = "user action") => {
+  const perform = useCallback(async (action: () => Promise<unknown>, label = "user action") => {
     try {
       setError(null);
       await action();
@@ -206,6 +221,25 @@ function App() {
       setError(message);
       void api.reportError(label, message).catch(() => undefined);
     }
+  }, []);
+
+  // The smoothing choice is remembered across launches; apply it at once and
+  // save in the background so the toggle never feels laggy.
+  const changePowerSmoothing = (smoothing: PowerSmoothing) => {
+    setPowerSmoothing(smoothing);
+    void api.savePowerSmoothing(smoothing).catch((cause) =>
+      void api.reportError("save power smoothing", messageOf(cause)).catch(() => undefined),
+    );
+  };
+
+  const changeSourcePreference = (metric: SourceMetric, choice: SourceChoice) => {
+    const next = withSourcePreference(
+      hub?.sourcePreferences ?? defaultSourcePreferences,
+      metric,
+      choice,
+    );
+    setHub((current) => current ? { ...current, sourcePreferences: next } : current);
+    void perform(() => api.saveSourcePreferences(next), "save source preferences");
   };
 
   const openRide = (workoutId: string) => {
@@ -303,6 +337,11 @@ function App() {
             onConnect={() => setDevicePicker("trainer")}
             onRide={openRide}
             onNavigate={setPage}
+            onRefreshFtp={() =>
+              perform(async () => {
+                setProfile(await api.refreshEstimatedFtp());
+              }, "refresh estimated FTP")
+            }
           />
         )}
         {page === "devices" && (
@@ -310,6 +349,7 @@ function App() {
             hub={hub}
             sources={telemetry.sources}
             onConnect={setDevicePicker}
+            onSourcePreference={changeSourcePreference}
             perform={perform}
           />
         )}
@@ -340,6 +380,10 @@ function App() {
             runner={runner}
             telemetry={telemetry}
             telemetryHistory={telemetryHistory}
+            powerSmoothing={powerSmoothing}
+            onPowerSmoothing={changePowerSmoothing}
+            sourcePreferences={hub?.sourcePreferences ?? defaultSourcePreferences}
+            onSourcePreference={changeSourcePreference}
             distanceUnit={profile.distanceUnit}
             perform={perform}
           />
@@ -369,6 +413,8 @@ function App() {
         {page === "settings" && (
           <SettingsPage
             profile={profile}
+            perform={perform}
+            onProfileUpdate={setProfile}
             onSave={(next) =>
               void perform(async () => {
                 await api.saveProfile(next);
@@ -450,6 +496,7 @@ function Overview({
   onConnect,
   onRide,
   onNavigate,
+  onRefreshFtp,
 }: {
   profile: Profile;
   workouts: Workout[];
@@ -458,8 +505,18 @@ function Overview({
   onConnect: () => void;
   onRide: (id: string) => void;
   onNavigate: (page: Page) => void;
+  onRefreshFtp: () => Promise<void>;
 }) {
   const latest = sessions[0];
+  const [refreshingFtp, setRefreshingFtp] = useState(false);
+  const refreshFtp = async () => {
+    setRefreshingFtp(true);
+    try {
+      await onRefreshFtp();
+    } finally {
+      setRefreshingFtp(false);
+    }
+  };
   return (
     <>
       <PageHeader eyebrow="GOOD EVENING" title={`Ready to ride, ${profile.name}?`} />
@@ -472,6 +529,15 @@ function Overview({
           <button className={connected ? "secondary" : "primary"} onClick={onConnect}>{connected ? "Manage" : "Connect"}</button>
         </article>
         <article className="card ftp-card">
+          <button
+            className="icon-button ftp-refresh"
+            title="Refresh from Intervals.icu"
+            aria-label="Refresh from Intervals.icu"
+            disabled={refreshingFtp}
+            onClick={() => void refreshFtp()}
+          >
+            <RefreshCw size={16} className={refreshingFtp ? "spinning" : ""} />
+          </button>
           <span className="label">CURRENT FTP</span>
           <div className="big-number">{profile.ftpWatts}<small> W</small></div>
           <p>Power targets scale from your rider profile.</p>
@@ -560,6 +626,10 @@ function Ride({
   runner,
   telemetry,
   telemetryHistory,
+  powerSmoothing,
+  onPowerSmoothing,
+  sourcePreferences,
+  onSourcePreference,
   distanceUnit,
   perform,
 }: {
@@ -571,6 +641,10 @@ function Ride({
   runner: RunnerState;
   telemetry: Telemetry;
   telemetryHistory: Telemetry[];
+  powerSmoothing: PowerSmoothing;
+  onPowerSmoothing: (smoothing: PowerSmoothing) => void;
+  sourcePreferences: SourcePreferences;
+  onSourcePreference: (metric: SourceMetric, choice: SourceChoice) => void;
   distanceUnit: Profile["distanceUnit"];
   perform: (action: () => Promise<unknown>, label?: string) => Promise<void>;
 }) {
@@ -580,12 +654,26 @@ function Ride({
   const elapsed = runner.status === "running" || runner.status === "paused" ? runner.elapsedSeconds : 0;
   const total = runner.status === "running" || runner.status === "paused" ? runner.totalSeconds : selected ? workoutDuration(selected.steps) : 0;
   const progress = total ? Math.min(100, (elapsed / total) * 100) : 0;
-  const manualErg = (runner.status === "running" || runner.status === "paused") && runner.manualErg;
-  const openEnded = (runner.status === "running" || runner.status === "paused") && runner.totalSeconds === null;
-  const targetPower = runner.status === "running" || runner.status === "paused"
-    ? runner.targetPowerWatts
-    : telemetry.targetPowerWatts;
+  const riding = runner.status === "running" || runner.status === "paused";
+  const manualErg = riding && runner.manualErg;
+  const openEnded = riding && runner.totalSeconds === null;
+  const targetPower = riding ? runner.targetPowerWatts : telemetry.targetPowerWatts;
+  // Structured workouts get the same target controls as free ride: ± 5 W,
+  // typed watts and ↑/↓ override the current interval; a bias scales the plan.
+  const plannedTarget = riding && !runner.manualErg ? runner.plannedTargetWatts : null;
+  const overrideActive = riding && !runner.manualErg && runner.overrideActive;
+  const biasPercent = riding ? runner.biasPercent : 100;
+  const structured = riding && !openEnded;
+  const adjustable = manualErg || openEnded || (structured && targetPower !== null);
   const displayedSpeed = formatSpeed(telemetry.speedKph ?? 0, distanceUnit);
+  const smoothedHistory = useMemo(
+    () => withSmoothedPower(telemetryHistory, powerSmoothing),
+    [telemetryHistory, powerSmoothing],
+  );
+  const displayedPower =
+    powerSmoothing === "instant"
+      ? telemetry.powerWatts
+      : smoothedHistory[smoothedHistory.length - 1]?.displayPowerWatts ?? telemetry.powerWatts;
 
   useEffect(() => {
     if (targetPower !== null) setTargetDraft(String(targetPower));
@@ -607,17 +695,35 @@ function Ride({
     }, "set manual power");
   };
 
+  const adjustBias = (delta: number) =>
+    perform(async () => {
+      await api.setBiasPercent(clampBias(biasPercent + delta));
+    }, delta > 0 ? "raise workout bias" : "lower workout bias");
+
+  const backToPlan = () =>
+    perform(async () => {
+      const applied = await api.clearTargetOverride();
+      if (applied !== null) setTargetDraft(String(applied));
+    }, "clear target override");
+
   useEffect(() => {
-    if (runner.status !== "running" || !runner.manualErg) return;
+    if (runner.status !== "running" || !adjustable) return;
     const onKeyDown = (event: KeyboardEvent) => {
-      const delta = manualPowerDeltaForKey(event.key, event.repeat);
-      if (delta === null) return;
+      // Leave typing in the watts box alone.
+      if (event.target instanceof HTMLInputElement) return;
+      const action = rideKeyAction(event.key, event.shiftKey, event.repeat);
+      if (action === null) return;
+      if (action.kind === "bias" && !structured) return;
       event.preventDefault();
-      void perform(() => api.adjustManualPower(delta), "adjust manual power");
+      if (action.kind === "power") {
+        void perform(() => api.adjustManualPower(action.delta), "adjust manual power");
+      } else {
+        void perform(() => api.setBiasPercent(clampBias(biasPercent + action.delta)), "adjust workout bias");
+      }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [perform, runner]);
+  }, [adjustable, biasPercent, perform, runner.status, structured]);
 
   return (
     <>
@@ -648,15 +754,45 @@ function Ride({
         <section className="live-ride">
           {runner.status === "countdown" && <div className="countdown">{runner.seconds}</div>}
           <div className="metrics-grid">
-            <LiveMetric icon={Zap} label="POWER" value={telemetry.powerWatts} unit="W" accent note={sourceNote(telemetry.sources?.power)} />
-            <LiveMetric icon={Gauge} label="CADENCE" value={Math.round(telemetry.cadenceRpm ?? 0)} unit="rpm" note={sourceNote(telemetry.sources?.cadence)} />
+            <LiveMetric icon={Zap} label="POWER" value={displayedPower} unit="W" accent note={sourceNote(telemetry.sources?.power)}
+              control={
+                <span className="metric-control-group">
+                  <SourceSelect
+                    metric="power"
+                    choice={sourcePreferences.power}
+                    onChange={(choice) => onSourcePreference("power", choice)}
+                  />
+                  <label className="smoothing-select">
+                    <span className="sr-only">Power smoothing</span>
+                    <select value={powerSmoothing} onChange={(event) => onPowerSmoothing(event.target.value as PowerSmoothing)}>
+                      {powerSmoothingOptions.map((option) => (
+                        <option key={option} value={option}>{powerSmoothingLabel[option]}</option>
+                      ))}
+                    </select>
+                  </label>
+                </span>
+              } />
+            <LiveMetric
+              icon={Gauge}
+              label="CADENCE"
+              value={Math.round(telemetry.cadenceRpm ?? 0)}
+              unit="rpm"
+              note={sourceNote(telemetry.sources?.cadence)}
+              control={
+                <SourceSelect
+                  metric="cadence"
+                  choice={sourcePreferences.cadence}
+                  onChange={(choice) => onSourcePreference("cadence", choice)}
+                />
+              }
+            />
             <LiveMetric icon={Radio} label="SPEED" value={displayedSpeed.value} unit={displayedSpeed.unit} />
             <LiveMetric icon={HeartPulse} label="HEART RATE" value={telemetry.heartRateBpm ?? "—"} unit="bpm" note={sourceNote(telemetry.sources?.heartRate)} />
           </div>
           <div className="card live-chart">
-            <div className={manualErg || openEnded ? "target-line editable" : "target-line"}>
+            <div className={adjustable ? "target-line editable" : "target-line"}>
               <span>Target power</span>
-              {manualErg || openEnded ? (
+              {adjustable ? (
                 <div className="manual-erg-stepper">
                   <button className="secondary" disabled={runner.status !== "running"} onClick={() => void adjustPower(-5)}>− 5 W</button>
                   <label>
@@ -681,9 +817,38 @@ function Ride({
                   <button className="secondary" disabled={runner.status !== "running"} onClick={() => void adjustPower(5)}>+ 5 W</button>
                 </div>
               ) : <strong>{targetPower ?? "Free"}{targetPower !== null ? " W" : ""}</strong>}
-              {(manualErg || openEnded) && <span className="manual-erg-hint">Type watts or use ↑ / ↓</span>}
+              {adjustable && <span className="manual-erg-hint">{structured ? "Type watts or use ↑ / ↓ · Shift for bias" : "Type watts or use ↑ / ↓"}</span>}
             </div>
-            <ResponsiveContainer width="100%" height={220}><AreaChart data={telemetryHistory}><defs><linearGradient id="powerFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#c8ff32" stopOpacity={0.45}/><stop offset="100%" stopColor="#c8ff32" stopOpacity={0}/></linearGradient></defs><CartesianGrid strokeDasharray="4 4" vertical={false} /><XAxis dataKey="timestampMs" hide /><YAxis width={40} domain={[0, "dataMax + 50"]} /><Tooltip labelFormatter={() => ""} formatter={(value) => [`${value} W`, "Power"]} /><Area type="monotone" dataKey="powerWatts" stroke="#c8ff32" fill="url(#powerFill)" isAnimationActive={false} /></AreaChart></ResponsiveContainer>
+            {structured && (
+              <div className="plan-line">
+                <span className="plan-note">
+                  {manualErg
+                    ? "Free-ride block · manual ERG"
+                    : plannedTarget === null
+                      ? "No target in this block"
+                      : overrideActive
+                        ? `Plan ${plannedTarget} W · overridden for this block`
+                        : biasPercent !== 100
+                          ? `Plan ${plannedTarget} W · ${biasPercent}% bias`
+                          : `Plan ${plannedTarget} W`}
+                </span>
+                {overrideActive && (
+                  <button type="button" className="text-button" disabled={runner.status !== "running"} onClick={() => void backToPlan()}>
+                    Back to plan
+                  </button>
+                )}
+                <div className="bias-stepper" aria-label="Workout bias">
+                  <span>Bias</span>
+                  <button type="button" className="secondary" onClick={() => void adjustBias(-BIAS_STEP_PERCENT)}>−</button>
+                  <strong className={biasPercent === 100 ? "" : "active"}>{biasPercent}%</strong>
+                  <button type="button" className="secondary" onClick={() => void adjustBias(BIAS_STEP_PERCENT)}>+</button>
+                  {biasPercent !== 100 && (
+                    <button type="button" className="text-button" onClick={() => void perform(() => api.setBiasPercent(100), "reset workout bias")}>Reset</button>
+                  )}
+                </div>
+              </div>
+            )}
+            <ResponsiveContainer width="100%" height={220}><AreaChart data={smoothedHistory}><defs><linearGradient id="powerFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#c8ff32" stopOpacity={0.45}/><stop offset="100%" stopColor="#c8ff32" stopOpacity={0}/></linearGradient></defs><CartesianGrid strokeDasharray="4 4" vertical={false} /><XAxis dataKey="timestampMs" hide /><YAxis width={40} domain={[0, "dataMax + 50"]} /><Tooltip labelFormatter={() => ""} formatter={(value) => [`${value} W`, powerSmoothing === "instant" ? "Power" : `Power (${powerSmoothingLabel[powerSmoothing]})`]} /><Area type="monotone" dataKey="displayPowerWatts" stroke="#c8ff32" fill="url(#powerFill)" isAnimationActive={false} /></AreaChart></ResponsiveContainer>
             {openEnded
               ? <div className="open-ended-time"><span>Elapsed</span><strong>{formatDuration(elapsed)}</strong><span>Open ended</span></div>
               : <div className="progress-meta"><span>{formatDuration(elapsed)}</span><div className="progress"><i style={{ width: `${progress}%` }} /></div><span>-{formatDuration(Math.max(0, (total ?? 0) - elapsed))}</span></div>}
@@ -725,15 +890,62 @@ function storedWeight(value: number, unit: Profile["weightUnit"]) {
   return unit === "lb" ? value * KG_PER_LB : value;
 }
 
-function SettingsPage({ profile, onSave, onForgetDevices }: { profile: Profile; onSave: (profile: Profile) => void; onForgetDevices: () => Promise<void> }) {
+export function SettingsPage({
+  profile,
+  perform,
+  onProfileUpdate,
+  onSave,
+  onForgetDevices,
+}: {
+  profile: Profile;
+  perform: (action: () => Promise<unknown>, label?: string) => Promise<void>;
+  onProfileUpdate: (profile: Profile) => void;
+  onSave: (profile: Profile) => void;
+  onForgetDevices: () => Promise<void>;
+}) {
   const [draft, setDraft] = useState(profile);
   const [logPath, setLogPath] = useState("Loading log location…");
   const [rideFilesPath, setRideFilesPath] = useState("Loading ride files location…");
+  const [apiKey, setApiKey] = useState("");
+  const [intervalsConfigured, setIntervalsConfigured] = useState(false);
+  const [intervalsBusy, setIntervalsBusy] = useState<"save" | "clear" | "refresh" | null>(null);
   useEffect(() => {
     void api.logFilePath().then(setLogPath);
     void api.rideFilesPath().then(setRideFilesPath);
-  }, []);
+    void perform(async () => {
+      setIntervalsConfigured(await api.intervalsApiKeyConfigured());
+    }, "load Intervals.icu settings");
+  }, [perform]);
   useEffect(() => setDraft(profile), [profile]);
+
+  const saveIntervalsKey = async () => {
+    setIntervalsBusy("save");
+    await perform(async () => {
+      await api.saveIntervalsApiKey(apiKey);
+      setIntervalsConfigured(true);
+      setApiKey("");
+    }, "save Intervals.icu API key");
+    setIntervalsBusy(null);
+  };
+
+  const clearIntervalsKey = async () => {
+    setIntervalsBusy("clear");
+    await perform(async () => {
+      await api.clearIntervalsApiKey();
+      setIntervalsConfigured(false);
+      setApiKey("");
+    }, "clear Intervals.icu API key");
+    setIntervalsBusy(null);
+  };
+
+  const refreshEstimatedFtp = async () => {
+    setIntervalsBusy("refresh");
+    await perform(async () => {
+      onProfileUpdate(await api.refreshEstimatedFtp());
+    }, "refresh estimated FTP");
+    setIntervalsBusy(null);
+  };
+
   return (
     <>
       <PageHeader eyebrow="LOCAL PROFILE" title="Settings" />
@@ -744,6 +956,54 @@ function SettingsPage({ profile, onSave, onForgetDevices }: { profile: Profile; 
         <div className="form-row"><label>Rider weight ({draft.weightUnit})<input type="number" step="0.1" min={draft.weightUnit === "lb" ? 66 : 30} max={draft.weightUnit === "lb" ? 551 : 250} value={displayedWeight(draft.riderWeightKg, draft.weightUnit)} onChange={(event) => setDraft({ ...draft, riderWeightKg: storedWeight(Number(event.target.value), draft.weightUnit) })}/></label><label>Bike weight ({draft.weightUnit})<input type="number" step="0.1" min={draft.weightUnit === "lb" ? 7 : 3} max={draft.weightUnit === "lb" ? 88 : 40} value={displayedWeight(draft.bikeWeightKg, draft.weightUnit)} onChange={(event) => setDraft({ ...draft, bikeWeightKg: storedWeight(Number(event.target.value), draft.weightUnit) })}/></label></div>
         <button className="primary" type="submit">Save settings</button>
       </form></section>
+      <section className="card settings-card">
+        <div>
+          <span className="label">INTERVALS.ICU</span>
+          <h2>Estimated FTP</h2>
+          <p>Connect your Intervals.icu account to replace the workout FTP above with your latest modeled eFTP.</p>
+          <span className={`integration-status ${intervalsConfigured ? "configured" : ""}`}>
+            {intervalsConfigured ? "API key saved" : "API key not configured"}
+          </span>
+        </div>
+        <div className="integration-controls">
+          <label>
+            API key
+            <input
+              type="password"
+              autoComplete="off"
+              placeholder={intervalsConfigured ? "Enter a new key to replace the saved key" : "Intervals.icu API key"}
+              value={apiKey}
+              onChange={(event) => setApiKey(event.target.value)}
+            />
+          </label>
+          <p className="settings-note">The key is stored in this app's local SQLite database and is used only by the desktop backend.</p>
+          <div className="settings-actions">
+            <button
+              className="secondary"
+              disabled={!apiKey.trim() || intervalsBusy !== null}
+              onClick={() => void saveIntervalsKey()}
+            >
+              {intervalsBusy === "save" ? "Saving…" : "Save API key"}
+            </button>
+            {intervalsConfigured && (
+              <button
+                className="danger-button"
+                disabled={intervalsBusy !== null}
+                onClick={() => void clearIntervalsKey()}
+              >
+                {intervalsBusy === "clear" ? "Clearing…" : "Clear key"}
+              </button>
+            )}
+          </div>
+          <button
+            className="primary"
+            disabled={!intervalsConfigured || intervalsBusy !== null}
+            onClick={() => void refreshEstimatedFtp()}
+          >
+            {intervalsBusy === "refresh" ? "Refreshing…" : "Refresh estimated FTP"}
+          </button>
+        </div>
+      </section>
       <section className="card settings-card"><div><span className="label">DATA & DIAGNOSTICS</span><h2>Local-first by design</h2><p>Every finalized ride is stored in SQLite and as a persistent Garmin-compatible FIT file. Missing FIT files are regenerated automatically.</p></div><div className="data-locations"><div className="log-location"><span>Ride Files</span><code>{rideFilesPath}</code><button className="secondary" onClick={() => void api.revealRideFiles().catch(() => undefined)}>Show Ride Files</button></div><div className="log-location"><span>Log file</span><code>{logPath}</code><button className="secondary" onClick={() => void api.revealLogFile().catch(() => undefined)}>Show in folder</button><button className="secondary" onClick={() => void navigator.clipboard.writeText(logPath)}>Copy path</button></div><div className="log-location"><span>Known devices</span><p className="settings-note">Devices you have connected are remembered on this computer so they can be reconnected without scanning. Forgetting them does not disconnect anything.</p><button className="danger-button" onClick={() => void onForgetDevices()}>Forget all devices</button></div></div></section>
     </>
   );
@@ -797,8 +1057,8 @@ function distanceSourceLabel(source: SessionSummary["distanceSource"]) {
   return "no telemetry";
 }
 
-function LiveMetric({ icon: Icon, label, value, unit, accent = false, note }: { icon: typeof Activity; label: string; value: string | number; unit: string; accent?: boolean; note?: string | null }) {
-  return <div className={accent ? "live-metric accent" : "live-metric"}><span><Icon size={17}/>{label}</span><strong>{value}<small>{unit}</small></strong>{note && <em className="metric-source">{note}</em>}</div>;
+function LiveMetric({ icon: Icon, label, value, unit, accent = false, note, control }: { icon: typeof Activity; label: string; value: string | number; unit: string; accent?: boolean; note?: string | null; control?: React.ReactNode }) {
+  return <div className={accent ? "live-metric accent" : "live-metric"}><span><Icon size={17}/>{label}{control && <span className="metric-control">{control}</span>}</span><strong>{value}<small>{unit}</small></strong>{note && <em className="metric-source">{note}</em>}</div>;
 }
 
 function newWorkout(): Workout {

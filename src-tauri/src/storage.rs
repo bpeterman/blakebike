@@ -17,6 +17,129 @@ use crate::{
 };
 
 const SOURCE_PREFERENCES_KEY: &str = "source_preferences";
+const POWER_SMOOTHING_KEY: &str = "power_smoothing";
+const INTERVALS_API_KEY: &str = "intervals_api_key";
+const TRAINING_ZONES_KEY: &str = "training_zones";
+const RIDE_DISPLAY_PREFERENCES_KEY: &str = "ride_display_preferences";
+
+/// How the live power readout is averaged on the ride screens. Stored so the
+/// rider's last choice comes back on the next launch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum PowerSmoothing {
+    #[default]
+    #[serde(rename = "instant")]
+    Instant,
+    #[serde(rename = "3s")]
+    ThreeSeconds,
+    #[serde(rename = "5s")]
+    FiveSeconds,
+    #[serde(rename = "10s")]
+    TenSeconds,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ZoneDefinition {
+    pub name: String,
+    pub upper_bound: Option<u16>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ZoneMode {
+    #[default]
+    Derived,
+    Custom,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TrainingZoneSettings {
+    pub version: u8,
+    pub power_mode: ZoneMode,
+    pub power_zones: Vec<ZoneDefinition>,
+    pub heart_rate_mode: ZoneMode,
+    pub heart_rate_zones: Vec<ZoneDefinition>,
+}
+
+impl Default for TrainingZoneSettings {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            power_mode: ZoneMode::Derived,
+            power_zones: Vec::new(),
+            heart_rate_mode: ZoneMode::Derived,
+            heart_rate_zones: Vec::new(),
+        }
+    }
+}
+
+impl TrainingZoneSettings {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.version != 1 {
+            return Err("Unsupported training-zone settings version".into());
+        }
+        validate_zones("power", self.power_mode, &self.power_zones, 1, 3_000)?;
+        validate_zones(
+            "heart-rate",
+            self.heart_rate_mode,
+            &self.heart_rate_zones,
+            30,
+            250,
+        )
+    }
+}
+
+fn validate_zones(
+    label: &str,
+    mode: ZoneMode,
+    zones: &[ZoneDefinition],
+    minimum: u16,
+    maximum: u16,
+) -> Result<(), String> {
+    if mode == ZoneMode::Derived {
+        return Ok(());
+    }
+    if !(2..=10).contains(&zones.len()) {
+        return Err(format!("Custom {label} zones require 2–10 zones"));
+    }
+    let mut previous = 0;
+    for (index, zone) in zones.iter().enumerate() {
+        if zone.name.trim().is_empty() {
+            return Err(format!("{label} zone names cannot be empty"));
+        }
+        match zone.upper_bound {
+            Some(bound) if index + 1 == zones.len() => {
+                return Err(format!("The final {label} zone must be open-ended"));
+            }
+            Some(bound) if bound < minimum || bound > maximum || bound <= previous => {
+                return Err(format!(
+                    "{label} zone boundaries must increase and stay between {minimum} and {maximum}"
+                ));
+            }
+            Some(bound) => previous = bound,
+            None if index + 1 != zones.len() => {
+                return Err(format!("Only the final {label} zone can be open-ended"));
+            }
+            None => {}
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RideDisplayPreferences {
+    pub show_time_in_zone: bool,
+}
+
+impl Default for RideDisplayPreferences {
+    fn default() -> Self {
+        Self {
+            show_time_in_zone: false,
+        }
+    }
+}
 
 pub struct Storage {
     connection: Mutex<Connection>,
@@ -108,6 +231,12 @@ impl Storage {
         )?;
         ensure_column(
             &connection,
+            "profiles",
+            "max_heart_rate_bpm",
+            "INTEGER NOT NULL DEFAULT 190",
+        )?;
+        ensure_column(
+            &connection,
             "sessions",
             "estimated_distance_meters",
             "REAL NOT NULL DEFAULT 0.0",
@@ -149,8 +278,8 @@ impl Storage {
                 .execute(
                     "INSERT INTO profiles(
                        id, name, ftp_watts, max_power_watts, rider_weight_kg, bike_weight_kg,
-                       weight_unit, distance_unit
-                     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                       weight_unit, distance_unit, max_heart_rate_bpm
+                     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                     params![
                         profile.id.to_string(),
                         profile.name,
@@ -160,6 +289,7 @@ impl Storage {
                         profile.bike_weight_kg,
                         weight_unit_value(profile.weight_unit),
                         distance_unit_value(profile.distance_unit),
+                        profile.max_heart_rate_bpm,
                     ],
                 )
                 .map_err(|error| error.to_string())?;
@@ -178,7 +308,8 @@ impl Storage {
         self.connection()?
             .query_row(
                 "SELECT id, name, ftp_watts, max_power_watts, rider_weight_kg, bike_weight_kg,
-                 weight_unit, distance_unit FROM profiles WHERE active = 1 LIMIT 1",
+                 weight_unit, distance_unit, max_heart_rate_bpm
+                 FROM profiles WHERE active = 1 LIMIT 1",
                 [],
                 |row| {
                     Ok(Profile {
@@ -190,6 +321,7 @@ impl Storage {
                         bike_weight_kg: row.get(5)?,
                         weight_unit: parse_weight_unit(&row.get::<_, String>(6)?),
                         distance_unit: parse_distance_unit(&row.get::<_, String>(7)?),
+                        max_heart_rate_bpm: row.get(8)?,
                     })
                 },
             )
@@ -200,6 +332,12 @@ impl Storage {
         if profile.name.trim().is_empty() || !(50..=500).contains(&profile.ftp_watts) {
             return Err("Enter a name and an FTP between 50 and 500 watts".into());
         }
+        if !(100..=230).contains(&profile.max_heart_rate_bpm) {
+            return Err("Enter a maximum heart rate between 100 and 230 bpm".into());
+        }
+        if !(100..=2_500).contains(&profile.max_power_watts) {
+            return Err("Enter a safety power limit between 100 and 2500 watts".into());
+        }
         if !(30.0..=250.0).contains(&profile.rider_weight_kg)
             || !(3.0..=40.0).contains(&profile.bike_weight_kg)
         {
@@ -209,14 +347,15 @@ impl Storage {
             .execute(
                 "INSERT INTO profiles(
                    id, name, ftp_watts, max_power_watts, rider_weight_kg, bike_weight_kg,
-                   weight_unit, distance_unit, active
-                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1)
+                   weight_unit, distance_unit, max_heart_rate_bpm, active
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1)
                  ON CONFLICT(id) DO UPDATE SET name = excluded.name,
                    ftp_watts = excluded.ftp_watts, max_power_watts = excluded.max_power_watts,
                    rider_weight_kg = excluded.rider_weight_kg,
                    bike_weight_kg = excluded.bike_weight_kg,
                    weight_unit = excluded.weight_unit,
-                   distance_unit = excluded.distance_unit",
+                   distance_unit = excluded.distance_unit,
+                   max_heart_rate_bpm = excluded.max_heart_rate_bpm",
                 params![
                     profile.id.to_string(),
                     profile.name,
@@ -226,6 +365,7 @@ impl Storage {
                     profile.bike_weight_kg,
                     weight_unit_value(profile.weight_unit),
                     distance_unit_value(profile.distance_unit),
+                    profile.max_heart_rate_bpm,
                 ],
             )
             .map_err(|error| error.to_string())?;
@@ -262,6 +402,28 @@ impl Storage {
         Ok(())
     }
 
+    pub fn intervals_api_key(&self) -> Result<Option<String>, String> {
+        self.setting(INTERVALS_API_KEY)
+    }
+
+    pub fn save_intervals_api_key(&self, api_key: &str) -> Result<(), String> {
+        let api_key = api_key.trim();
+        if api_key.is_empty() {
+            return Err("Enter an Intervals.icu API key".into());
+        }
+        self.save_setting(INTERVALS_API_KEY, &api_key)
+    }
+
+    pub fn clear_intervals_api_key(&self) -> Result<(), String> {
+        self.connection()?
+            .execute(
+                "DELETE FROM settings WHERE key = ?1",
+                params![INTERVALS_API_KEY],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
     /// Which device feeds each telemetry metric; `Auto` everywhere by default.
     pub fn source_preferences(&self) -> Result<SourcePreferences, String> {
         Ok(self.setting(SOURCE_PREFERENCES_KEY)?.unwrap_or_default())
@@ -269,6 +431,37 @@ impl Storage {
 
     pub fn save_source_preferences(&self, preferences: &SourcePreferences) -> Result<(), String> {
         self.save_setting(SOURCE_PREFERENCES_KEY, preferences)
+    }
+
+    /// Live power averaging window for the ride screens; instant by default.
+    pub fn power_smoothing(&self) -> Result<PowerSmoothing, String> {
+        Ok(self.setting(POWER_SMOOTHING_KEY)?.unwrap_or_default())
+    }
+
+    pub fn save_power_smoothing(&self, smoothing: PowerSmoothing) -> Result<(), String> {
+        self.save_setting(POWER_SMOOTHING_KEY, &smoothing)
+    }
+
+    pub fn training_zones(&self) -> Result<TrainingZoneSettings, String> {
+        Ok(self.setting(TRAINING_ZONES_KEY)?.unwrap_or_default())
+    }
+
+    pub fn save_training_zones(&self, zones: &TrainingZoneSettings) -> Result<(), String> {
+        zones.validate()?;
+        self.save_setting(TRAINING_ZONES_KEY, zones)
+    }
+
+    pub fn ride_display_preferences(&self) -> Result<RideDisplayPreferences, String> {
+        Ok(self
+            .setting(RIDE_DISPLAY_PREFERENCES_KEY)?
+            .unwrap_or_default())
+    }
+
+    pub fn save_ride_display_preferences(
+        &self,
+        preferences: &RideDisplayPreferences,
+    ) -> Result<(), String> {
+        self.save_setting(RIDE_DISPLAY_PREFERENCES_KEY, preferences)
     }
 
     /// Remember (or refresh) a device after a successful connection.
@@ -705,6 +898,49 @@ mod tests {
         let updated = SourcePreferences::default();
         storage.save_source_preferences(&updated).unwrap();
         assert_eq!(storage.source_preferences().unwrap(), updated);
+    }
+
+    #[test]
+    fn power_smoothing_defaults_to_instant_and_round_trips() {
+        let storage = Storage::in_memory().unwrap();
+        assert_eq!(storage.power_smoothing().unwrap(), PowerSmoothing::Instant);
+        storage
+            .save_power_smoothing(PowerSmoothing::TenSeconds)
+            .unwrap();
+        assert_eq!(
+            storage.power_smoothing().unwrap(),
+            PowerSmoothing::TenSeconds
+        );
+        storage
+            .save_power_smoothing(PowerSmoothing::ThreeSeconds)
+            .unwrap();
+        assert_eq!(
+            storage.power_smoothing().unwrap(),
+            PowerSmoothing::ThreeSeconds
+        );
+        // The frontend uses the same short names.
+        assert_eq!(
+            serde_json::to_string(&PowerSmoothing::FiveSeconds).unwrap(),
+            "\"5s\""
+        );
+    }
+
+    #[test]
+    fn intervals_api_key_round_trips_and_clears() {
+        let storage = Storage::in_memory().unwrap();
+        assert_eq!(storage.intervals_api_key().unwrap(), None);
+
+        storage
+            .save_intervals_api_key("  secret-api-key  ")
+            .unwrap();
+        assert_eq!(
+            storage.intervals_api_key().unwrap().as_deref(),
+            Some("secret-api-key")
+        );
+
+        storage.clear_intervals_api_key().unwrap();
+        assert_eq!(storage.intervals_api_key().unwrap(), None);
+        assert!(storage.save_intervals_api_key("  ").is_err());
     }
 
     #[test]
