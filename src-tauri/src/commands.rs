@@ -13,10 +13,19 @@ use crate::{
     domain::{Profile, SessionDetail, SessionSummary, Workout},
     fit::ensure_ride_file,
     formats::{export_zwo, import_zwo},
-    intervals::fetch_estimated_ftp,
+    intervals::{fetch_cycling_training_zones, fetch_estimated_ftp},
     runner::RunnerState,
     storage::{PowerSmoothing, RideDisplayPreferences, TrainingZoneSettings},
 };
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrainingSyncResult {
+    profile: Profile,
+    zones: TrainingZoneSettings,
+    power_zones_imported: bool,
+    heart_rate_zones_imported: bool,
+}
 
 // Trainer-only commands kept for the pre-hub UI; they delegate to the hub.
 
@@ -161,7 +170,9 @@ pub fn clear_intervals_api_key(state: State<'_, AppState>) -> Result<(), String>
 }
 
 #[tauri::command]
-pub async fn refresh_estimated_ftp(state: State<'_, AppState>) -> Result<Profile, String> {
+pub async fn refresh_estimated_ftp(
+    state: State<'_, AppState>,
+) -> Result<TrainingSyncResult, String> {
     let api_key = state
         .storage
         .intervals_api_key()?
@@ -169,9 +180,97 @@ pub async fn refresh_estimated_ftp(state: State<'_, AppState>) -> Result<Profile
     let ftp = fetch_estimated_ftp(&api_key).await?;
     let mut profile = state.storage.profile()?;
     profile.ftp_watts = ftp;
+    let mut zones = state.storage.training_zones()?;
+    let mut power_zones_imported = false;
+    let mut heart_rate_zones_imported = false;
+    let mut power_zone_ftp = None;
+    match fetch_cycling_training_zones(&api_key).await {
+        Ok(Some(imported)) => {
+            if let Some(max_hr) = imported.max_heart_rate_bpm {
+                profile.max_heart_rate_bpm = max_hr;
+            }
+            if !imported.heart_rate_boundaries.is_empty() {
+                let mut boundaries = imported.heart_rate_boundaries;
+                if boundaries
+                    .last()
+                    .is_some_and(|bound| *bound >= profile.max_heart_rate_bpm)
+                {
+                    boundaries.pop();
+                }
+                zones.heart_rate_mode = crate::storage::ZoneMode::Custom;
+                zones.heart_rate_zones = zone_definitions(&boundaries, &imported.heart_rate_names);
+                heart_rate_zones_imported = true;
+            }
+            if zones.sync_power_zones_from_intervals
+                && !imported.power_percent_boundaries.is_empty()
+            {
+                let zone_ftp = imported.cycling_ftp_watts.unwrap_or(ftp);
+                let boundaries =
+                    power_zone_boundaries(zone_ftp, &imported.power_percent_boundaries);
+                zones.power_mode = crate::storage::ZoneMode::Custom;
+                zones.power_zones = zone_definitions(&boundaries, &imported.power_names);
+                power_zones_imported = true;
+                power_zone_ftp = Some(zone_ftp);
+            }
+            state.storage.save_training_zones(&zones)?;
+        }
+        Ok(None) => {
+            tracing::warn!("Intervals.icu has no cycling sport settings; keeping derived HR zones");
+        }
+        Err(error) => {
+            tracing::warn!(%error, "Could not import Intervals.icu training zones; keeping current zones");
+        }
+    }
     state.storage.save_profile(&profile)?;
-    tracing::info!(ftp, "Updated profile FTP from Intervals.icu");
-    Ok(profile)
+    tracing::info!(
+        ftp,
+        max_hr = profile.max_heart_rate_bpm,
+        power_zone_ftp,
+        power_zones_imported,
+        heart_rate_zones_imported,
+        "Updated training settings from Intervals.icu"
+    );
+    Ok(TrainingSyncResult {
+        profile,
+        zones,
+        power_zones_imported,
+        heart_rate_zones_imported,
+    })
+}
+
+fn zone_definitions(boundaries: &[u16], names: &[String]) -> Vec<crate::storage::ZoneDefinition> {
+    (0..=boundaries.len())
+        .map(|index| crate::storage::ZoneDefinition {
+            name: names
+                .get(index)
+                .filter(|name| !name.trim().is_empty())
+                .cloned()
+                .unwrap_or_else(|| format!("Zone {}", index + 1)),
+            upper_bound: boundaries.get(index).copied(),
+        })
+        .collect()
+}
+
+fn power_zone_boundaries(ftp: u16, percentages: &[u16]) -> Vec<u16> {
+    percentages
+        .iter()
+        .map(|percent| {
+            ((u32::from(ftp) * u32::from(*percent)) / 100).min(u32::from(u16::MAX)) as u16
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod training_sync_tests {
+    use super::power_zone_boundaries;
+
+    #[test]
+    fn converts_intervals_power_zones_with_cycling_profile_ftp() {
+        assert_eq!(
+            power_zone_boundaries(280, &[55, 75, 90, 105, 120, 150]),
+            vec![154, 210, 252, 294, 336, 420]
+        );
+    }
 }
 
 #[tauri::command]

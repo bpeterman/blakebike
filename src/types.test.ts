@@ -3,10 +3,15 @@ import {
   formatDistance,
   formatDuration,
   formatSpeed,
+  derivedHeartRateZones,
+  derivedPowerZones,
+  downsampleTelemetry,
   manualPowerDeltaForKey,
   rideKeyAction,
   clampBias,
   withSmoothedPower,
+  timeInZones,
+  zoneIndex,
   workoutDuration,
   type WorkoutStep,
 } from "./types";
@@ -79,5 +84,56 @@ describe("workout helpers", () => {
     // 10 s window covers everything here.
     expect(withSmoothedPower(history, "10s")[5].displayPowerWatts).toBe(250);
     expect(withSmoothedPower([], "10s")).toEqual([]);
+  });
+
+  it("derives standard open-ended zones from FTP and max HR", () => {
+    expect(derivedPowerZones(200).map((zone) => zone.upperBound)).toEqual([
+      110, 150, 180, 210, 240, 300, null,
+    ]);
+    expect(derivedHeartRateZones(200).map((zone) => zone.upperBound)).toEqual([
+      120, 140, 160, 180, null,
+    ]);
+  });
+
+  it("classifies zone boundaries inclusively", () => {
+    const zones = derivedHeartRateZones(200);
+    expect(zoneIndex(120, zones)).toBe(0);
+    expect(zoneIndex(121, zones)).toBe(1);
+    expect(zoneIndex(220, zones)).toBe(4);
+  });
+
+  it("totals variable sample intervals but excludes pauses and missing HR", () => {
+    const samples = [
+      { timestampMs: 0, powerWatts: 100, heartRateBpm: 110 },
+      { timestampMs: 800, powerWatts: 160, heartRateBpm: null },
+      { timestampMs: 2000, powerWatts: 190, heartRateBpm: 150 },
+      { timestampMs: 12_000, powerWatts: 220, heartRateBpm: 180 },
+    ].map((sample) => ({
+      ...sample,
+      cadenceRpm: null,
+      speedKph: null,
+      targetPowerWatts: null,
+    }));
+    expect(timeInZones(samples, derivedPowerZones(200), "power")).toEqual([
+      0.8, 0, 1.2, 0, 0, 0, 0,
+    ]);
+    expect(timeInZones(samples, derivedHeartRateZones(200), "heartRate")).toEqual([
+      0.8, 0, 0, 0, 0,
+    ]);
+  });
+
+  it("downsamples while retaining the session endpoints", () => {
+    const samples = Array.from({ length: 100 }, (_, timestampMs) => ({
+      timestampMs,
+      powerWatts: timestampMs,
+      cadenceRpm: null,
+      speedKph: null,
+      heartRateBpm: null,
+      targetPowerWatts: null,
+    }));
+    const result = downsampleTelemetry(samples, 10);
+    expect(result).toHaveLength(10);
+    expect(result[0]).toBe(samples[0]);
+    expect(result[9]).toBe(samples[99]);
   });
 });

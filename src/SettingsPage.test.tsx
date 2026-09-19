@@ -9,6 +9,7 @@ vi.mock("./api", () => ({
     saveIntervalsApiKey: vi.fn(() => Promise.resolve()),
     clearIntervalsApiKey: vi.fn(() => Promise.resolve()),
     refreshEstimatedFtp: vi.fn(),
+    saveTrainingZones: vi.fn(() => Promise.resolve()),
     revealRideFiles: vi.fn(() => Promise.resolve()),
     revealLogFile: vi.fn(() => Promise.resolve()),
   },
@@ -16,7 +17,10 @@ vi.mock("./api", () => ({
 
 import { api } from "./api";
 import { SettingsPage } from "./App";
-import type { Profile } from "./types";
+import {
+  defaultTrainingZoneSettings,
+  type Profile,
+} from "./types";
 
 const profile: Profile = {
   id: "profile",
@@ -40,13 +44,59 @@ afterEach(() => {
 });
 
 describe("Intervals.icu settings", () => {
+  it("switches edited zones to custom and can reset them", async () => {
+    const onSaveTrainingZones = vi.fn();
+    render(
+      <SettingsPage
+        profile={profile}
+        trainingZones={defaultTrainingZoneSettings}
+        perform={perform}
+        onProfileUpdate={vi.fn()}
+        onTrainingZonesUpdate={vi.fn()}
+        onSave={vi.fn()}
+        onSaveTrainingZones={onSaveTrainingZones}
+        onForgetDevices={() => Promise.resolve()}
+      />,
+    );
+    fireEvent.change(screen.getByLabelText("Power zone 1 upper bound"), {
+      target: { value: "125" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save zone settings" }));
+    expect(onSaveTrainingZones).toHaveBeenCalledWith(
+      expect.objectContaining({
+        powerMode: "custom",
+        powerZones: expect.arrayContaining([
+          expect.objectContaining({ upperBound: 125 }),
+        ]),
+      }),
+    );
+    fireEvent.click(screen.getAllByRole("button", { name: "Reset defaults" })[0]);
+    fireEvent.click(screen.getByRole("button", { name: "Save zone settings" }));
+    expect(onSaveTrainingZones).toHaveBeenLastCalledWith(
+      expect.objectContaining({ powerMode: "derived", powerZones: [] }),
+    );
+
+    fireEvent.click(
+      screen.getByRole("checkbox", {
+        name: /Import power zones from Intervals\.icu/,
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Save zone settings" }));
+    expect(onSaveTrainingZones).toHaveBeenLastCalledWith(
+      expect.objectContaining({ syncPowerZonesFromIntervals: true }),
+    );
+  });
+
   it("saves and clears the API key without reading it back", async () => {
     render(
       <SettingsPage
         profile={profile}
+        trainingZones={defaultTrainingZoneSettings}
         perform={perform}
         onProfileUpdate={vi.fn()}
+        onTrainingZonesUpdate={vi.fn()}
         onSave={vi.fn()}
+        onSaveTrainingZones={vi.fn()}
         onForgetDevices={() => Promise.resolve()}
       />,
     );
@@ -65,13 +115,18 @@ describe("Intervals.icu settings", () => {
     await screen.findByText("API key not configured");
     expect(api.clearIntervalsApiKey).toHaveBeenCalledOnce();
     expect(
-      screen.getByRole("button", { name: "Refresh estimated FTP" }),
+      screen.getByRole("button", { name: "Refresh training settings" }),
     ).toBeDisabled();
   });
 
   it("shows refresh progress and publishes the updated profile", async () => {
     vi.mocked(api.intervalsApiKeyConfigured).mockResolvedValue(true);
-    let resolveRefresh!: (profile: Profile) => void;
+    let resolveRefresh!: (result: {
+      profile: Profile;
+      zones: typeof defaultTrainingZoneSettings;
+      powerZonesImported: boolean;
+      heartRateZonesImported: boolean;
+    }) => void;
     vi.mocked(api.refreshEstimatedFtp).mockReturnValue(
       new Promise((resolve) => {
         resolveRefresh = resolve;
@@ -82,15 +137,18 @@ describe("Intervals.icu settings", () => {
     render(
       <SettingsPage
         profile={profile}
+        trainingZones={defaultTrainingZoneSettings}
         perform={perform}
         onProfileUpdate={onProfileUpdate}
+        onTrainingZonesUpdate={vi.fn()}
         onSave={vi.fn()}
+        onSaveTrainingZones={vi.fn()}
         onForgetDevices={() => Promise.resolve()}
       />,
     );
 
     const refresh = await screen.findByRole("button", {
-      name: "Refresh estimated FTP",
+      name: "Refresh training settings",
     });
     await waitFor(() => expect(refresh).toBeEnabled());
     fireEvent.click(refresh);
@@ -99,10 +157,19 @@ describe("Intervals.icu settings", () => {
     ).toBeDisabled();
 
     const updated = { ...profile, ftpWatts: 267 };
-    resolveRefresh(updated);
+    resolveRefresh({
+      profile: updated,
+      zones: defaultTrainingZoneSettings,
+      powerZonesImported: true,
+      heartRateZonesImported: true,
+    });
     await waitFor(() => expect(onProfileUpdate).toHaveBeenCalledWith(updated));
+    expect(api.saveTrainingZones).toHaveBeenCalledWith(defaultTrainingZoneSettings);
     expect(
-      screen.getByRole("button", { name: "Refresh estimated FTP" }),
+      screen.getByText("FTP, heart-rate zones, and power zones updated."),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Refresh training settings" }),
     ).toBeEnabled();
   });
 });
