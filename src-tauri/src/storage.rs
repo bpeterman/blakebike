@@ -22,6 +22,7 @@ const POWER_SMOOTHING_KEY: &str = "power_smoothing";
 const INTERVALS_API_KEY: &str = "intervals_api_key";
 const TRAINING_ZONES_KEY: &str = "training_zones";
 const RIDE_DISPLAY_PREFERENCES_KEY: &str = "ride_display_preferences";
+const DEV_MODE_KEY: &str = "dev_mode";
 
 /// How the live power readout is averaged on the ride screens. Stored so the
 /// rider's last choice comes back on the next launch.
@@ -538,6 +539,16 @@ impl Storage {
 
     pub fn save_power_smoothing(&self, smoothing: PowerSmoothing) -> Result<(), String> {
         self.save_setting(POWER_SMOOTHING_KEY, &smoothing)
+    }
+
+    /// Developer mode. Off by default; while it is on the simulated sensors
+    /// are offered alongside real hardware.
+    pub fn dev_mode(&self) -> Result<bool, String> {
+        Ok(self.setting(DEV_MODE_KEY)?.unwrap_or(false))
+    }
+
+    pub fn save_dev_mode(&self, enabled: bool) -> Result<(), String> {
+        self.save_setting(DEV_MODE_KEY, &enabled)
     }
 
     pub fn training_zones(&self) -> Result<TrainingZoneSettings, String> {
@@ -1142,6 +1153,16 @@ mod tests {
         let updated = SourcePreferences::default();
         storage.save_source_preferences(&updated).unwrap();
         assert_eq!(storage.source_preferences().unwrap(), updated);
+    }
+
+    #[test]
+    fn dev_mode_defaults_to_off_and_round_trips() {
+        let storage = Storage::in_memory().unwrap();
+        assert!(!storage.dev_mode().unwrap());
+        storage.save_dev_mode(true).unwrap();
+        assert!(storage.dev_mode().unwrap());
+        storage.save_dev_mode(false).unwrap();
+        assert!(!storage.dev_mode().unwrap());
     }
 
     #[test]

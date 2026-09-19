@@ -207,6 +207,8 @@ pub fn run() {
             commands::set_bias_percent,
             commands::get_power_smoothing,
             commands::set_power_smoothing,
+            commands::get_dev_mode,
+            commands::set_dev_mode,
             commands::get_training_zones,
             commands::set_training_zones,
             commands::get_ride_display_preferences,

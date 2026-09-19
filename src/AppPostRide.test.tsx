@@ -51,6 +51,7 @@ vi.mock("./api", () => ({
     powerSmoothing: vi.fn(async () => "instant"),
     trainingZones: vi.fn(async () => defaultTrainingZoneSettings),
     rideDisplayPreferences: vi.fn(async () => defaultRideDisplayPreferences),
+    devMode: vi.fn(async () => false),
     session: vi.fn(async () => session),
     reportEvent: vi.fn(async () => undefined),
     reportError: vi.fn(async () => undefined),
