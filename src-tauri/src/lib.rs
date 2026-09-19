@@ -5,6 +5,7 @@ mod domain;
 mod fit;
 mod formats;
 mod ftms;
+mod intervals;
 mod runner;
 mod storage;
 
@@ -134,6 +135,10 @@ pub fn run() {
             commands::forget_all_devices,
             commands::get_profile,
             commands::save_profile,
+            commands::intervals_api_key_configured,
+            commands::save_intervals_api_key,
+            commands::clear_intervals_api_key,
+            commands::refresh_estimated_ftp,
             commands::list_workouts,
             commands::get_workout,
             commands::save_workout,
@@ -145,6 +150,14 @@ pub fn run() {
             commands::start_free_ride,
             commands::adjust_manual_power,
             commands::set_manual_power,
+            commands::clear_target_override,
+            commands::set_bias_percent,
+            commands::get_power_smoothing,
+            commands::set_power_smoothing,
+            commands::get_training_zones,
+            commands::set_training_zones,
+            commands::get_ride_display_preferences,
+            commands::set_ride_display_preferences,
             commands::pause_or_resume_workout,
             commands::skip_interval,
             commands::stop_workout,

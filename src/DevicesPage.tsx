@@ -33,10 +33,11 @@ import type {
   KnownDevice,
   Metric,
   SourceChoice,
-  SourcePreferences,
   TelemetrySources,
 } from "./types";
 import { deviceRoleLabel, deviceRoles } from "./types";
+import { SourceSelect } from "./SourceSelect";
+import { metricLabel } from "./sourcePreferences";
 
 const roleIcon: Record<DeviceRole, typeof Activity> = {
   trainer: Bike,
@@ -52,28 +53,17 @@ const roleBlurb: Record<DeviceRole, string> = {
   cadence: "Dedicated cadence sensor, or a power meter used for cadence only.",
 };
 
-const metricLabel: Record<Metric, string> = {
-  power: "Power",
-  cadence: "Cadence",
-  heartRate: "Heart rate",
-};
-
-/** Roles that can supply each metric, in the backend's default priority order. */
-const metricRoles: Record<Metric, DeviceRole[]> = {
-  power: ["power", "trainer"],
-  cadence: ["cadence", "power", "trainer"],
-  heartRate: ["heartRate", "trainer"],
-};
-
 export function DevicesPage({
   hub,
   sources,
   onConnect,
+  onSourcePreference,
   perform,
 }: {
   hub: DevicesSnapshot | null;
   sources: TelemetrySources | undefined;
   onConnect: (role: DeviceRole) => void;
+  onSourcePreference: (metric: Metric, choice: SourceChoice) => void;
   perform: (action: () => Promise<unknown>, label?: string) => Promise<void>;
 }) {
   const [known, setKnown] = useState<KnownDevice[]>([]);
@@ -100,9 +90,6 @@ export function DevicesPage({
   }, [hub]);
   const connectedCount = slots.filter((slot) => isConnected(slot.state)).length;
   const liveSources = sources ?? hub?.sources;
-
-  const savePreferences = (preferences: SourcePreferences) =>
-    void perform(() => api.saveSourcePreferences(preferences), "save source preferences");
 
   return (
     <>
@@ -216,14 +203,7 @@ export function DevicesPage({
               choice={hub?.sourcePreferences[metric] ?? { mode: "auto" }}
               active={liveSources?.[metric] ?? null}
               slots={slots}
-              onChange={(choice) => {
-                const current = hub?.sourcePreferences ?? {
-                  power: { mode: "auto" },
-                  cadence: { mode: "auto" },
-                  heartRate: { mode: "auto" },
-                };
-                savePreferences({ ...current, [metric]: choice });
-              }}
+              onChange={(choice) => onSourcePreference(metric, choice)}
             />
           ))}
         </div>
@@ -245,7 +225,6 @@ function SourceRow({
   slots: DeviceSlot[];
   onChange: (choice: SourceChoice) => void;
 }) {
-  const value = choice.mode === "auto" ? "auto" : choice.role;
   const nameOf = (role: DeviceRole) => {
     const slot = slots.find((candidate) => candidate.role === role);
     return deviceName(slot?.state) ?? deviceRoleLabel[role];
@@ -253,24 +232,19 @@ function SourceRow({
   return (
     <div className="source-row">
       <span className="source-metric">{metricLabel[metric]}</span>
-      <select
-        value={value}
-        onChange={(event) =>
-          onChange(
-            event.target.value === "auto"
-              ? { mode: "auto" }
-              : { mode: "role", role: event.target.value as DeviceRole },
-          )
+      <SourceSelect
+        metric={metric}
+        choice={choice}
+        autoLabel="Auto (dedicated sensor first)"
+        roleLabel={(role) =>
+          `${deviceRoleLabel[role]}${
+            isConnected(slots.find((slot) => slot.role === role)?.state)
+              ? ` · ${nameOf(role)}`
+              : " · not connected"
+          }`
         }
-      >
-        <option value="auto">Auto (dedicated sensor first)</option>
-        {metricRoles[metric].map((role) => (
-          <option key={role} value={role}>
-            {deviceRoleLabel[role]}
-            {isConnected(slots.find((slot) => slot.role === role)?.state) ? ` · ${nameOf(role)}` : " · not connected"}
-          </option>
-        ))}
-      </select>
+        onChange={onChange}
+      />
       <span className={active ? (active.fallback ? "source-active fallback" : "source-active") : "source-active none"}>
         {active
           ? active.fallback

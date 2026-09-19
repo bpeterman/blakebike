@@ -13,7 +13,9 @@ use crate::{
     domain::{Profile, SessionDetail, SessionSummary, Workout},
     fit::ensure_ride_file,
     formats::{export_zwo, import_zwo},
+    intervals::fetch_estimated_ftp,
     runner::RunnerState,
+    storage::{PowerSmoothing, RideDisplayPreferences, TrainingZoneSettings},
 };
 
 // Trainer-only commands kept for the pre-hub UI; they delegate to the hub.
@@ -141,6 +143,35 @@ pub fn save_profile(state: State<'_, AppState>, profile: Profile) -> Result<(), 
         "Saving profile"
     );
     state.storage.save_profile(&profile)
+}
+
+#[tauri::command]
+pub fn intervals_api_key_configured(state: State<'_, AppState>) -> Result<bool, String> {
+    Ok(state.storage.intervals_api_key()?.is_some())
+}
+
+#[tauri::command]
+pub fn save_intervals_api_key(state: State<'_, AppState>, api_key: String) -> Result<(), String> {
+    state.storage.save_intervals_api_key(&api_key)
+}
+
+#[tauri::command]
+pub fn clear_intervals_api_key(state: State<'_, AppState>) -> Result<(), String> {
+    state.storage.clear_intervals_api_key()
+}
+
+#[tauri::command]
+pub async fn refresh_estimated_ftp(state: State<'_, AppState>) -> Result<Profile, String> {
+    let api_key = state
+        .storage
+        .intervals_api_key()?
+        .ok_or_else(|| "Save an Intervals.icu API key before refreshing FTP".to_string())?;
+    let ftp = fetch_estimated_ftp(&api_key).await?;
+    let mut profile = state.storage.profile()?;
+    profile.ftp_watts = ftp;
+    state.storage.save_profile(&profile)?;
+    tracing::info!(ftp, "Updated profile FTP from Intervals.icu");
+    Ok(profile)
 }
 
 #[tauri::command]
@@ -272,6 +303,75 @@ pub async fn set_manual_power(
         .runner
         .set_manual_power(&app, watts, profile.max_power_watts, &state.devices)
         .await
+}
+
+#[tauri::command]
+pub async fn clear_target_override(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Option<u16>, String> {
+    tracing::debug!("command clear_target_override");
+    let profile = state.storage.profile()?;
+    state
+        .runner
+        .clear_target_override(&app, profile.max_power_watts, &state.devices)
+        .await
+}
+
+#[tauri::command]
+pub async fn set_bias_percent(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    percent: u16,
+) -> Result<u16, String> {
+    tracing::debug!(percent, "command set_bias_percent");
+    let profile = state.storage.profile()?;
+    state
+        .runner
+        .set_bias_percent(&app, percent, profile.max_power_watts, &state.devices)
+        .await
+}
+
+#[tauri::command]
+pub fn get_power_smoothing(state: State<'_, AppState>) -> Result<PowerSmoothing, String> {
+    state.storage.power_smoothing()
+}
+
+#[tauri::command]
+pub fn set_power_smoothing(
+    state: State<'_, AppState>,
+    smoothing: PowerSmoothing,
+) -> Result<(), String> {
+    tracing::debug!(?smoothing, "command set_power_smoothing");
+    state.storage.save_power_smoothing(smoothing)
+}
+
+#[tauri::command]
+pub fn get_training_zones(state: State<'_, AppState>) -> Result<TrainingZoneSettings, String> {
+    state.storage.training_zones()
+}
+
+#[tauri::command]
+pub fn set_training_zones(
+    state: State<'_, AppState>,
+    zones: TrainingZoneSettings,
+) -> Result<(), String> {
+    state.storage.save_training_zones(&zones)
+}
+
+#[tauri::command]
+pub fn get_ride_display_preferences(
+    state: State<'_, AppState>,
+) -> Result<RideDisplayPreferences, String> {
+    state.storage.ride_display_preferences()
+}
+
+#[tauri::command]
+pub fn set_ride_display_preferences(
+    state: State<'_, AppState>,
+    preferences: RideDisplayPreferences,
+) -> Result<(), String> {
+    state.storage.save_ride_display_preferences(&preferences)
 }
 
 #[tauri::command]

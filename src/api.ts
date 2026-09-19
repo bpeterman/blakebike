@@ -10,12 +10,15 @@ import type {
   DeviceState,
   DevicesSnapshot,
   KnownDevice,
+  PowerSmoothing,
   SourcePreferences,
   Profile,
+  RideDisplayPreferences,
   RunnerState,
   SessionDetail,
   SessionSummary,
   Telemetry,
+  TrainingZoneSettings,
   Workout,
 } from "./types";
 
@@ -41,6 +44,14 @@ export const api = {
   profile: () => invoke<Profile>("get_profile"),
   saveProfile: (profile: Profile) =>
     invoke<void>("save_profile", { profile }),
+  intervalsApiKeyConfigured: () =>
+    invoke<boolean>("intervals_api_key_configured"),
+  saveIntervalsApiKey: (apiKey: string) =>
+    invoke<void>("save_intervals_api_key", { apiKey }),
+  clearIntervalsApiKey: () =>
+    invoke<void>("clear_intervals_api_key"),
+  refreshEstimatedFtp: () =>
+    invoke<Profile>("refresh_estimated_ftp"),
   workouts: () => invoke<Workout[]>("list_workouts"),
   workout: (id: string) => invoke<Workout | null>("get_workout", { id }),
   saveWorkout: (workout: Workout) =>
@@ -68,6 +79,19 @@ export const api = {
     invoke<number>("adjust_manual_power", { delta }),
   setManualPower: (watts: number) =>
     invoke<number>("set_manual_power", { watts }),
+  clearTargetOverride: () => invoke<number | null>("clear_target_override"),
+  setBiasPercent: (percent: number) =>
+    invoke<number>("set_bias_percent", { percent }),
+  powerSmoothing: () => invoke<PowerSmoothing>("get_power_smoothing"),
+  savePowerSmoothing: (smoothing: PowerSmoothing) =>
+    invoke<void>("set_power_smoothing", { smoothing }),
+  trainingZones: () => invoke<TrainingZoneSettings>("get_training_zones"),
+  saveTrainingZones: (zones: TrainingZoneSettings) =>
+    invoke<void>("set_training_zones", { zones }),
+  rideDisplayPreferences: () =>
+    invoke<RideDisplayPreferences>("get_ride_display_preferences"),
+  saveRideDisplayPreferences: (preferences: RideDisplayPreferences) =>
+    invoke<void>("set_ride_display_preferences", { preferences }),
   pauseOrResume: () => invoke<void>("pause_or_resume_workout"),
   skipInterval: () => invoke<void>("skip_interval"),
   stopWorkout: () => invoke<void>("stop_workout"),
