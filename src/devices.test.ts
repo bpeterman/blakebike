@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+  connectAllSummary,
   deviceFitsRole,
   deviceName,
+  knownToDeviceInfo,
   formatAge,
   formatRelativeDate,
   formatUptime,
@@ -13,7 +15,7 @@ import {
   deviceTransport,
   transportLabel,
 } from "./devices";
-import type { DeviceInfo, DeviceState } from "./types";
+import type { DeviceInfo, DeviceState, KnownConnectOutcome } from "./types";
 
 const device = (capabilities?: DeviceInfo["capabilities"]): DeviceInfo => ({
   id: "x",
@@ -107,5 +109,49 @@ describe("formatting", () => {
     expect(readoutMark("warn")).toBe("!");
     expect(readoutMark("error")).toBe("✕");
     expect(readoutMark("info")).toBe("›");
+  });
+});
+
+describe("connect all", () => {
+  const outcome = (role: KnownConnectOutcome["role"], name: string, status: KnownConnectOutcome["status"]): KnownConnectOutcome =>
+    ({ role, name, status, error: status === "failed" ? "Device was not seen within 10s" : null });
+
+  it("turns a remembered device into a connect request without a stale signal reading", () => {
+    expect(
+      knownToDeviceInfo({
+        id: "strap",
+        name: "HRM-Pro",
+        transport: "ant",
+        role: "heartRate",
+        capabilities: ["heartRate"],
+        simulated: false,
+        manufacturer: "Garmin",
+        model: null,
+        lastConnectedAt: "2026-09-01T00:00:00Z",
+      }),
+    ).toEqual({ id: "strap", name: "HRM-Pro", transport: "ant", simulated: false, rssi: null, capabilities: ["heartRate"] });
+  });
+
+  it("stays quiet when every device answered", () => {
+    expect(connectAllSummary([])).toBeNull();
+    expect(connectAllSummary([outcome("trainer", "KICKR", "connected"), outcome("heartRate", "HRM", "skipped")])).toBeNull();
+  });
+
+  it("names a sleeping sensor gently, without the raw error", () => {
+    const summary = connectAllSummary([
+      outcome("trainer", "KICKR CORE", "connected"),
+      outcome("heartRate", "HRM-Pro", "connected"),
+      outcome("power", "Assioma", "failed"),
+    ]);
+    expect(summary).toBe(
+      "Trainer and heart rate connected. Power meter (Assioma) didn’t answer, probably asleep. Wake it and press Connect on its card.",
+    );
+    expect(summary).not.toContain("10s");
+  });
+
+  it("handles nothing connecting and several sleepers", () => {
+    expect(connectAllSummary([outcome("power", "Assioma", "failed"), outcome("cadence", "Wahoo RPM", "failed")])).toBe(
+      "Power meter (Assioma) and cadence sensor (Wahoo RPM) didn’t answer, probably asleep. Wake them and press Connect on their card.",
+    );
   });
 });

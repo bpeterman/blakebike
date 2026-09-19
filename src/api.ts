@@ -12,6 +12,7 @@ import type {
   DeviceSlot,
   DeviceState,
   DevicesSnapshot,
+  KnownConnectOutcome,
   KnownDevice,
   PowerSmoothing,
   SourcePreferences,
@@ -56,6 +57,7 @@ export const api = {
   calibrateTrainer: () => invoke<void>("calibrate_trainer"),
   deviceLog: (role: DeviceRole) => invoke<DeviceLogLine[]>("device_log", { role }),
   knownDevices: () => invoke<KnownDevice[]>("known_devices"),
+  connectKnownDevices: () => invoke<KnownConnectOutcome[]>("connect_known_devices"),
   forgetDevice: (id: string) => invoke<void>("forget_device", { id }),
   forgetAllDevices: () => invoke<number>("forget_all_devices"),
   restoreKnownDevices: (devices: KnownDevice[]) =>

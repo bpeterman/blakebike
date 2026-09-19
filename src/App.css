@@ -527,7 +527,8 @@ textarea { min-height: 70px; resize: vertical; }
 .known-devices { display: grid; gap: 14px; margin-bottom: 16px; padding: 20px; }
 .known-head { display: flex; justify-content: space-between; align-items: end; gap: 20px; }
 .known-head h2 { margin: 2px 0 0; font-size: 18px; }
-.known-head p { margin: 0; font-size: 12px; }
+.known-head p { flex: 1; margin: 0; font-size: 12px; }
+.known-head .primary { min-height: 34px; padding: 0 14px; white-space: nowrap; }
 .known-list { display: grid; gap: 7px; }
 .known-row { display: grid; grid-template-columns: auto 1fr auto auto auto; align-items: center; gap: 12px; padding: 10px 12px; border: 1px solid #2a2f28; border-radius: 9px; background: #151814; }
 .known-title { display: grid; min-width: 0; }

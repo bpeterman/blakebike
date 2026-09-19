@@ -123,6 +123,15 @@ export type KnownDevice = {
   lastConnectedAt: string;
 };
 
+/** What happened to one remembered device during "Connect all". */
+export type KnownConnectOutcome = {
+  role: DeviceRole;
+  name: string;
+  /** `skipped` means the role already had a device connected or connecting. */
+  status: "connected" | "skipped" | "failed";
+  error: string | null;
+};
+
 export type SourceChoice = { mode: "auto" } | { mode: "role"; role: DeviceRole };
 
 export type Metric = "power" | "cadence" | "heartRate";

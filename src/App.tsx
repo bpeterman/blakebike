@@ -440,9 +440,9 @@ function App() {
   const navItems: Array<[Page, string, typeof Activity]> = [
     ["home", "Overview", Activity],
     ["workouts", "Workouts", Library],
-    ["devices", "Devices", Bluetooth],
     ["ride", "Ride", Bike],
     ["history", "History", History],
+    ["devices", "Devices", Bluetooth],
     ["settings", "Settings", Settings],
   ];
 
@@ -554,6 +554,7 @@ function App() {
             onConnect={setDevicePicker}
             onCalibrate={() => setCalibrationOpen(true)}
             onSourcePreference={changeSourcePreference}
+            onNotice={setNotice}
             onOfferUndo={offerUndo}
             perform={perform}
           />

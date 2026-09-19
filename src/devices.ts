@@ -4,6 +4,8 @@ import type {
   DeviceLogLine,
   DeviceRole,
   DeviceState,
+  KnownConnectOutcome,
+  KnownDevice,
   TelemetrySources,
   DeviceTransport,
 } from "./types";
@@ -72,6 +74,45 @@ export type Metric = keyof TelemetrySources;
 export function metricsFedBy(role: DeviceRole, sources: TelemetrySources | undefined): Metric[] {
   if (!sources) return [];
   return (["power", "cadence", "heartRate"] as Metric[]).filter((metric) => sources[metric]?.role === role);
+}
+
+/** A remembered device as a connect needs it; its current signal is unknown. */
+export function knownToDeviceInfo(device: KnownDevice): DeviceInfo {
+  return {
+    id: device.id,
+    name: device.name,
+    transport: device.transport,
+    simulated: device.simulated,
+    rssi: null,
+    capabilities: device.capabilities,
+  };
+}
+
+/** "trainer, heart rate and power meter" */
+function listInProse(items: string[]): string {
+  if (items.length <= 1) return items.join("");
+  return `${items.slice(0, -1).join(", ")} and ${items[items.length - 1]}`;
+}
+
+/**
+ * The calm one-liner shown after "Connect all" when at least one device did
+ * not answer. Null when nothing failed: the ordinary success toast covers
+ * that. Never quotes the underlying error; the device card's log has it.
+ */
+export function connectAllSummary(outcomes: KnownConnectOutcome[]): string | null {
+  const failed = outcomes.filter((outcome) => outcome.status === "failed");
+  if (failed.length === 0) return null;
+  const connected = outcomes.filter((outcome) => outcome.status === "connected");
+  const roleName = (outcome: KnownConnectOutcome) => deviceRoleLabel[outcome.role].toLowerCase();
+  const sentence = (text: string) => `${text.charAt(0).toUpperCase()}${text.slice(1)}`;
+  const parts: string[] = [];
+  if (connected.length > 0) {
+    parts.push(sentence(`${listInProse(connected.map(roleName))} connected.`));
+  }
+  const quiet = listInProse(failed.map((outcome) => `${roleName(outcome)} (${outcome.name})`));
+  const one = failed.length === 1;
+  parts.push(sentence(`${quiet} didn’t answer, probably asleep. Wake ${one ? "it" : "them"} and press Connect on ${one ? "its" : "their"} card.`));
+  return parts.join(" ");
 }
 
 export function formatUptime(ms: number): string {
