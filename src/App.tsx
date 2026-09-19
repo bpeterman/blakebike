@@ -25,7 +25,10 @@ import {
 import {
   Area,
   AreaChart,
+  Bar,
+  BarChart,
   CartesianGrid,
+  Cell,
   ResponsiveContainer,
   Tooltip,
   XAxis,
@@ -39,26 +42,34 @@ import type {
   Metric as SourceMetric,
   PowerSmoothing,
   Profile,
+  RideDisplayPreferences,
   RunnerState,
   SessionDetail,
   SessionSummary,
   SourceChoice,
   SourcePreferences,
   Telemetry,
+  TrainingZoneSettings,
   Workout,
   WorkoutStep,
 } from "./types";
 import {
   BIAS_STEP_PERCENT,
   clampBias,
+  defaultRideDisplayPreferences,
+  defaultTrainingZoneSettings,
   deviceRoleLabel,
   deviceRoles,
   formatDistance,
   formatDuration,
   formatSpeed,
+  downsampleTelemetry,
+  effectiveHeartRateZones,
+  effectivePowerZones,
   powerSmoothingLabel,
   powerSmoothingOptions,
   rideKeyAction,
+  timeInZones,
   withSmoothedPower,
   workoutDuration,
 } from "./types";
@@ -92,6 +103,12 @@ function App() {
   const [telemetry, setTelemetry] = useState(emptyTelemetry);
   const [telemetryHistory, setTelemetryHistory] = useState<Telemetry[]>([]);
   const [powerSmoothing, setPowerSmoothing] = useState<PowerSmoothing>("instant");
+  const [trainingZones, setTrainingZones] = useState<TrainingZoneSettings>(
+    defaultTrainingZoneSettings,
+  );
+  const [rideDisplay, setRideDisplay] = useState<RideDisplayPreferences>(
+    defaultRideDisplayPreferences,
+  );
   const [error, setError] = useState<string | null>(null);
   const [devicePicker, setDevicePicker] = useState<DeviceRole | null>(null);
   const [editor, setEditor] = useState<Workout | null>(null);
@@ -100,10 +117,22 @@ function App() {
     null,
   );
   const importRef = useRef<HTMLInputElement>(null);
+  const runnerRef = useRef<RunnerState>(runner);
+  const liveSessionRef = useRef<string | null>(null);
+  const lastHistorySampleMsRef = useRef(0);
 
   const load = useCallback(async () => {
     try {
-      const [nextProfile, nextWorkouts, nextSessions, nextHub, nextRunner, nextSmoothing] =
+      const [
+        nextProfile,
+        nextWorkouts,
+        nextSessions,
+        nextHub,
+        nextRunner,
+        nextSmoothing,
+        nextZones,
+        nextRideDisplay,
+      ] =
         await Promise.all([
           api.profile(),
           api.workouts(),
@@ -111,13 +140,25 @@ function App() {
           api.devicesSnapshot(),
           api.runnerState(),
           api.powerSmoothing(),
+          api.trainingZones(),
+          api.rideDisplayPreferences(),
         ]);
       setProfile(nextProfile);
       setWorkouts(nextWorkouts);
       setSessions(nextSessions);
       setHub(nextHub);
       setRunner(nextRunner);
+      runnerRef.current = nextRunner;
       setPowerSmoothing(nextSmoothing);
+      setTrainingZones(nextZones);
+      setRideDisplay(nextRideDisplay);
+      if (nextRunner.status === "running" || nextRunner.status === "paused") {
+        liveSessionRef.current = nextRunner.sessionId;
+        const session = await api.session(nextRunner.sessionId);
+        setTelemetryHistory(session?.samples ?? []);
+        lastHistorySampleMsRef.current =
+          session?.samples[session.samples.length - 1]?.timestampMs ?? 0;
+      }
       setSelectedWorkout((current) => current ?? nextWorkouts[0]?.id ?? null);
     } catch (cause) {
       const message = messageOf(cause);
@@ -151,12 +192,27 @@ function App() {
     let offRunner: (() => void) | undefined;
     void api.onTelemetry((sample) => {
       setTelemetry(sample);
-      setTelemetryHistory((history) => [...history.slice(-239), sample]);
+      if (
+        runnerRef.current.status === "running" &&
+        sample.timestampMs - lastHistorySampleMsRef.current >= 1_000
+      ) {
+        lastHistorySampleMsRef.current = sample.timestampMs;
+        setTelemetryHistory((history) => [...history, sample]);
+      }
     }).then((off) => {
       offTelemetry = off;
     });
     void api.onRunnerState((state) => {
       setRunner(state);
+      runnerRef.current = state;
+      if (
+        state.status === "running" &&
+        liveSessionRef.current !== state.sessionId
+      ) {
+        liveSessionRef.current = state.sessionId;
+        lastHistorySampleMsRef.current = 0;
+        setTelemetryHistory([]);
+      }
       if (state.status === "finished") {
         void api.sessions().then(setSessions);
       }
@@ -229,6 +285,13 @@ function App() {
     setPowerSmoothing(smoothing);
     void api.savePowerSmoothing(smoothing).catch((cause) =>
       void api.reportError("save power smoothing", messageOf(cause)).catch(() => undefined),
+    );
+  };
+
+  const changeRideDisplay = (preferences: RideDisplayPreferences) => {
+    setRideDisplay(preferences);
+    void api.saveRideDisplayPreferences(preferences).catch((cause) =>
+      void api.reportError("save ride display", messageOf(cause)).catch(() => undefined),
     );
   };
 
@@ -339,8 +402,10 @@ function App() {
             onNavigate={setPage}
             onRefreshFtp={() =>
               perform(async () => {
-                setProfile(await api.refreshEstimatedFtp());
-              }, "refresh estimated FTP")
+                const result = await api.refreshEstimatedFtp();
+                setProfile(result.profile);
+                setTrainingZones(result.zones);
+              }, "refresh training settings")
             }
           />
         )}
@@ -384,7 +449,10 @@ function App() {
             onPowerSmoothing={changePowerSmoothing}
             sourcePreferences={hub?.sourcePreferences ?? defaultSourcePreferences}
             onSourcePreference={changeSourcePreference}
-            distanceUnit={profile.distanceUnit}
+            profile={profile}
+            trainingZones={trainingZones}
+            rideDisplay={rideDisplay}
+            onRideDisplay={changeRideDisplay}
             perform={perform}
           />
         )}
@@ -413,13 +481,21 @@ function App() {
         {page === "settings" && (
           <SettingsPage
             profile={profile}
+            trainingZones={trainingZones}
             perform={perform}
             onProfileUpdate={setProfile}
+            onTrainingZonesUpdate={setTrainingZones}
             onSave={(next) =>
               void perform(async () => {
                 await api.saveProfile(next);
                 setProfile(next);
               }, "save profile")
+            }
+            onSaveTrainingZones={(zones) =>
+              void perform(async () => {
+                await api.saveTrainingZones(zones);
+                setTrainingZones(zones);
+              }, "save training zones")
             }
             onForgetDevices={() => perform(() => api.forgetAllDevices(), "forget all devices")}
           />
@@ -617,7 +693,7 @@ function WorkoutLibrary({
   );
 }
 
-function Ride({
+export function Ride({
   workouts,
   selectedWorkout,
   setSelectedWorkout,
@@ -630,7 +706,10 @@ function Ride({
   onPowerSmoothing,
   sourcePreferences,
   onSourcePreference,
-  distanceUnit,
+  profile,
+  trainingZones,
+  rideDisplay,
+  onRideDisplay,
   perform,
 }: {
   workouts: Workout[];
@@ -645,7 +724,10 @@ function Ride({
   onPowerSmoothing: (smoothing: PowerSmoothing) => void;
   sourcePreferences: SourcePreferences;
   onSourcePreference: (metric: SourceMetric, choice: SourceChoice) => void;
-  distanceUnit: Profile["distanceUnit"];
+  profile: Profile;
+  trainingZones: TrainingZoneSettings;
+  rideDisplay: RideDisplayPreferences;
+  onRideDisplay: (preferences: RideDisplayPreferences) => void;
   perform: (action: () => Promise<unknown>, label?: string) => Promise<void>;
 }) {
   const [targetDraft, setTargetDraft] = useState("100");
@@ -665,10 +747,22 @@ function Ride({
   const biasPercent = riding ? runner.biasPercent : 100;
   const structured = riding && !openEnded;
   const adjustable = manualErg || openEnded || (structured && targetPower !== null);
-  const displayedSpeed = formatSpeed(telemetry.speedKph ?? 0, distanceUnit);
+  const displayedSpeed = formatSpeed(telemetry.speedKph ?? 0, profile.distanceUnit);
   const smoothedHistory = useMemo(
     () => withSmoothedPower(telemetryHistory, powerSmoothing),
     [telemetryHistory, powerSmoothing],
+  );
+  const chartHistory = useMemo(
+    () => downsampleTelemetry(smoothedHistory),
+    [smoothedHistory],
+  );
+  const powerZones = useMemo(
+    () => effectivePowerZones(trainingZones, profile.ftpWatts),
+    [profile.ftpWatts, trainingZones],
+  );
+  const heartRateZones = useMemo(
+    () => effectiveHeartRateZones(trainingZones, profile.maxHeartRateBpm),
+    [profile.maxHeartRateBpm, trainingZones],
   );
   const displayedPower =
     powerSmoothing === "instant"
@@ -790,6 +884,19 @@ function Ride({
             <LiveMetric icon={HeartPulse} label="HEART RATE" value={telemetry.heartRateBpm ?? "—"} unit="bpm" note={sourceNote(telemetry.sources?.heartRate)} />
           </div>
           <div className="card live-chart">
+            <div className="chart-heading">
+              <div><span className="label">FULL SESSION</span><h3>Power</h3></div>
+              <label className="chart-toggle">
+                <input
+                  type="checkbox"
+                  checked={rideDisplay.showTimeInZone}
+                  onChange={(event) =>
+                    onRideDisplay({ showTimeInZone: event.target.checked })
+                  }
+                />
+                Time in zone
+              </label>
+            </div>
             <div className={adjustable ? "target-line editable" : "target-line"}>
               <span>Target power</span>
               {adjustable ? (
@@ -848,11 +955,45 @@ function Ride({
                 </div>
               </div>
             )}
-            <ResponsiveContainer width="100%" height={220}><AreaChart data={smoothedHistory}><defs><linearGradient id="powerFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#c8ff32" stopOpacity={0.45}/><stop offset="100%" stopColor="#c8ff32" stopOpacity={0}/></linearGradient></defs><CartesianGrid strokeDasharray="4 4" vertical={false} /><XAxis dataKey="timestampMs" hide /><YAxis width={40} domain={[0, "dataMax + 50"]} /><Tooltip labelFormatter={() => ""} formatter={(value) => [`${value} W`, powerSmoothing === "instant" ? "Power" : `Power (${powerSmoothingLabel[powerSmoothing]})`]} /><Area type="monotone" dataKey="displayPowerWatts" stroke="#c8ff32" fill="url(#powerFill)" isAnimationActive={false} /></AreaChart></ResponsiveContainer>
+            <SessionAreaChart
+              samples={chartHistory}
+              dataKey="displayPowerWatts"
+              unit="W"
+              color="#c8ff32"
+              name={powerSmoothing === "instant" ? "Power" : `Power (${powerSmoothingLabel[powerSmoothing]})`}
+              domain={[0, "dataMax + 50"]}
+            />
             {openEnded
               ? <div className="open-ended-time"><span>Elapsed</span><strong>{formatDuration(elapsed)}</strong><span>Open ended</span></div>
               : <div className="progress-meta"><span>{formatDuration(elapsed)}</span><div className="progress"><i style={{ width: `${progress}%` }} /></div><span>-{formatDuration(Math.max(0, (total ?? 0) - elapsed))}</span></div>}
           </div>
+          <div className="card live-chart secondary-chart">
+            <div className="chart-heading">
+              <div><span className="label">FULL SESSION</span><h3>Heart rate</h3></div>
+            </div>
+            <SessionAreaChart
+              samples={chartHistory}
+              dataKey="heartRateBpm"
+              unit="bpm"
+              color="#ff6f7d"
+              name="Heart rate"
+              domain={["dataMin - 10", "dataMax + 10"]}
+            />
+          </div>
+          {rideDisplay.showTimeInZone && (
+            <div className="zone-chart-grid">
+              <TimeInZoneChart
+                title="Power zones"
+                zones={powerZones}
+                seconds={timeInZones(telemetryHistory, powerZones, "power")}
+              />
+              <TimeInZoneChart
+                title="Heart-rate zones"
+                zones={heartRateZones}
+                seconds={timeInZones(telemetryHistory, heartRateZones, "heartRate")}
+              />
+            </div>
+          )}
           <div className="ride-controls">
             <button className="secondary control" onClick={() => void perform(() => api.pauseOrResume(), "pause/resume")}>{runner.status === "paused" ? <Play /> : <Pause />} {runner.status === "paused" ? "Resume" : "Pause"}</button>
             {!openEnded && <button className="secondary control" onClick={() => void perform(() => api.skipInterval(), "skip interval")}><SkipForward /> Skip</button>}
@@ -875,7 +1016,7 @@ function HistoryPage({ sessions, selected, distanceUnit, onSelect, onClose, onEx
         <div className="history-title"><strong>{session.workoutName}</strong><span>{new Date(session.startedAt).toLocaleString()}</span></div>
         <Metric value={formatDuration(session.elapsedSeconds)} unit="duration" /><Metric value={`${session.averagePowerWatts}`} unit="W avg" /><DistanceMetric meters={session.estimatedDistanceMeters} unit={distanceUnit} /><ChevronRight />
       </button>)}</div>}
-      {selected && <div className="modal-backdrop"><div className="modal detail-modal"><button className="modal-close" onClick={onClose}><X /></button><span className="label">RIDE DETAIL</span><h2>{selected.summary.workoutName}</h2><p>{new Date(selected.summary.startedAt).toLocaleString()}</p><div className="detail-metrics"><Metric value={formatDuration(selected.summary.elapsedSeconds)} unit="duration" /><Metric value={`${selected.summary.averagePowerWatts}`} unit="W average" /><Metric value={`${selected.summary.maxPowerWatts}`} unit="W maximum" /><Metric value={`${Math.round(selected.summary.averageCadenceRpm ?? 0)}`} unit="rpm average" /><DistanceMetric meters={selected.summary.estimatedDistanceMeters} unit={distanceUnit} /></div><p className="distance-note">Estimated distance · {distanceSourceLabel(selected.summary.distanceSource)}</p><ResponsiveContainer width="100%" height={220}><AreaChart data={selected.samples}><CartesianGrid strokeDasharray="4 4" vertical={false}/><XAxis dataKey="timestampMs" hide/><YAxis width={42}/><Tooltip labelFormatter={() => ""}/><Area type="monotone" dataKey="powerWatts" stroke="#c8ff32" fill="#c8ff3233" isAnimationActive={false}/></AreaChart></ResponsiveContainer><div className="detail-actions"><button className="primary" onClick={() => onGarmin(selected.summary)}><Upload size={16}/> Upload to Garmin</button><button className="secondary" onClick={() => onExportFit(selected.summary)}><Download size={16}/> Export FIT</button><button className="secondary" onClick={() => onExport(selected.summary)}><Download size={16}/> Export CSV</button></div><p className="handoff-note">Garmin Connect and Finder will open. Drag the selected FIT file onto Garmin’s import page, then confirm the upload.</p></div></div>}
+      {selected && <div className="modal-backdrop"><div className="modal detail-modal"><button className="modal-close" onClick={onClose}><X /></button><span className="label">RIDE DETAIL</span><h2>{selected.summary.workoutName}</h2><p>{new Date(selected.summary.startedAt).toLocaleString()}</p><div className="detail-metrics"><Metric value={formatDuration(selected.summary.elapsedSeconds)} unit="duration" /><Metric value={`${selected.summary.averagePowerWatts}`} unit="W average" /><Metric value={`${selected.summary.maxPowerWatts}`} unit="W maximum" /><Metric value={`${Math.round(selected.summary.averageCadenceRpm ?? 0)}`} unit="rpm average" /><DistanceMetric meters={selected.summary.estimatedDistanceMeters} unit={distanceUnit} /></div><p className="distance-note">Estimated distance · {distanceSourceLabel(selected.summary.distanceSource)}</p><div className="history-charts"><h3>Power</h3><SessionAreaChart samples={downsampleTelemetry(selected.samples)} dataKey="powerWatts" unit="W" color="#c8ff32" name="Power" domain={[0, "dataMax + 50"]}/><h3>Heart rate</h3><SessionAreaChart samples={downsampleTelemetry(selected.samples)} dataKey="heartRateBpm" unit="bpm" color="#ff6f7d" name="Heart rate" domain={["dataMin - 10", "dataMax + 10"]}/></div><div className="detail-actions"><button className="primary" onClick={() => onGarmin(selected.summary)}><Upload size={16}/> Upload to Garmin</button><button className="secondary" onClick={() => onExportFit(selected.summary)}><Download size={16}/> Export FIT</button><button className="secondary" onClick={() => onExport(selected.summary)}><Download size={16}/> Export CSV</button></div><p className="handoff-note">Garmin Connect and Finder will open. Drag the selected FIT file onto Garmin’s import page, then confirm the upload.</p></div></div>}
     </>
   );
 }
@@ -892,23 +1033,31 @@ function storedWeight(value: number, unit: Profile["weightUnit"]) {
 
 export function SettingsPage({
   profile,
+  trainingZones,
   perform,
   onProfileUpdate,
+  onTrainingZonesUpdate,
   onSave,
+  onSaveTrainingZones,
   onForgetDevices,
 }: {
   profile: Profile;
+  trainingZones: TrainingZoneSettings;
   perform: (action: () => Promise<unknown>, label?: string) => Promise<void>;
   onProfileUpdate: (profile: Profile) => void;
+  onTrainingZonesUpdate: (zones: TrainingZoneSettings) => void;
   onSave: (profile: Profile) => void;
+  onSaveTrainingZones: (zones: TrainingZoneSettings) => void;
   onForgetDevices: () => Promise<void>;
 }) {
   const [draft, setDraft] = useState(profile);
+  const [zoneDraft, setZoneDraft] = useState(trainingZones);
   const [logPath, setLogPath] = useState("Loading log location…");
   const [rideFilesPath, setRideFilesPath] = useState("Loading ride files location…");
   const [apiKey, setApiKey] = useState("");
   const [intervalsConfigured, setIntervalsConfigured] = useState(false);
   const [intervalsBusy, setIntervalsBusy] = useState<"save" | "clear" | "refresh" | null>(null);
+  const [intervalsRefreshStatus, setIntervalsRefreshStatus] = useState<string | null>(null);
   useEffect(() => {
     void api.logFilePath().then(setLogPath);
     void api.rideFilesPath().then(setRideFilesPath);
@@ -917,6 +1066,7 @@ export function SettingsPage({
     }, "load Intervals.icu settings");
   }, [perform]);
   useEffect(() => setDraft(profile), [profile]);
+  useEffect(() => setZoneDraft(trainingZones), [trainingZones]);
 
   const saveIntervalsKey = async () => {
     setIntervalsBusy("save");
@@ -941,8 +1091,18 @@ export function SettingsPage({
   const refreshEstimatedFtp = async () => {
     setIntervalsBusy("refresh");
     await perform(async () => {
-      onProfileUpdate(await api.refreshEstimatedFtp());
-    }, "refresh estimated FTP");
+      await api.saveTrainingZones(zoneDraft);
+      const result = await api.refreshEstimatedFtp();
+      onProfileUpdate(result.profile);
+      onTrainingZonesUpdate(result.zones);
+      setIntervalsRefreshStatus(
+        result.powerZonesImported
+          ? "FTP, heart-rate zones, and power zones updated."
+          : result.heartRateZonesImported
+            ? "FTP and heart-rate zones updated. Power zones were not imported."
+            : "FTP updated. Intervals.icu did not return usable training zones.",
+      );
+    }, "refresh training settings");
     setIntervalsBusy(null);
   };
 
@@ -951,16 +1111,59 @@ export function SettingsPage({
       <PageHeader eyebrow="LOCAL PROFILE" title="Settings" />
       <section className="card settings-card"><div><span className="label">RIDER PROFILE</span><h2>Training and distance</h2><p>Your weight and bike weight support flat-road distance estimates when the trainer does not report speed. Values are stored in kilograms regardless of display units.</p></div><form onSubmit={(event) => { event.preventDefault(); onSave(draft); }}>
         <label>Rider name<input value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })}/></label>
-        <div className="form-row"><label>FTP (watts)<input type="number" min="50" max="500" value={draft.ftpWatts} onChange={(event) => setDraft({ ...draft, ftpWatts: Number(event.target.value) })}/></label><label>Safety power limit<input type="number" min="100" max="2500" value={draft.maxPowerWatts} onChange={(event) => setDraft({ ...draft, maxPowerWatts: Number(event.target.value) })}/></label></div>
+        <div className="form-row"><label>FTP (watts)<input type="number" min="50" max="500" value={draft.ftpWatts} onChange={(event) => setDraft({ ...draft, ftpWatts: Number(event.target.value) })}/></label><label>Maximum heart rate (bpm)<input type="number" min="100" max="230" value={draft.maxHeartRateBpm} onChange={(event) => setDraft({ ...draft, maxHeartRateBpm: Number(event.target.value) })}/></label></div>
+        <label>Safety power limit<input type="number" min="100" max="2500" value={draft.maxPowerWatts} onChange={(event) => setDraft({ ...draft, maxPowerWatts: Number(event.target.value) })}/></label>
         <div className="form-row"><label>Weight unit<select value={draft.weightUnit} onChange={(event) => setDraft({ ...draft, weightUnit: event.target.value as Profile["weightUnit"] })}><option value="kg">Kilograms (kg)</option><option value="lb">Pounds (lb)</option></select></label><label>Distance unit<select value={draft.distanceUnit} onChange={(event) => setDraft({ ...draft, distanceUnit: event.target.value as Profile["distanceUnit"] })}><option value="km">Kilometers</option><option value="mi">Miles</option></select></label></div>
         <div className="form-row"><label>Rider weight ({draft.weightUnit})<input type="number" step="0.1" min={draft.weightUnit === "lb" ? 66 : 30} max={draft.weightUnit === "lb" ? 551 : 250} value={displayedWeight(draft.riderWeightKg, draft.weightUnit)} onChange={(event) => setDraft({ ...draft, riderWeightKg: storedWeight(Number(event.target.value), draft.weightUnit) })}/></label><label>Bike weight ({draft.weightUnit})<input type="number" step="0.1" min={draft.weightUnit === "lb" ? 7 : 3} max={draft.weightUnit === "lb" ? 88 : 40} value={displayedWeight(draft.bikeWeightKg, draft.weightUnit)} onChange={(event) => setDraft({ ...draft, bikeWeightKg: storedWeight(Number(event.target.value), draft.weightUnit) })}/></label></div>
         <button className="primary" type="submit">Save settings</button>
       </form></section>
       <section className="card settings-card">
         <div>
+          <span className="label">TRAINING ZONES</span>
+          <h2>Power and heart rate</h2>
+          <p>Defaults follow your FTP and maximum heart rate. Editing a boundary switches that set to custom values.</p>
+        </div>
+        <div className="zone-settings">
+          <label className="zone-sync-toggle">
+            <input
+              type="checkbox"
+              checked={zoneDraft.syncPowerZonesFromIntervals}
+              onChange={(event) =>
+                setZoneDraft({
+                  ...zoneDraft,
+                  syncPowerZonesFromIntervals: event.target.checked,
+                })
+              }
+            />
+            <span>
+              Import power zones from Intervals.icu
+              <small>Applied when training settings are refreshed below.</small>
+            </span>
+          </label>
+          <ZoneEditor
+            title="Power"
+            unit="W"
+            mode={zoneDraft.powerMode}
+            zones={effectivePowerZones(zoneDraft, draft.ftpWatts)}
+            onChange={(zones) => setZoneDraft({ ...zoneDraft, powerMode: "custom", powerZones: zones })}
+            onReset={() => setZoneDraft({ ...zoneDraft, powerMode: "derived", powerZones: [] })}
+          />
+          <ZoneEditor
+            title="Heart rate"
+            unit="bpm"
+            mode={zoneDraft.heartRateMode}
+            zones={effectiveHeartRateZones(zoneDraft, draft.maxHeartRateBpm)}
+            onChange={(zones) => setZoneDraft({ ...zoneDraft, heartRateMode: "custom", heartRateZones: zones })}
+            onReset={() => setZoneDraft({ ...zoneDraft, heartRateMode: "derived", heartRateZones: [] })}
+          />
+          <button className="primary" type="button" onClick={() => onSaveTrainingZones(zoneDraft)}>Save zone settings</button>
+        </div>
+      </section>
+      <section className="card settings-card">
+        <div>
           <span className="label">INTERVALS.ICU</span>
-          <h2>Estimated FTP</h2>
-          <p>Connect your Intervals.icu account to replace the workout FTP above with your latest modeled eFTP.</p>
+          <h2>FTP and training zones</h2>
+          <p>Connect your Intervals.icu account to import modeled eFTP, cycling heart-rate zones, and power zones when enabled above.</p>
           <span className={`integration-status ${intervalsConfigured ? "configured" : ""}`}>
             {intervalsConfigured ? "API key saved" : "API key not configured"}
           </span>
@@ -1000,12 +1203,165 @@ export function SettingsPage({
             disabled={!intervalsConfigured || intervalsBusy !== null}
             onClick={() => void refreshEstimatedFtp()}
           >
-            {intervalsBusy === "refresh" ? "Refreshing…" : "Refresh estimated FTP"}
+            {intervalsBusy === "refresh" ? "Refreshing…" : "Refresh training settings"}
           </button>
+          {intervalsRefreshStatus && <p className="integration-result">{intervalsRefreshStatus}</p>}
         </div>
       </section>
       <section className="card settings-card"><div><span className="label">DATA & DIAGNOSTICS</span><h2>Local-first by design</h2><p>Every finalized ride is stored in SQLite and as a persistent Garmin-compatible FIT file. Missing FIT files are regenerated automatically.</p></div><div className="data-locations"><div className="log-location"><span>Ride Files</span><code>{rideFilesPath}</code><button className="secondary" onClick={() => void api.revealRideFiles().catch(() => undefined)}>Show Ride Files</button></div><div className="log-location"><span>Log file</span><code>{logPath}</code><button className="secondary" onClick={() => void api.revealLogFile().catch(() => undefined)}>Show in folder</button><button className="secondary" onClick={() => void navigator.clipboard.writeText(logPath)}>Copy path</button></div><div className="log-location"><span>Known devices</span><p className="settings-note">Devices you have connected are remembered on this computer so they can be reconnected without scanning. Forgetting them does not disconnect anything.</p><button className="danger-button" onClick={() => void onForgetDevices()}>Forget all devices</button></div></div></section>
     </>
+  );
+}
+
+const zoneColors = [
+  "#6ca8ff",
+  "#63d6c6",
+  "#c8ff32",
+  "#f4d35e",
+  "#ff9f43",
+  "#ff6f7d",
+  "#c77dff",
+  "#9d6b53",
+  "#d0d5ce",
+  "#ffffff",
+];
+
+function SessionAreaChart({
+  samples,
+  dataKey,
+  unit,
+  color,
+  name,
+  domain,
+}: {
+  samples: Array<Telemetry & { displayPowerWatts?: number }>;
+  dataKey: "powerWatts" | "displayPowerWatts" | "heartRateBpm";
+  unit: string;
+  color: string;
+  name: string;
+  domain: [number | string, number | string];
+}) {
+  const start = samples[0]?.timestampMs ?? 0;
+  const gradientId = `fill-${dataKey}`;
+  return (
+    <ResponsiveContainer width="100%" height={220}>
+      <AreaChart data={samples}>
+        <defs>
+          <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor={color} stopOpacity={0.42} />
+            <stop offset="100%" stopColor={color} stopOpacity={0} />
+          </linearGradient>
+        </defs>
+        <CartesianGrid strokeDasharray="4 4" vertical={false} />
+        <XAxis
+          dataKey="timestampMs"
+          type="number"
+          domain={["dataMin", "dataMax"]}
+          tickFormatter={(value) => formatDuration(Math.max(0, Math.round((Number(value) - start) / 1000)))}
+          minTickGap={45}
+        />
+        <YAxis width={42} domain={domain} />
+        <Tooltip
+          labelFormatter={(value) => formatDuration(Math.max(0, Math.round((Number(value) - start) / 1000)))}
+          formatter={(value) => [`${value ?? "—"} ${unit}`, name]}
+        />
+        <Area
+          connectNulls={false}
+          type="monotone"
+          dataKey={dataKey}
+          stroke={color}
+          fill={`url(#${gradientId})`}
+          isAnimationActive={false}
+        />
+      </AreaChart>
+    </ResponsiveContainer>
+  );
+}
+
+function TimeInZoneChart({
+  title,
+  zones,
+  seconds,
+}: {
+  title: string;
+  zones: ReturnType<typeof effectivePowerZones>;
+  seconds: number[];
+}) {
+  const data = zones.map((zone, index) => ({
+    name: zone.name,
+    seconds: Math.round(seconds[index] ?? 0),
+    fill: zoneColors[index % zoneColors.length],
+  }));
+  return (
+    <div className="card zone-chart">
+      <div className="chart-heading"><div><span className="label">LIVE TOTALS</span><h3>{title}</h3></div></div>
+      <ResponsiveContainer width="100%" height={Math.max(150, data.length * 30)}>
+        <BarChart data={data} layout="vertical" margin={{ left: 4, right: 12 }}>
+          <XAxis type="number" hide />
+          <YAxis type="category" dataKey="name" width={58} tick={{ fontSize: 10 }} />
+          <Tooltip formatter={(value) => [formatDuration(Number(value)), "Time"]} />
+          <Bar dataKey="seconds" radius={[0, 4, 4, 0]} isAnimationActive={false}>
+            {data.map((entry) => <Cell key={entry.name} fill={entry.fill} />)}
+          </Bar>
+        </BarChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
+
+function ZoneEditor({
+  title,
+  unit,
+  mode,
+  zones,
+  onChange,
+  onReset,
+}: {
+  title: string;
+  unit: string;
+  mode: "derived" | "custom";
+  zones: ReturnType<typeof effectivePowerZones>;
+  onChange: (zones: ReturnType<typeof effectivePowerZones>) => void;
+  onReset: () => void;
+}) {
+  const update = (index: number, patch: Partial<(typeof zones)[number]>) =>
+    onChange(zones.map((zone, zoneIndex) => zoneIndex === index ? { ...zone, ...patch } : zone));
+  return (
+    <div className="zone-editor">
+      <div className="zone-editor-head">
+        <strong>{title}</strong>
+        <span>{mode === "derived" ? "Derived" : "Custom"}</span>
+        {mode === "custom" && <button type="button" className="text-button" onClick={onReset}>Reset defaults</button>}
+      </div>
+      <div className="zone-boundaries">
+        {zones.map((zone, index) => (
+          <div className="zone-boundary" key={`${title}-${index}`}>
+            <i style={{ background: zoneColors[index % zoneColors.length] }} />
+            <input
+              aria-label={`${title} zone ${index + 1} name`}
+              value={zone.name}
+              onChange={(event) => update(index, { name: event.target.value })}
+            />
+            {zone.upperBound === null ? (
+              <span>and above</span>
+            ) : (
+              <label>
+                up to
+                <input
+                  aria-label={`${title} zone ${index + 1} upper bound`}
+                  type="number"
+                  min={unit === "W" ? 1 : 30}
+                  max={unit === "W" ? 3000 : 250}
+                  value={zone.upperBound}
+                  onChange={(event) => update(index, { upperBound: Number(event.target.value) })}
+                />
+                {unit}
+              </label>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
   );
 }
 

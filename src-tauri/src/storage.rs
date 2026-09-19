@@ -56,6 +56,7 @@ pub enum ZoneMode {
 #[serde(rename_all = "camelCase", default)]
 pub struct TrainingZoneSettings {
     pub version: u8,
+    pub sync_power_zones_from_intervals: bool,
     pub power_mode: ZoneMode,
     pub power_zones: Vec<ZoneDefinition>,
     pub heart_rate_mode: ZoneMode,
@@ -66,6 +67,7 @@ impl Default for TrainingZoneSettings {
     fn default() -> Self {
         Self {
             version: 1,
+            sync_power_zones_from_intervals: false,
             power_mode: ZoneMode::Derived,
             power_zones: Vec::new(),
             heart_rate_mode: ZoneMode::Derived,
@@ -109,7 +111,7 @@ fn validate_zones(
             return Err(format!("{label} zone names cannot be empty"));
         }
         match zone.upper_bound {
-            Some(bound) if index + 1 == zones.len() => {
+            Some(_) if index + 1 == zones.len() => {
                 return Err(format!("The final {label} zone must be open-ended"));
             }
             Some(bound) if bound < minimum || bound > maximum || bound <= previous => {
@@ -926,6 +928,60 @@ mod tests {
     }
 
     #[test]
+    fn training_zones_and_ride_display_default_validate_and_round_trip() {
+        let storage = Storage::in_memory().unwrap();
+        assert_eq!(
+            storage.training_zones().unwrap(),
+            TrainingZoneSettings::default()
+        );
+        assert_eq!(
+            storage.ride_display_preferences().unwrap(),
+            RideDisplayPreferences::default()
+        );
+        let zones = TrainingZoneSettings {
+            sync_power_zones_from_intervals: true,
+            heart_rate_mode: ZoneMode::Custom,
+            heart_rate_zones: vec![
+                ZoneDefinition {
+                    name: "Easy".into(),
+                    upper_bound: Some(140),
+                },
+                ZoneDefinition {
+                    name: "Hard".into(),
+                    upper_bound: None,
+                },
+            ],
+            ..TrainingZoneSettings::default()
+        };
+        storage.save_training_zones(&zones).unwrap();
+        assert_eq!(storage.training_zones().unwrap(), zones);
+        let display = RideDisplayPreferences {
+            show_time_in_zone: true,
+        };
+        storage.save_ride_display_preferences(&display).unwrap();
+        assert_eq!(storage.ride_display_preferences().unwrap(), display);
+    }
+
+    #[test]
+    fn rejects_invalid_custom_zone_boundaries() {
+        let invalid = TrainingZoneSettings {
+            power_mode: ZoneMode::Custom,
+            power_zones: vec![
+                ZoneDefinition {
+                    name: "One".into(),
+                    upper_bound: Some(200),
+                },
+                ZoneDefinition {
+                    name: "Two".into(),
+                    upper_bound: Some(150),
+                },
+            ],
+            ..TrainingZoneSettings::default()
+        };
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
     fn intervals_api_key_round_trips_and_clears() {
         let storage = Storage::in_memory().unwrap();
         assert_eq!(storage.intervals_api_key().unwrap(), None);
@@ -1064,6 +1120,7 @@ mod tests {
         assert_eq!(profile.bike_weight_kg, 9.0);
         assert_eq!(profile.weight_unit, WeightUnit::Kg);
         assert_eq!(profile.distance_unit, DistanceUnit::Km);
+        assert_eq!(profile.max_heart_rate_bpm, 190);
         let session = storage.start_session(None, "Migrated", 84.0).unwrap();
         assert_eq!(
             storage

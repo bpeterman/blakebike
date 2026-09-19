@@ -210,6 +210,7 @@ export type ZoneMode = "derived" | "custom";
 
 export type TrainingZoneSettings = {
   version: 1;
+  syncPowerZonesFromIntervals: boolean;
   powerMode: ZoneMode;
   powerZones: ZoneDefinition[];
   heartRateMode: ZoneMode;
@@ -222,6 +223,7 @@ export type RideDisplayPreferences = {
 
 export const defaultTrainingZoneSettings: TrainingZoneSettings = {
   version: 1,
+  syncPowerZonesFromIntervals: false,
   powerMode: "derived",
   powerZones: [],
   heartRateMode: "derived",

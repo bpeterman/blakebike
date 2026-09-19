@@ -22,6 +22,13 @@ import type {
   Workout,
 } from "./types";
 
+export type TrainingSyncResult = {
+  profile: Profile;
+  zones: TrainingZoneSettings;
+  powerZonesImported: boolean;
+  heartRateZonesImported: boolean;
+};
+
 export const api = {
   deviceState: () => invoke<DeviceState>("device_state"),
   scanTrainers: () => invoke<DeviceInfo[]>("scan_trainers"),
@@ -51,7 +58,7 @@ export const api = {
   clearIntervalsApiKey: () =>
     invoke<void>("clear_intervals_api_key"),
   refreshEstimatedFtp: () =>
-    invoke<Profile>("refresh_estimated_ftp"),
+    invoke<TrainingSyncResult>("refresh_estimated_ftp"),
   workouts: () => invoke<Workout[]>("list_workouts"),
   workout: (id: string) => invoke<Workout | null>("get_workout", { id }),
   saveWorkout: (workout: Workout) =>
