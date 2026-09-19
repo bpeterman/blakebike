@@ -45,6 +45,8 @@ const idleStats: DeviceSlot["stats"] = {
   rateHz: 0,
   rssi: null,
   batteryPercent: null,
+  batteryStatus: null,
+  batteryVoltage: null,
   manufacturer: null,
   model: null,
   firmware: null,
@@ -213,9 +215,10 @@ describe("DevicesPage", () => {
     await waitFor(() => expect(api.forgetDevice).toHaveBeenCalledWith("strap"));
   });
 
-  it("shows actionable ANT adapter failures but keeps no-stick quiet", () => {
+  it("shows the ANT adapter card at the bottom and expands the HR connect action only when ready", () => {
     const view = render(<DevicesPage hub={snapshot} sources={snapshot.sources} onConnect={vi.fn()} onCalibrate={vi.fn()} onSourcePreference={vi.fn()} perform={perform} />);
-    expect(screen.queryByText("ANT+")).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "ANT+ receiver" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Reconnect/ })).toHaveAttribute("title", "Connect via Bluetooth");
     view.rerender(
       <DevicesPage
         hub={{ ...snapshot, antAdapter: { status: "permissionDenied", message: "Permission denied on /dev/ttyUSB0" } }}
@@ -226,8 +229,39 @@ describe("DevicesPage", () => {
         perform={perform}
       />,
     );
-    expect(screen.getByText("ANT+")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "ANT+ receiver" })).toBeInTheDocument();
     expect(screen.getByText(/Permission denied.*ttyUSB0/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Reconnect/ })).toHaveAttribute("title", "Connect via Bluetooth");
+
+    view.rerender(
+      <DevicesPage
+        hub={{ ...snapshot, antAdapter: { status: "ready", name: "ANT USBStick2" } }}
+        sources={snapshot.sources}
+        onConnect={vi.fn()}
+        onCalibrate={vi.fn()}
+        onSourcePreference={vi.fn()}
+        perform={perform}
+      />,
+    );
+    const adapterHeading = screen.getByRole("heading", { name: "ANT+ receiver" });
+    const sourcesHeading = screen.getByRole("heading", { name: "Which device feeds each metric" });
+    expect(sourcesHeading.compareDocumentPosition(adapterHeading) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    const reconnect = screen.getByRole("button", { name: /Reconnect/ });
+    expect(reconnect).toHaveAttribute("title", "Connect via Bluetooth or ANT+");
+    expect(reconnect.querySelector(".lucide-radio")).toBeInTheDocument();
+  });
+
+  it("shows ANT battery status when the sensor omits an exact percentage", () => {
+    const batterySnapshot: DevicesSnapshot = {
+      ...snapshot,
+      slots: snapshot.slots.map((slot) =>
+        slot.role === "heartRate"
+          ? { ...slot, stats: { ...slot.stats, batteryStatus: "Good", batteryVoltage: 2.5 } }
+          : slot,
+      ),
+    };
+    render(<DevicesPage hub={batterySnapshot} sources={batterySnapshot.sources} onConnect={vi.fn()} onCalibrate={vi.fn()} onSourcePreference={vi.fn()} perform={perform} />);
+    expect(screen.getByText("Good")).toBeInTheDocument();
   });
 
   it("renders sensibly before the first snapshot arrives", () => {

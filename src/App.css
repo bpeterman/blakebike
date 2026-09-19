@@ -430,11 +430,12 @@ textarea { min-height: 70px; resize: vertical; }
 .status-dot.busy { background: #e6c36a; box-shadow: 0 0 8px #e6c36a66; }
 .status-dot.error { background: #ff8a7a; box-shadow: 0 0 8px #ff8a7a66; }
 .devices-scan-error { margin-bottom: 16px; }
-.ant-adapter-status { display: flex; gap: 8px; align-items: center; margin-bottom: 16px; padding: 9px 12px; border: 1px solid #384231; border-radius: 8px; background: #20271b; color: #aeb9a4; font-size: 12px; }
-.ant-adapter-status strong { color: #d4ef58; letter-spacing: .06em; }
-.ant-adapter-status.permissionDenied,
-.ant-adapter-status.busy,
-.ant-adapter-status.error { border-color: #68443a; background: #2a201c; color: #e0ada0; }
+.ant-adapter-card { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 14px; margin-top: 16px; padding: 20px; }
+.ant-adapter-card h2 { margin: 2px 0 3px; font-size: 18px; }
+.ant-adapter-card p { margin: 0; font-size: 12px; }
+.ant-adapter-card.permissionDenied,
+.ant-adapter-card.busy,
+.ant-adapter-card.error { border-color: #5a3a35; }
 .device-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 15px; }
 .device-card { display: grid; gap: 14px; padding: 20px; }
 .calibration-unavailable { margin-top: -8px; color: #8f8878; font-size: 10px; }

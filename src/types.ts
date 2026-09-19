@@ -84,6 +84,8 @@ export type SlotStats = {
   rateHz: number;
   rssi: number | null;
   batteryPercent: number | null;
+  batteryStatus: string | null;
+  batteryVoltage: number | null;
   manufacturer: string | null;
   model: string | null;
   firmware: string | null;

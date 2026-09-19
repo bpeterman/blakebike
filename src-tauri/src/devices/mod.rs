@@ -142,6 +142,8 @@ pub struct SlotStats {
     pub rate_hz: f32,
     pub rssi: Option<i16>,
     pub battery_percent: Option<u8>,
+    pub battery_status: Option<String>,
+    pub battery_voltage: Option<f32>,
     pub manufacturer: Option<String>,
     pub model: Option<String>,
     pub firmware: Option<String>,
@@ -381,16 +383,26 @@ impl DeviceSlot {
     /// Update battery information delivered after connection (for example,
     /// the optional ANT+ HRM page 7) and immediately refresh the device card.
     /// Returns true when the displayed value changed.
-    pub fn record_battery_percent(&self, battery_percent: u8) -> bool {
+    pub fn record_battery(
+        &self,
+        battery_percent: Option<u8>,
+        battery_status: Option<String>,
+        battery_voltage: Option<f32>,
+    ) -> bool {
         let changed = {
             let mut inner = self
                 .stats
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if inner.stats.battery_percent == Some(battery_percent) {
+            if inner.stats.battery_percent == battery_percent
+                && inner.stats.battery_status == battery_status
+                && inner.stats.battery_voltage == battery_voltage
+            {
                 false
             } else {
-                inner.stats.battery_percent = Some(battery_percent);
+                inner.stats.battery_percent = battery_percent;
+                inner.stats.battery_status = battery_status;
+                inner.stats.battery_voltage = battery_voltage;
                 true
             }
         };
@@ -442,6 +454,8 @@ impl DeviceSlot {
         inner.stats.connected_since_ms = Some(Utc::now().timestamp_millis());
         inner.stats.rssi = rssi;
         inner.stats.battery_percent = details.battery_percent;
+        inner.stats.battery_status = None;
+        inner.stats.battery_voltage = None;
         inner.stats.manufacturer = details.manufacturer.clone();
         inner.stats.model = details.model.clone();
         inner.stats.firmware = details.firmware.clone();
@@ -1367,9 +1381,11 @@ mod tests {
         assert_eq!(stats.samples, 2);
         assert_eq!(stats.last_raw_hex.as_deref(), Some("10 5a"));
         assert!(stats.rate_hz > 0.0);
-        assert!(slot.record_battery_percent(82));
-        assert!(!slot.record_battery_percent(82));
+        assert!(slot.record_battery(Some(82), Some("Good".into()), Some(2.5)));
+        assert!(!slot.record_battery(Some(82), Some("Good".into()), Some(2.5)));
         assert_eq!(slot.stats().battery_percent, Some(82));
+        assert_eq!(slot.stats().battery_status.as_deref(), Some("Good"));
+        assert_eq!(slot.stats().battery_voltage, Some(2.5));
         slot.record_drop();
         assert_eq!(slot.stats().drops, 1);
         assert_eq!(slot.stats().rate_hz, 0.0);

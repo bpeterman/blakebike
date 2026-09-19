@@ -91,12 +91,26 @@ impl HeartRateReceiver {
                 let mut session = session;
                 let mut last_sample = Instant::now();
                 let mut first = true;
+                let mut last_battery = None;
                 while !cancel.load(Ordering::Acquire) {
                     match session.next_heart_rate(POLL_INTERVAL) {
                         Ok(Some((measurement, raw))) => {
                             last_sample = Instant::now();
                             let valid_bpm = measurement.bpm.is_some();
-                            record(&blocking_slot, &blocking_fuser, measurement, &raw, first);
+                            let battery_changed = measurement
+                                .battery
+                                .is_some_and(|battery| last_battery != Some(battery));
+                            if let Some(battery) = measurement.battery {
+                                last_battery = Some(battery);
+                            }
+                            record(
+                                &blocking_slot,
+                                &blocking_fuser,
+                                measurement,
+                                &raw,
+                                first,
+                                battery_changed,
+                            );
                             if valid_bpm {
                                 first = false;
                             }
@@ -155,15 +169,33 @@ fn record(
     measurement: super::hrm::Measurement,
     raw: &[u8; 8],
     first: bool,
+    battery_changed: bool,
 ) {
     slot.record_sample(Some(raw));
-    if let Some(battery_percent) = measurement.battery_percent
-        && slot.record_battery_percent(battery_percent)
-    {
+    if battery_changed && let Some(battery) = measurement.battery {
+        let status = battery.status.map(|status| status.label().to_string());
+        let voltage = battery.voltage();
+        slot.record_battery(battery.percent, status.clone(), voltage);
+        let mut details = Vec::new();
+        if let Some(percent) = battery.percent {
+            details.push(format!("{percent}%"));
+        } else {
+            details.push("percentage not provided by sensor".into());
+        }
+        if let Some(status) = status {
+            details.push(status);
+        }
+        if let Some(voltage) = voltage {
+            details.push(format!("{voltage:.2} V"));
+        }
         slot.note(
-            "ok",
+            if battery.percent.is_some() {
+                "ok"
+            } else {
+                "info"
+            },
             "ANT battery received",
-            Some(format!("{battery_percent}%")),
+            Some(details.join(" · ")),
         );
     }
     let Some(bpm) = measurement.bpm else {
