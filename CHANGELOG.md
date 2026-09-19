@@ -19,6 +19,10 @@ Conventions:
 
 ## [Unreleased]
 
+### Added
+
+- Drag across the power or heart-rate chart in a ride's detail view to highlight a section and see its average, maximum, and minimum power and heart rate. Click the chart, press Clear, or press Escape to dismiss it.
+
 ## [0.1.0] - 2026-09-19
 
 First release: structured workouts on an FTMS smart trainer, with Bluetooth and ANT+ heart rate, saved locally on your own computer.

@@ -40,12 +40,19 @@ import {
   BarChart,
   CartesianGrid,
   Cell,
+  ReferenceArea,
   ResponsiveContainer,
   Tooltip,
   XAxis,
   YAxis,
 } from "recharts";
 import { api } from "./api";
+import {
+  type ChartRange,
+  type RangeSummary,
+  summarizeRange,
+  useChartRangeDrag,
+} from "./chartRange";
 import {
   formatReleaseDate,
   releaseFor,
@@ -1399,7 +1406,10 @@ export function PostRidePrompt({ errorMessage, saveWarning = null, onView, onDis
 }
 
 export function RideDetailModal({ session, profile, trainingZones, onClose, onExport, onExportFit, onGarmin }: { session: SessionDetail; profile: Profile; trainingZones: TrainingZoneSettings; onClose: () => void; onExport: (session: SessionSummary) => void; onExportFit: (session: SessionSummary) => void; onGarmin: (session: SessionSummary) => void }) {
-  const dialogRef = useDialog<HTMLDivElement>(onClose);
+  const [range, setRange] = useState<ChartRange | null>(null);
+  const clearRange = useCallback(() => setRange(null), []);
+  // Escape dismisses the innermost thing: a chart selection first, then the modal.
+  const dialogRef = useDialog<HTMLDivElement>(range ? clearRange : onClose);
   const powerZones = useMemo(
     () => effectivePowerZones(trainingZones, profile.ftpWatts),
     [profile.ftpWatts, trainingZones],
@@ -1408,9 +1418,14 @@ export function RideDetailModal({ session, profile, trainingZones, onClose, onEx
     () => effectiveHeartRateZones(trainingZones, profile.maxHeartRateBpm),
     [profile.maxHeartRateBpm, trainingZones],
   );
-  const samples = useMemo(
-    () => downsampleTelemetry(withActiveElapsed(session.samples, session.summary.elapsedSeconds)),
+  const activeSamples = useMemo(
+    () => withActiveElapsed(session.samples, session.summary.elapsedSeconds),
     [session],
+  );
+  const samples = useMemo(() => downsampleTelemetry(activeSamples), [activeSamples]);
+  const rangeSummary = useMemo(
+    () => (range ? summarizeRange(activeSamples, range) : null),
+    [activeSamples, range],
   );
   const powerSeconds = useMemo(
     () => timeInZones(session.samples, powerZones, "power"),
@@ -1451,10 +1466,11 @@ export function RideDetailModal({ session, profile, trainingZones, onClose, onEx
         </div>
         <p className="distance-note">Estimated distance · {distanceSourceLabel(session.summary.distanceSource)}</p>
         <div className="history-charts">
+          <RangeSummaryStrip summary={rangeSummary} onClear={clearRange} />
           <h3>Power</h3>
-          <SessionAreaChart samples={samples} dataKey="powerWatts" unit="W" color="#c8ff32" name="Power" domain={powerDomain}/>
+          <SessionAreaChart samples={samples} dataKey="powerWatts" unit="W" color="#c8ff32" name="Power" domain={powerDomain} selection={range} onSelectionChange={setRange}/>
           <h3>Heart rate</h3>
-          <SessionAreaChart samples={samples} dataKey="heartRateBpm" unit="bpm" color="#ff6f7d" name="Heart rate" domain={heartRateDomain}/>
+          <SessionAreaChart samples={samples} dataKey="heartRateBpm" unit="bpm" color="#ff6f7d" name="Heart rate" domain={heartRateDomain} selection={range} onSelectionChange={setRange}/>
           <div className="zone-chart-grid history-zone-charts">
             <TimeInZoneChart title="Power zones" zones={powerZones} seconds={powerSeconds}/>
             <TimeInZoneChart title="Heart-rate zones" zones={heartRateZones} seconds={heartRateSeconds}/>
@@ -1912,6 +1928,11 @@ const zoneColors = [
   "#ffffff",
 ];
 
+const formatChartTime = (value: unknown) =>
+  formatDuration(Math.max(0, Math.round(Number(value) / 1000)));
+
+const noSelectionChange = () => undefined;
+
 const SessionAreaChart = memo(function SessionAreaChart({
   samples,
   dataKey,
@@ -1919,6 +1940,8 @@ const SessionAreaChart = memo(function SessionAreaChart({
   color,
   name,
   domain,
+  selection = null,
+  onSelectionChange,
 }: {
   samples: Array<Telemetry & { displayPowerWatts?: number; activeElapsedMs: number }>;
   dataKey: "powerWatts" | "displayPowerWatts" | "heartRateBpm";
@@ -1926,46 +1949,98 @@ const SessionAreaChart = memo(function SessionAreaChart({
   color: string;
   name: string;
   domain: ChartDomain;
+  /** Highlighted stretch of the ride, shared by every chart on the screen. */
+  selection?: ChartRange | null;
+  /** When provided, the rider can press and drag on the chart to select a range. */
+  onSelectionChange?: (range: ChartRange | null) => void;
 }) {
   const gradientId = `fill-${dataKey}`;
+  const selectable = onSelectionChange !== undefined;
+  const drag = useChartRangeDrag(onSelectionChange ?? noSelectionChange);
   return (
-    <ResponsiveContainer width="100%" height={220}>
-      <AreaChart data={samples}>
-        <defs>
-          <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stopColor={color} stopOpacity={0.42} />
-            <stop offset="100%" stopColor={color} stopOpacity={0} />
-          </linearGradient>
-        </defs>
-        <CartesianGrid strokeDasharray="4 4" vertical={false} />
-        <XAxis
-          dataKey="activeElapsedMs"
-          type="number"
-          domain={["dataMin", "dataMax"]}
-          tickFormatter={(value) => formatDuration(Math.max(0, Math.round(Number(value) / 1000)))}
-          minTickGap={45}
-        />
-        <YAxis width={42} domain={domain} />
-        <Tooltip
-          labelFormatter={(value) => formatDuration(Math.max(0, Math.round(Number(value) / 1000)))}
-          formatter={(value) => [`${value ?? "—"} ${unit}`, name]}
-          contentStyle={chartTooltipContentStyle}
-          labelStyle={chartTooltipLabelStyle}
-          itemStyle={chartTooltipItemStyle}
-          cursor={chartTooltipCursor}
-        />
-        <Area
-          connectNulls={false}
-          type="monotone"
-          dataKey={dataKey}
-          stroke={color}
-          fill={`url(#${gradientId})`}
-          isAnimationActive={false}
-        />
-      </AreaChart>
-    </ResponsiveContainer>
+    <div className={selectable ? "session-chart session-chart-selectable" : "session-chart"}>
+      <ResponsiveContainer width="100%" height={220}>
+        <AreaChart data={samples} {...(selectable ? drag : undefined)}>
+          <defs>
+            <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor={color} stopOpacity={0.42} />
+              <stop offset="100%" stopColor={color} stopOpacity={0} />
+            </linearGradient>
+          </defs>
+          <CartesianGrid strokeDasharray="4 4" vertical={false} />
+          <XAxis
+            dataKey="activeElapsedMs"
+            type="number"
+            domain={["dataMin", "dataMax"]}
+            tickFormatter={formatChartTime}
+            minTickGap={45}
+          />
+          <YAxis width={42} domain={domain} />
+          <Tooltip
+            labelFormatter={formatChartTime}
+            formatter={(value) => [`${value ?? "—"} ${unit}`, name]}
+            contentStyle={chartTooltipContentStyle}
+            labelStyle={chartTooltipLabelStyle}
+            itemStyle={chartTooltipItemStyle}
+            cursor={chartTooltipCursor}
+          />
+          {selection && (
+            <ReferenceArea
+              x1={selection.startMs}
+              x2={selection.endMs}
+              ifOverflow="discard"
+              fill={color}
+              fillOpacity={0.16}
+              stroke={color}
+              strokeOpacity={0.6}
+            />
+          )}
+          <Area
+            connectNulls={false}
+            type="monotone"
+            dataKey={dataKey}
+            stroke={color}
+            fill={`url(#${gradientId})`}
+            isAnimationActive={false}
+          />
+        </AreaChart>
+      </ResponsiveContainer>
+    </div>
   );
 });
+
+/**
+ * Average, maximum, and minimum for the stretch highlighted on the charts.
+ * Shows a short hint until the rider drags a range.
+ */
+export function RangeSummaryStrip({
+  summary,
+  onClear,
+}: {
+  summary: RangeSummary | null;
+  onClear: () => void;
+}) {
+  if (!summary) {
+    return <p className="range-hint">Drag across a chart to see the average, maximum, and minimum for that section.</p>;
+  }
+  const { range, durationMs, power, heartRate } = summary;
+  return (
+    <div className="range-summary" role="status">
+      <div className="range-summary-span">
+        <span className="label">SELECTION</span>
+        <strong>{formatChartTime(range.startMs)} – {formatChartTime(range.endMs)}</strong>
+        <span>{formatChartTime(durationMs)} selected</span>
+      </div>
+      <Metric value={power ? `${power.average}` : "—"} unit="W average" />
+      <Metric value={power ? `${power.max}` : "—"} unit="W maximum" />
+      <Metric value={power ? `${power.min}` : "—"} unit="W minimum" />
+      <Metric value={heartRate ? `${heartRate.average}` : "—"} unit="bpm average" />
+      <Metric value={heartRate ? `${heartRate.max}` : "—"} unit="bpm maximum" />
+      <Metric value={heartRate ? `${heartRate.min}` : "—"} unit="bpm minimum" />
+      <button type="button" className="secondary" onClick={onClear}>Clear</button>
+    </div>
+  );
+}
 
 const TimeInZoneChart = memo(function TimeInZoneChart({
   title,
