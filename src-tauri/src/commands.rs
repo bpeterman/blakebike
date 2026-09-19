@@ -570,7 +570,7 @@ pub fn set_ride_display_preferences(
 
 #[tauri::command]
 pub async fn pause_or_resume_workout(state: State<'_, AppState>) -> Result<(), String> {
-    state.runner.pause_or_resume(&state.devices).await
+    state.runner.pause_or_resume().await
 }
 
 #[tauri::command]
@@ -580,7 +580,7 @@ pub fn skip_interval(state: State<'_, AppState>) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn stop_workout(state: State<'_, AppState>) -> Result<(), String> {
-    state.runner.stop(&state.devices).await
+    state.runner.stop().await
 }
 
 #[tauri::command]
@@ -706,6 +706,18 @@ pub fn debug_inject_trainer_fault(
     match kind.as_str() {
         "failWrites" => faults
             .fail_writes
+            .store(count.unwrap_or(1), Ordering::Relaxed),
+        "writeDelayMs" => faults
+            .write_delay_ms
+            .store(u64::from(count.unwrap_or(0)), Ordering::Relaxed),
+        "ackDelayMs" => faults
+            .ack_delay_ms
+            .store(u64::from(count.unwrap_or(0)), Ordering::Relaxed),
+        "refuseWith" => faults
+            .refuse_with
+            .store(count.unwrap_or(4).min(255) as u8, Ordering::Relaxed),
+        "failConnects" => faults
+            .fail_connects
             .store(count.unwrap_or(1), Ordering::Relaxed),
         "dropLink" => faults.drop_link.notify_one(),
         other => return Err(format!("Unknown trainer fault: {other}")),

@@ -42,6 +42,8 @@ fit-sdk-rust = "0.2.1"
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"
+# start_paused / time::advance for deterministic timing tests.
+tokio = { version = "1", features = ["test-util"] }
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

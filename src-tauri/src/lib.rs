@@ -126,7 +126,7 @@ pub fn run() {
                 let devices = Arc::clone(&state.devices);
                 let runner = Arc::clone(&state.runner);
                 tauri::async_runtime::spawn(async move {
-                    let _ = runner.stop(&devices).await;
+                    let _ = runner.stop().await;
                     devices.disconnect().await;
                 });
             }

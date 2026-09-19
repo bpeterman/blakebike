@@ -1,8 +1,25 @@
+//! The workout runner.
+//!
+//! Three cooperating pieces per ride:
+//! - the **timeline** task keeps the clock on wall time, decides which
+//!   interval and target are current, records telemetry totals and is the only
+//!   writer of [`RunnerState`];
+//! - the **target writer** task is the only thing that talks to the trainer
+//!   during a ride: it follows the timeline's intent (running / paused /
+//!   stopped plus the current target), retries with backoff and reports a
+//!   [`ControlStatus`] instead of ever failing the ride;
+//! - the **recorder** thread batches telemetry into SQLite so a slow or
+//!   failing write never stalls the ride.
+//!
+//! Trainer trouble degrades a ride; it never ends it. The session is finalized
+//! on every exit path.
+
 use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU8, AtomicU16, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, Ordering},
+        mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel},
     },
     time::Duration,
 };
@@ -10,14 +27,19 @@ use std::{
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
-use tokio::{sync::RwLock, task::JoinHandle};
+use tokio::{
+    sync::{Notify, RwLock, broadcast, watch},
+    task::JoinHandle,
+    time::{Instant, MissedTickBehavior},
+};
 use uuid::Uuid;
 
 use crate::{
-    devices::DeviceHub,
+    devices::{ControlError, DeviceHub, DeviceState},
     distance::estimate_distance,
     domain::{Interval, SessionSummary, Telemetry, Workout},
     fit::ensure_ride_file,
+    ftms::ResponseCode,
     storage::Storage,
 };
 
@@ -32,6 +54,35 @@ pub const MIN_BIAS_PERCENT: u16 = 50;
 pub const MAX_BIAS_PERCENT: u16 = 150;
 /// `override_target == NO_OVERRIDE` means the planned target is in force.
 const NO_OVERRIDE: u16 = 0;
+/// Re-send the current target this often when nothing changed, so a trainer
+/// that quietly dropped it gets it again.
+const KEEPALIVE: Duration = Duration::from_secs(5);
+/// After a failed command, try again this soon (each attempt is itself bounded
+/// by the control timeouts).
+const RETRY_AFTER: Duration = Duration::from_secs(2);
+/// Consecutive command failures before a nominally connected trainer counts
+/// as lost.
+const FAILURES_BEFORE_LOST: u8 = 3;
+/// How long the writer waits for the trainer to acknowledge Stop at the end.
+const STOP_GRACE: Duration = Duration::from_secs(3);
+/// How long the ride waits for the recorder to write the last samples.
+const FLUSH_GRACE: Duration = Duration::from_secs(5);
+/// Samples the recorder keeps while the database stays unwritable (about ten
+/// minutes at 5 Hz); older ones are dropped first.
+const MAX_PENDING_SAMPLES: usize = 3_000;
+
+/// How the trainer is keeping up with the ride, shown on the ride screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ControlStatus {
+    /// Commands are acknowledged.
+    #[default]
+    Ok,
+    /// A recent command failed or was refused; the writer keeps retrying.
+    Degraded,
+    /// No usable link; the target is held until the trainer is back.
+    Lost,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(
@@ -48,7 +99,8 @@ pub enum RunnerState {
         total_seconds: Option<u32>,
         interval_index: usize,
         interval_elapsed_seconds: u32,
-        /// Target currently sent to the trainer (after bias and any override).
+        /// Target the ride wants on the trainer right now (after bias and any
+        /// override). Whether the trainer has it is `control`.
         target_power_watts: Option<u16>,
         /// Target the workout plan asks for right now, before bias/override.
         planned_target_watts: Option<u16>,
@@ -57,6 +109,7 @@ pub enum RunnerState {
         /// True while the rider has overridden this interval's target.
         override_active: bool,
         bias_percent: u16,
+        control: ControlStatus,
     },
     Paused {
         session_id: Uuid,
@@ -70,6 +123,7 @@ pub enum RunnerState {
         manual_erg: bool,
         override_active: bool,
         bias_percent: u16,
+        control: ControlStatus,
     },
     Finished {
         session_id: Uuid,
@@ -117,7 +171,23 @@ impl RideStats {
     }
 }
 
-/// Lock-free knobs shared between the command handlers and the timeline task.
+/// What the ride wants the trainer to be doing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Idle,
+    Running,
+    Paused,
+    Stopped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TrainerIntent {
+    phase: Phase,
+    /// Desired ERG target, already clamped to the trainer and rider limits.
+    target: Option<u16>,
+}
+
+/// Lock-free knobs shared between the command handlers and the ride tasks.
 #[derive(Clone)]
 struct Controls {
     control: Arc<AtomicU8>,
@@ -129,10 +199,14 @@ struct Controls {
     planned_active: Arc<AtomicBool>,
     /// Rider override for the current planned interval, `NO_OVERRIDE` when unset.
     override_target: Arc<AtomicU16>,
-    /// The last target actually sent to the trainer; ± steps start from here.
+    /// The target the ride wants applied right now; ± steps start from here.
     current_target: Arc<AtomicU16>,
     /// Overall bias applied to every planned target for this ride.
     bias_percent: Arc<AtomicU16>,
+    /// What the trainer should be doing; the writer task follows it.
+    intent: Arc<watch::Sender<TrainerIntent>>,
+    /// Wakes the timeline so stop, skip, pause and resume act at once.
+    wake: Arc<Notify>,
 }
 
 impl Default for Controls {
@@ -145,6 +219,11 @@ impl Default for Controls {
             override_target: Arc::new(AtomicU16::new(NO_OVERRIDE)),
             current_target: Arc::new(AtomicU16::new(0)),
             bias_percent: Arc::new(AtomicU16::new(DEFAULT_BIAS_PERCENT)),
+            intent: Arc::new(watch::Sender::new(TrainerIntent {
+                phase: Phase::Idle,
+                target: None,
+            })),
+            wake: Arc::new(Notify::new()),
         }
     }
 }
@@ -170,6 +249,28 @@ impl Controls {
     fn planned_effective(&self, planned: Option<u16>) -> Option<u16> {
         self.override_target()
             .or_else(|| planned.map(|watts| biased_target(watts, self.bias())))
+    }
+
+    fn set_phase(&self, phase: Phase) {
+        self.intent.send_if_modified(|intent| {
+            if intent.phase == phase {
+                false
+            } else {
+                intent.phase = phase;
+                true
+            }
+        });
+    }
+
+    fn set_target(&self, target: Option<u16>) {
+        self.intent.send_if_modified(|intent| {
+            if intent.target == target {
+                false
+            } else {
+                intent.target = target;
+                true
+            }
+        });
     }
 }
 
@@ -287,7 +388,21 @@ impl WorkoutRunner {
             tracing::warn!(state = ?current, "start ride rejected: already active");
             return Err("A ride is already active".into());
         }
-        devices.begin_control().await?;
+        // Let the previous ride's tasks wind down first: its final Stop must
+        // not land after this ride's Start.
+        if let Some(previous) = self.worker.lock().await.take()
+            && tokio::time::timeout(Duration::from_secs(5), previous)
+                .await
+                .is_err()
+        {
+            tracing::warn!("Previous ride did not wind down in time; starting anyway");
+        }
+        // Control is acquired synchronously so a missing trainer is reported
+        // to the rider right away; from here on the writer task owns the link.
+        devices.begin_control().await.map_err(|error| match error {
+            ControlError::NotConnected => "Connect a trainer before starting a workout".to_string(),
+            other => other.to_string(),
+        })?;
         let session = storage.start_session(workout_id, &ride_name, distance_weight_kg)?;
         let session_id = session.id;
         tracing::info!(
@@ -307,62 +422,69 @@ impl WorkoutRunner {
         self.controls
             .bias_percent
             .store(DEFAULT_BIAS_PERCENT, Ordering::Relaxed);
-        // Nothing has been sent to the trainer for this ride yet, so the first
-        // tick always writes its target (see the unchanged-target skip).
         self.controls.current_target.store(0, Ordering::Relaxed);
+        self.controls.intent.send_replace(TrainerIntent {
+            phase: Phase::Running,
+            target: None,
+        });
         self.standalone.store(standalone, Ordering::Relaxed);
 
-        let state = self.state.clone();
-        let controls = self.controls.clone();
+        let (status_tx, status_rx) = watch::channel(ControlStatus::Ok);
+        let writer = tokio::spawn(target_writer(
+            devices.clone(),
+            self.controls.intent.subscribe(),
+            status_tx,
+            devices.subscribe_trainer_state(),
+            rider_max,
+        ));
+        let mut ride = Ride {
+            app: app.clone(),
+            name: ride_name,
+            intervals,
+            total_seconds,
+            standalone,
+            rider_max,
+            session_id,
+            devices,
+            state: self.state.clone(),
+            controls: self.controls.clone(),
+            status_rx,
+            recorder: Recorder::start(storage.clone(), session_id),
+        };
         let ride_files_dir = self.ride_files_dir.clone();
-        let supervisor_app = app.clone();
-        let supervisor_state = state.clone();
+        let supervisor_app = app;
+        let supervisor_state = self.state.clone();
         let supervisor_storage = storage.clone();
-        let ride = tokio::spawn(async move {
-            let (stats, outcome) = run_timeline(
-                app.as_ref(),
-                &ride_name,
-                intervals,
-                total_seconds,
-                standalone,
-                rider_max,
-                &session,
-                devices.clone(),
-                storage.clone(),
-                state.clone(),
-                controls.clone(),
-            )
-            .await;
-            controls.manual_active.store(false, Ordering::Relaxed);
-            controls.planned_active.store(false, Ordering::Relaxed);
-            let (completed, error) = match outcome {
-                Ok(completed) => (completed, None),
-                Err(message) => {
-                    tracing::error!(session_id = %session_id, error = %message, "Workout aborted with error");
-                    if let Err(error) = devices.stop().await {
-                        tracing::warn!(error = %error, "Could not stop trainer after workout error");
-                    }
-                    (false, Some(message))
-                }
-            };
+        let ride_task = tokio::spawn(async move {
+            let mut stats = RideStats::default();
+            let completed = run_timeline(&mut ride, &mut stats).await;
+            // Tell the trainer first; closing the session takes a moment.
+            ride.controls.set_phase(Phase::Stopped);
+            ride.controls.manual_active.store(false, Ordering::Relaxed);
+            ride.controls.planned_active.store(false, Ordering::Relaxed);
+            ride.recorder.flush(FLUSH_GRACE).await;
+            let dropped = ride.recorder.dropped();
+            if dropped > 0 {
+                tracing::warn!(session_id = %session_id, dropped, "Telemetry samples were dropped during the ride");
+            }
             // Whatever happened, the ride is closed out and lands in History.
             finish(&storage, &ride_files_dir, session, &stats, completed);
-            *state.write().await = match error {
-                None => RunnerState::Finished {
-                    session_id,
-                    completed,
-                },
-                Some(message) => RunnerState::Error {
-                    message,
-                    session_id: Some(session_id),
-                },
+            if tokio::time::timeout(STOP_GRACE + Duration::from_secs(1), writer)
+                .await
+                .is_err()
+            {
+                tracing::warn!("Trainer writer did not wind down in time");
+            }
+            *ride.state.write().await = RunnerState::Finished {
+                session_id,
+                completed,
             };
-            emit_state(app.as_ref(), &state).await;
+            emit_state(ride.app.as_ref(), &ride.state).await;
         });
         // If the ride task itself dies (a panic), the session is still closed
         // from whatever samples were recorded and the UI is told.
         let worker = tokio::spawn(async move {
-            if let Err(error) = ride.await
+            if let Err(error) = ride_task.await
                 && error.is_panic()
             {
                 tracing::error!(session_id = %session_id, "Ride task panicked; finalizing from recorded samples");
@@ -384,7 +506,7 @@ impl WorkoutRunner {
 
     /// Nudge the target by ±5 W. In a free-ride interval this moves the manual
     /// ERG target; in a planned interval it overrides that interval's target
-    /// until the next one starts.
+    /// until the next one starts. Returns at once; the writer task applies it.
     pub async fn adjust_manual_power(
         &self,
         app: Option<&AppHandle>,
@@ -440,7 +562,7 @@ impl WorkoutRunner {
             return Err("No workout interval is running".into());
         }
         self.controls.clear_override();
-        self.reapply_plan(app, rider_max, devices).await
+        Ok(self.reapply_plan(app, rider_max, devices).await)
     }
 
     /// Scale every planned target for the rest of this ride. Applies at once
@@ -471,7 +593,7 @@ impl WorkoutRunner {
             && self.controls.planned_active.load(Ordering::Relaxed)
             && self.controls.override_target().is_none();
         if planned_running {
-            self.reapply_plan(app, rider_max, devices).await?;
+            self.reapply_plan(app, rider_max, devices).await;
         } else {
             emit_state(app, &self.state).await;
         }
@@ -500,22 +622,7 @@ impl WorkoutRunner {
         devices: &DeviceHub,
         mode: Adjustment,
     ) -> Result<u16, String> {
-        let clamped = devices.set_target_power(requested, rider_max).await?;
-        self.controls
-            .current_target
-            .store(clamped, Ordering::Relaxed);
-        match mode {
-            Adjustment::Manual => self
-                .controls
-                .manual_target
-                .store(clamped, Ordering::Relaxed),
-            Adjustment::Override => {
-                self.controls
-                    .override_target
-                    .store(clamped, Ordering::Relaxed);
-                tracing::info!(watts = clamped, "Interval target overridden");
-            }
-        }
+        let clamped = devices.clamp_target(requested, rider_max);
         {
             let mut state = self.state.write().await;
             let RunnerState::Running {
@@ -536,18 +643,34 @@ impl WorkoutRunner {
             }
             *target_power_watts = Some(clamped);
         }
+        self.controls
+            .current_target
+            .store(clamped, Ordering::Relaxed);
+        match mode {
+            Adjustment::Manual => self
+                .controls
+                .manual_target
+                .store(clamped, Ordering::Relaxed),
+            Adjustment::Override => {
+                self.controls
+                    .override_target
+                    .store(clamped, Ordering::Relaxed);
+                tracing::info!(watts = clamped, "Interval target overridden");
+            }
+        }
+        self.controls.set_target(Some(clamped));
         emit_state(app, &self.state).await;
         Ok(clamped)
     }
 
-    /// Send the biased planned target for the current interval right away
+    /// Publish the biased planned target for the current interval right away
     /// rather than waiting for the next one-second tick.
     async fn reapply_plan(
         &self,
         app: Option<&AppHandle>,
         rider_max: u16,
         devices: &DeviceHub,
-    ) -> Result<Option<u16>, String> {
+    ) -> Option<u16> {
         let planned = match &*self.state.read().await {
             RunnerState::Running {
                 planned_target_watts,
@@ -555,13 +678,15 @@ impl WorkoutRunner {
             } => *planned_target_watts,
             _ => None,
         };
-        let mut applied = None;
-        if let Some(watts) = self.controls.planned_effective(planned) {
-            let clamped = devices.set_target_power(watts, rider_max).await?;
+        let applied = self
+            .controls
+            .planned_effective(planned)
+            .map(|watts| devices.clamp_target(watts, rider_max));
+        if let Some(clamped) = applied {
             self.controls
                 .current_target
                 .store(clamped, Ordering::Relaxed);
-            applied = Some(clamped);
+            self.controls.set_target(Some(clamped));
         }
         {
             let mut state = self.state.write().await;
@@ -578,23 +703,25 @@ impl WorkoutRunner {
             }
         }
         emit_state(app, &self.state).await;
-        Ok(applied)
+        applied
     }
 
-    pub async fn pause_or_resume(&self, devices: &DeviceHub) -> Result<(), String> {
+    /// Pause or resume the ride clock. The trainer is told by the writer
+    /// task; a trainer that cannot be reached does not stop the rider from
+    /// pausing.
+    pub async fn pause_or_resume(&self) -> Result<(), String> {
         let current = self.controls.control.load(Ordering::Relaxed);
         if current == RUNNING {
             tracing::info!("Workout paused");
-            devices.pause().await?;
             self.controls.control.store(PAUSED, Ordering::Relaxed);
         } else if current == PAUSED {
             tracing::info!("Workout resumed");
-            devices.begin_control().await?;
             self.controls.control.store(RUNNING, Ordering::Relaxed);
         } else {
             tracing::warn!(control = current, "pause_or_resume with no active workout");
             return Err("No workout can be paused or resumed".into());
         }
+        self.controls.wake.notify_one();
         Ok(())
     }
 
@@ -605,211 +732,632 @@ impl WorkoutRunner {
         if self.controls.control.load(Ordering::Relaxed) <= PAUSED {
             tracing::info!("Interval skip requested");
             self.controls.control.store(SKIP, Ordering::Relaxed);
+            self.controls.wake.notify_one();
             Ok(())
         } else {
             Err("No active interval to skip".into())
         }
     }
 
-    pub async fn stop(&self, devices: &DeviceHub) -> Result<(), String> {
+    /// End the ride. The timeline finalizes the session and the writer task
+    /// tells the trainer to stop; neither can fail from here.
+    pub async fn stop(&self) -> Result<(), String> {
         tracing::info!("Workout stop requested");
         self.controls.control.store(STOPPED, Ordering::Relaxed);
         self.controls.manual_active.store(false, Ordering::Relaxed);
         self.controls.planned_active.store(false, Ordering::Relaxed);
         self.controls.clear_override();
-        // The ride is over as far as the timeline is concerned; a trainer that
-        // cannot be told so (link lost, already stopped) is not an error here.
-        if let Err(error) = devices.stop().await {
-            tracing::warn!(error = %error, "Trainer did not acknowledge stop; ride ends anyway");
-        }
+        self.controls.wake.notify_one();
         Ok(())
     }
 }
 
-/// Drive the ride to its end. Returns the running totals together with the
-/// outcome: `Ok(completed)` when the ride ended normally (stopped by the
-/// rider or ran to the end), `Err` when something made it impossible to go
-/// on. The caller finalizes the session in every case.
-#[allow(clippy::too_many_arguments)]
-async fn run_timeline(
-    app: Option<&AppHandle>,
-    ride_name: &str,
-    intervals: Vec<Interval>,
-    total_seconds: Option<u32>,
-    standalone: bool,
-    rider_max: u16,
-    summary: &SessionSummary,
-    devices: Arc<DeviceHub>,
-    storage: Arc<Storage>,
-    state: Arc<RwLock<RunnerState>>,
-    controls: Controls,
-) -> (RideStats, Result<bool, String>) {
-    let mut stats = RideStats::default();
-    let outcome = timeline_body(
-        app,
-        ride_name,
-        intervals,
-        total_seconds,
-        standalone,
-        rider_max,
-        summary,
-        devices,
-        storage,
-        state,
-        controls,
-        &mut stats,
-    )
-    .await;
-    (stats, outcome)
+/// Riding time on a monotonic clock: wall time minus pauses, plus whatever
+/// skipped intervals jumped over.
+#[derive(Debug, Clone, Copy)]
+struct RideClock {
+    started: Instant,
+    paused_total: Duration,
+    pause_started: Option<Instant>,
+    skipped: Duration,
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn timeline_body(
-    app: Option<&AppHandle>,
-    ride_name: &str,
+impl RideClock {
+    fn new(now: Instant) -> Self {
+        Self {
+            started: now,
+            paused_total: Duration::ZERO,
+            pause_started: None,
+            skipped: Duration::ZERO,
+        }
+    }
+
+    fn is_paused(&self) -> bool {
+        self.pause_started.is_some()
+    }
+
+    fn pause(&mut self, now: Instant) {
+        if self.pause_started.is_none() {
+            self.pause_started = Some(now);
+        }
+    }
+
+    fn resume(&mut self, now: Instant) {
+        if let Some(at) = self.pause_started.take() {
+            self.paused_total += now.saturating_duration_since(at);
+        }
+    }
+
+    fn skip(&mut self, remainder: Duration) {
+        self.skipped += remainder;
+    }
+
+    fn elapsed(&self, now: Instant) -> Duration {
+        let paused = self.paused_total
+            + self
+                .pause_started
+                .map_or(Duration::ZERO, |at| now.saturating_duration_since(at));
+        now.saturating_duration_since(self.started)
+            .saturating_sub(paused)
+            + self.skipped
+    }
+
+    fn elapsed_seconds(&self, now: Instant) -> u64 {
+        self.elapsed(now).as_secs()
+    }
+}
+
+/// Everything the timeline needs for one ride.
+struct Ride {
+    app: Option<AppHandle>,
+    name: String,
     intervals: Vec<Interval>,
     total_seconds: Option<u32>,
     standalone: bool,
     rider_max: u16,
-    summary: &SessionSummary,
+    session_id: Uuid,
     devices: Arc<DeviceHub>,
-    storage: Arc<Storage>,
     state: Arc<RwLock<RunnerState>>,
     controls: Controls,
-    stats: &mut RideStats,
-) -> Result<bool, String> {
-    let Controls {
-        control,
-        manual_target,
-        manual_active,
-        planned_active,
-        current_target,
-        ..
-    } = controls.clone();
-    let mut telemetry_rx = devices.subscribe();
+    status_rx: watch::Receiver<ControlStatus>,
+    recorder: Recorder,
+}
 
-    for (interval_index, interval) in intervals.iter().enumerate() {
-        // Overrides belong to one interval only; the bias carries across.
-        controls.clear_override();
-        if interval.free_ride {
-            let clamped = devices
-                .set_target_power(MANUAL_START_WATTS, rider_max)
-                .await?;
-            manual_target.store(clamped, Ordering::Relaxed);
-            current_target.store(clamped, Ordering::Relaxed);
-            manual_active.store(true, Ordering::Relaxed);
-            planned_active.store(false, Ordering::Relaxed);
-        } else {
-            manual_active.store(false, Ordering::Relaxed);
-            planned_active.store(interval.start_watts.is_some(), Ordering::Relaxed);
-        }
-        tracing::info!(
-            session_id = %summary.id,
-            interval_index,
-            duration_seconds = interval.duration_seconds,
-            elapsed = stats.elapsed,
-            "Interval started"
-        );
-        let mut interval_elapsed = 0_u32;
-        while interval_elapsed < interval.duration_seconds {
-            match control.load(Ordering::Relaxed) {
-                // A stopped free ride still counts as completed: it has no end.
-                STOPPED => return Ok(standalone),
-                SKIP => {
-                    manual_active.store(false, Ordering::Relaxed);
-                    planned_active.store(false, Ordering::Relaxed);
-                    control.store(RUNNING, Ordering::Relaxed);
-                    break;
-                }
-                PAUSED => {
-                    let planned = target_at(interval, interval_elapsed);
-                    *state.write().await = RunnerState::Paused {
-                        session_id: summary.id,
-                        workout_name: ride_name.to_string(),
-                        elapsed_seconds: stats.elapsed,
-                        total_seconds,
-                        interval_index,
-                        interval_elapsed_seconds: interval_elapsed,
-                        target_power_watts: if interval.free_ride {
-                            Some(manual_target.load(Ordering::Relaxed))
-                        } else {
-                            controls.planned_effective(planned)
-                        },
-                        planned_target_watts: if interval.free_ride { None } else { planned },
-                        manual_erg: interval.free_ride,
-                        override_active: !interval.free_ride
-                            && controls.override_target().is_some(),
-                        bias_percent: controls.bias(),
-                    };
-                    emit_state(app, &state).await;
-                    tokio::time::sleep(Duration::from_millis(250)).await;
-                    continue;
-                }
-                _ => {}
-            }
+/// Drive the ride to its end on wall time. Never fails: trainer and storage
+/// trouble are handled by the writer and the recorder. Returns whether the
+/// ride counts as completed (ran to the end, or a free ride the rider ended).
+async fn run_timeline(ride: &mut Ride, stats: &mut RideStats) -> bool {
+    let controls = ride.controls.clone();
+    let mut telemetry_rx = ride.devices.subscribe();
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut clock = RideClock::new(Instant::now());
+    let mut interval_index = 0_usize;
+    let mut interval_start: u64 = 0;
+    let mut current_target: Option<u16> = None;
+    let mut lag_logged = false;
+    let mut telemetry_open = true;
+    let mut writer_alive = true;
+    enter_interval(ride, 0, 0);
 
-            let planned = if interval.free_ride {
-                None
-            } else {
-                target_at(interval, interval_elapsed)
-            };
-            let mut target = if interval.free_ride {
-                Some(manual_target.load(Ordering::Relaxed))
-            } else {
-                controls.planned_effective(planned)
-            };
-            if let Some(watts) = target {
-                // Only talk to the trainer when the target moves: every write
-                // costs a control-point round trip (about a second on some
-                // trainers), and re-sending the same value buys nothing.
-                let clamped = devices.clamp_target(watts, rider_max);
-                if current_target.load(Ordering::Relaxed) != clamped {
-                    devices.set_target_power(clamped, rider_max).await?;
-                    current_target.store(clamped, Ordering::Relaxed);
-                }
-                if interval.free_ride {
-                    manual_target.store(clamped, Ordering::Relaxed);
-                }
-                target = Some(clamped);
-            }
-            *state.write().await = RunnerState::Running {
-                session_id: summary.id,
-                workout_name: ride_name.to_string(),
-                elapsed_seconds: stats.elapsed,
-                total_seconds,
-                interval_index,
-                interval_elapsed_seconds: interval_elapsed,
-                target_power_watts: target,
-                planned_target_watts: planned,
-                manual_erg: interval.free_ride,
-                override_active: !interval.free_ride && controls.override_target().is_some(),
-                bias_percent: controls.bias(),
-            };
-            emit_state(app, &state).await;
-
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-            while tokio::time::Instant::now() < deadline {
-                let wait = deadline.saturating_duration_since(tokio::time::Instant::now());
-                match tokio::time::timeout(wait, telemetry_rx.recv()).await {
-                    Ok(Ok(mut sample)) => {
-                        sample.target_power_watts = target;
-                        storage.record_sample(summary.id, &sample)?;
+    loop {
+        tokio::select! {
+            biased;
+            _ = controls.wake.notified() => {}
+            _ = tick.tick() => {}
+            received = telemetry_rx.recv(), if telemetry_open => {
+                match received {
+                    Ok(mut sample) => {
+                        sample.target_power_watts = current_target;
                         stats.record(&sample);
+                        ride.recorder.push(sample);
                     }
-                    Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
-                    _ => break,
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        if !lag_logged {
+                            tracing::warn!(skipped, "Telemetry consumer lagged; some samples were not recorded");
+                            lag_logged = true;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => telemetry_open = false,
+                }
+                continue;
+            }
+            changed = ride.status_rx.changed(), if writer_alive => {
+                if changed.is_err() {
+                    writer_alive = false;
                 }
             }
-            stats.elapsed += 1;
-            interval_elapsed += 1;
         }
-        manual_active.store(false, Ordering::Relaxed);
-        planned_active.store(false, Ordering::Relaxed);
+
+        let now = Instant::now();
+        match controls.control.load(Ordering::Relaxed) {
+            STOPPED => {
+                stats.elapsed = clock.elapsed_seconds(now) as u32;
+                // A stopped free ride still counts as completed: it has no end.
+                return ride.standalone;
+            }
+            PAUSED => {
+                if !clock.is_paused() {
+                    clock.pause(now);
+                    controls.set_phase(Phase::Paused);
+                    tracing::info!("Ride clock paused");
+                }
+                let elapsed = clock.elapsed_seconds(now);
+                stats.elapsed = elapsed as u32;
+                publish(
+                    ride,
+                    true,
+                    elapsed,
+                    interval_index,
+                    interval_start,
+                    current_target,
+                )
+                .await;
+                continue;
+            }
+            SKIP => {
+                let elapsed = clock.elapsed_seconds(now);
+                let end =
+                    interval_start + u64::from(ride.intervals[interval_index].duration_seconds);
+                clock.skip(Duration::from_secs(end.saturating_sub(elapsed)));
+                controls.control.store(RUNNING, Ordering::Relaxed);
+                tracing::info!(interval_index, "Interval skipped");
+            }
+            _ => {}
+        }
+        if clock.is_paused() {
+            clock.resume(now);
+            controls.set_phase(Phase::Running);
+            tracing::info!("Ride clock resumed");
+        }
+
+        let elapsed = clock.elapsed_seconds(now);
+        stats.elapsed = elapsed as u32;
+        // Advance through every interval that has ended; a skip or a long
+        // stall can cross several short ones at once.
+        loop {
+            let duration = u64::from(ride.intervals[interval_index].duration_seconds);
+            if elapsed < interval_start + duration {
+                break;
+            }
+            interval_start += duration;
+            interval_index += 1;
+            if interval_index == ride.intervals.len() {
+                return true;
+            }
+            enter_interval(ride, interval_index, elapsed);
+        }
+
+        let interval = &ride.intervals[interval_index];
+        let interval_elapsed = (elapsed - interval_start) as u32;
+        let planned = if interval.free_ride {
+            None
+        } else {
+            target_at(interval, interval_elapsed)
+        };
+        let mut target = if interval.free_ride {
+            Some(controls.manual_target.load(Ordering::Relaxed))
+        } else {
+            controls.planned_effective(planned)
+        };
+        if let Some(watts) = target {
+            let clamped = ride.devices.clamp_target(watts, ride.rider_max);
+            controls.current_target.store(clamped, Ordering::Relaxed);
+            if interval.free_ride {
+                controls.manual_target.store(clamped, Ordering::Relaxed);
+            }
+            target = Some(clamped);
+        }
+        controls.set_target(target);
+        current_target = target;
+        publish(ride, false, elapsed, interval_index, interval_start, target).await;
     }
-    if let Err(error) = devices.stop().await {
-        tracing::warn!(error = %error, "Trainer did not acknowledge stop at the end of the workout");
+}
+
+fn enter_interval(ride: &Ride, index: usize, elapsed: u64) {
+    let interval = &ride.intervals[index];
+    // Overrides belong to one interval only; the bias carries across.
+    ride.controls.clear_override();
+    if interval.free_ride {
+        ride.controls
+            .manual_target
+            .store(MANUAL_START_WATTS, Ordering::Relaxed);
+        ride.controls.manual_active.store(true, Ordering::Relaxed);
+        ride.controls.planned_active.store(false, Ordering::Relaxed);
+    } else {
+        ride.controls.manual_active.store(false, Ordering::Relaxed);
+        ride.controls
+            .planned_active
+            .store(interval.start_watts.is_some(), Ordering::Relaxed);
     }
-    Ok(true)
+    tracing::info!(
+        session_id = %ride.session_id,
+        interval_index = index,
+        duration_seconds = interval.duration_seconds,
+        elapsed,
+        "Interval started"
+    );
+}
+
+/// Write the current ride position into `RunnerState` and tell the UI.
+async fn publish(
+    ride: &Ride,
+    paused: bool,
+    elapsed: u64,
+    interval_index: usize,
+    interval_start: u64,
+    target: Option<u16>,
+) {
+    let interval = &ride.intervals[interval_index];
+    let interval_elapsed = elapsed.saturating_sub(interval_start) as u32;
+    let planned = if interval.free_ride {
+        None
+    } else {
+        target_at(interval, interval_elapsed)
+    };
+    let control = *ride.status_rx.borrow();
+    let next = if paused {
+        RunnerState::Paused {
+            session_id: ride.session_id,
+            workout_name: ride.name.clone(),
+            elapsed_seconds: elapsed as u32,
+            total_seconds: ride.total_seconds,
+            interval_index,
+            interval_elapsed_seconds: interval_elapsed,
+            target_power_watts: target,
+            planned_target_watts: planned,
+            manual_erg: interval.free_ride,
+            override_active: !interval.free_ride && ride.controls.override_target().is_some(),
+            bias_percent: ride.controls.bias(),
+            control,
+        }
+    } else {
+        RunnerState::Running {
+            session_id: ride.session_id,
+            workout_name: ride.name.clone(),
+            elapsed_seconds: elapsed as u32,
+            total_seconds: ride.total_seconds,
+            interval_index,
+            interval_elapsed_seconds: interval_elapsed,
+            target_power_watts: target,
+            planned_target_watts: planned,
+            manual_erg: interval.free_ride,
+            override_active: !interval.free_ride && ride.controls.override_target().is_some(),
+            bias_percent: ride.controls.bias(),
+            control,
+        }
+    };
+    *ride.state.write().await = next;
+    emit_state(ride.app.as_ref(), &ride.state).await;
+}
+
+/// The only task that talks to the trainer during a ride. Follows the intent
+/// published by the timeline and the command handlers, re-sends the target as
+/// a keepalive, retries failures with backoff and reports a `ControlStatus`.
+/// It never returns an error to anyone: a trainer that is gone just means the
+/// status is `Lost` until it is back.
+async fn target_writer(
+    devices: Arc<DeviceHub>,
+    mut intent_rx: watch::Receiver<TrainerIntent>,
+    status_tx: watch::Sender<ControlStatus>,
+    mut trainer_state: watch::Receiver<DeviceState>,
+    rider_max: u16,
+) {
+    // Control was acquired synchronously when the ride started.
+    let mut started = true;
+    let mut failures: u8 = 0;
+    let mut last_sent: Option<u16> = None;
+    let mut last_attempt = Instant::now();
+    let mut status = ControlStatus::Ok;
+    loop {
+        let intent = *intent_rx.borrow_and_update();
+        if intent.phase == Phase::Stopped {
+            if tokio::time::timeout(STOP_GRACE, devices.stop())
+                .await
+                .is_err()
+            {
+                tracing::warn!("Trainer did not acknowledge stop in time");
+            }
+            return;
+        }
+        let connected = trainer_state.borrow_and_update().is_connected();
+        if !connected {
+            if status != ControlStatus::Lost {
+                tracing::warn!("Trainer link is down; holding the target until it is back");
+            }
+            status = ControlStatus::Lost;
+            started = false;
+            last_sent = None;
+            failures = 0;
+        } else {
+            let mut attempted = false;
+            let mut result: Result<(), ControlError> = Ok(());
+            match intent.phase {
+                Phase::Paused => {
+                    if started {
+                        attempted = true;
+                        started = false;
+                        result = devices.pause().await;
+                    }
+                }
+                Phase::Running => {
+                    if !started {
+                        attempted = true;
+                        result = devices.begin_control().await;
+                        if result.is_ok() {
+                            started = true;
+                            last_sent = None;
+                        }
+                    }
+                    if result.is_ok()
+                        && started
+                        && let Some(target) = intent.target
+                        && (last_sent != Some(target) || last_attempt.elapsed() >= KEEPALIVE)
+                    {
+                        attempted = true;
+                        result = devices
+                            .set_target_power(target, rider_max)
+                            .await
+                            .map(|_| ());
+                        if result.is_ok() {
+                            last_sent = Some(target);
+                        }
+                    }
+                }
+                Phase::Idle | Phase::Stopped => {}
+            }
+            if attempted {
+                last_attempt = Instant::now();
+                status = match result {
+                    Ok(()) => {
+                        failures = 0;
+                        ControlStatus::Ok
+                    }
+                    Err(error) => {
+                        failures = failures.saturating_add(1);
+                        last_sent = None;
+                        tracing::warn!(error = %error, failures, "Trainer command failed; ride continues");
+                        classify_failure(&devices, error, failures, &mut started).await
+                    }
+                };
+            }
+        }
+        status_tx.send_if_modified(|current| {
+            if *current == status {
+                false
+            } else {
+                tracing::info!(from = ?*current, to = ?status, "Trainer control status changed");
+                *current = status;
+                true
+            }
+        });
+
+        // Wait for a reason to act again: a new intent, a link state change,
+        // or the retry / keepalive timer.
+        let timer = if !connected || intent.phase != Phase::Running {
+            None
+        } else if failures > 0 {
+            Some(last_attempt + RETRY_AFTER)
+        } else if intent.target.is_some() {
+            Some(last_attempt + KEEPALIVE)
+        } else {
+            None
+        };
+        tokio::select! {
+            changed = intent_rx.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+            changed = trainer_state.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+            _ = async {
+                match timer {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                // Force a (re)write on the next pass.
+                last_sent = None;
+            }
+        }
+    }
+}
+
+async fn classify_failure(
+    devices: &DeviceHub,
+    error: ControlError,
+    failures: u8,
+    started: &mut bool,
+) -> ControlStatus {
+    match error {
+        ControlError::NotConnected => {
+            *started = false;
+            ControlStatus::Lost
+        }
+        ControlError::Refused(ResponseCode::ControlNotPermitted) => {
+            tracing::warn!("Trainer says control is not permitted; re-acquiring");
+            match devices.reacquire_control().await {
+                Ok(()) => *started = true,
+                Err(error) => {
+                    tracing::warn!(error = %error, "Could not re-acquire trainer control");
+                    *started = false;
+                }
+            }
+            ControlStatus::Degraded
+        }
+        ControlError::Refused(_) | ControlError::Busy(_) => ControlStatus::Degraded,
+        ControlError::Timeout | ControlError::Gatt(_) => {
+            if failures >= FAILURES_BEFORE_LOST {
+                *started = false;
+                ControlStatus::Lost
+            } else {
+                ControlStatus::Degraded
+            }
+        }
+    }
+}
+
+/// Where recorded telemetry goes. `Storage` is the real one; tests inject
+/// failing sinks.
+pub trait SampleSink: Send + Sync {
+    fn write_samples(&self, session_id: Uuid, samples: &[Telemetry]) -> Result<(), String>;
+}
+
+impl SampleSink for Storage {
+    fn write_samples(&self, session_id: Uuid, samples: &[Telemetry]) -> Result<(), String> {
+        self.record_samples(session_id, samples)
+    }
+}
+
+enum RecorderMessage {
+    Sample(Telemetry),
+    Flush(std::sync::mpsc::Sender<()>),
+}
+
+/// Persists telemetry on its own thread, one transaction per second, and
+/// keeps samples in memory while the database is unwritable.
+struct Recorder {
+    tx: Option<SyncSender<RecorderMessage>>,
+    dropped: Arc<AtomicU32>,
+}
+
+impl Recorder {
+    fn start(sink: Arc<dyn SampleSink>, session_id: Uuid) -> Self {
+        let (tx, rx) = sync_channel(256);
+        let dropped = Arc::new(AtomicU32::new(0));
+        let spawned = std::thread::Builder::new()
+            .name("ride-recorder".into())
+            .spawn(move || recorder_loop(rx, sink, session_id));
+        match spawned {
+            Ok(_) => Self {
+                tx: Some(tx),
+                dropped,
+            },
+            Err(error) => {
+                tracing::error!(error = %error, "Could not start the ride recorder; samples will not be saved");
+                Self { tx: None, dropped }
+            }
+        }
+    }
+
+    fn push(&self, sample: Telemetry) {
+        let Some(tx) = &self.tx else {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        if let Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) =
+            tx.try_send(RecorderMessage::Sample(sample))
+        {
+            let dropped = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+            if dropped == 1 || dropped.is_multiple_of(100) {
+                tracing::warn!(
+                    dropped,
+                    "Recorder cannot keep up; dropping telemetry samples"
+                );
+            }
+        }
+    }
+
+    /// Ask the thread to write everything it holds and wait (bounded) for it.
+    async fn flush(&self, grace: Duration) {
+        let Some(tx) = &self.tx else {
+            return;
+        };
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+        if tx.send(RecorderMessage::Flush(ack_tx)).is_err() {
+            return;
+        }
+        // Waits in real time on a real thread; unaffected by paused test time.
+        let _ = tokio::task::spawn_blocking(move || ack_rx.recv_timeout(grace)).await;
+    }
+
+    fn dropped(&self) -> u32 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+}
+
+fn recorder_loop(rx: Receiver<RecorderMessage>, sink: Arc<dyn SampleSink>, session_id: Uuid) {
+    let mut pending: Vec<Telemetry> = Vec::new();
+    let mut oldest: Option<std::time::Instant> = None;
+    let mut failures: u32 = 0;
+    loop {
+        match rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(RecorderMessage::Sample(sample)) => {
+                pending.push(sample);
+                oldest.get_or_insert_with(std::time::Instant::now);
+                if pending.len() > MAX_PENDING_SAMPLES {
+                    let excess = pending.len() - MAX_PENDING_SAMPLES;
+                    pending.drain(..excess);
+                    tracing::warn!(excess, "Recorder backlog full; oldest samples dropped");
+                }
+            }
+            Ok(RecorderMessage::Flush(ack)) => {
+                write_with_retries(&*sink, session_id, &mut pending, 8);
+                oldest = None;
+                let _ = ack.send(());
+                continue;
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                write_with_retries(&*sink, session_id, &mut pending, 8);
+                return;
+            }
+        }
+        if !pending.is_empty() && oldest.is_some_and(|at| at.elapsed() >= Duration::from_secs(1)) {
+            match sink.write_samples(session_id, &pending) {
+                Ok(()) => {
+                    if failures > 0 {
+                        tracing::info!(
+                            failures,
+                            samples = pending.len(),
+                            "Telemetry writes recovered"
+                        );
+                    }
+                    failures = 0;
+                    pending.clear();
+                    oldest = None;
+                }
+                Err(error) => {
+                    failures += 1;
+                    if failures == 1 || failures.is_multiple_of(20) {
+                        tracing::error!(error = %error, failures, pending = pending.len(), "Could not write telemetry; keeping it in memory");
+                    }
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+            }
+        }
+    }
+}
+
+fn write_with_retries(
+    sink: &dyn SampleSink,
+    session_id: Uuid,
+    pending: &mut Vec<Telemetry>,
+    attempts: u32,
+) {
+    for attempt in 1..=attempts {
+        if pending.is_empty() {
+            return;
+        }
+        match sink.write_samples(session_id, pending) {
+            Ok(()) => {
+                pending.clear();
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, attempt, "Final telemetry write failed");
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        }
+    }
+    tracing::error!(
+        samples = pending.len(),
+        "Giving up on unwritten telemetry samples"
+    );
 }
 
 fn adjusted_target(current: u16, delta: i16) -> u16 {
@@ -918,6 +1466,10 @@ async fn emit_state(app: Option<&AppHandle>, state: &RwLock<RunnerState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        devices::{DeviceRole, trainer::simulated_devices},
+        domain::{PowerTarget, WorkoutStep},
+    };
 
     #[test]
     fn interpolates_ramp_targets() {
@@ -971,6 +1523,7 @@ mod tests {
             manual_erg: true,
             override_active: false,
             bias_percent: DEFAULT_BIAS_PERCENT,
+            control: ControlStatus::Lost,
         };
         let json = serde_json::to_value(state).unwrap();
 
@@ -979,6 +1532,7 @@ mod tests {
         assert_eq!(json["manualErg"], true);
         assert_eq!(json["biasPercent"], 100);
         assert_eq!(json["overrideActive"], false);
+        assert_eq!(json["control"], "lost");
         assert!(json["plannedTargetWatts"].is_null());
         assert!(json.get("workout_name").is_none());
     }
@@ -997,11 +1551,13 @@ mod tests {
             manual_erg: false,
             override_active: false,
             bias_percent: DEFAULT_BIAS_PERCENT,
+            control: ControlStatus::Ok,
         };
         let json = serde_json::to_value(state).unwrap();
 
         assert_eq!(json["intervalIndex"], 1);
         assert_eq!(json["intervalElapsedSeconds"], 15);
+        assert_eq!(json["control"], "ok");
     }
 
     #[test]
@@ -1055,11 +1611,57 @@ mod tests {
         assert!(runner.adjustment_mode().is_err());
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn ride_clock_excludes_pauses_and_jumps_on_skip() {
+        let start = Instant::now();
+        let mut clock = RideClock::new(start);
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert_eq!(clock.elapsed_seconds(Instant::now()), 10);
+        clock.pause(Instant::now());
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert!(clock.is_paused());
+        assert_eq!(clock.elapsed_seconds(Instant::now()), 10);
+        clock.resume(Instant::now());
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert_eq!(clock.elapsed_seconds(Instant::now()), 15);
+        clock.skip(Duration::from_secs(45));
+        assert_eq!(clock.elapsed_seconds(Instant::now()), 60);
+        // Pausing twice or resuming twice is harmless.
+        clock.pause(Instant::now());
+        clock.pause(Instant::now());
+        clock.resume(Instant::now());
+        clock.resume(Instant::now());
+        assert_eq!(clock.elapsed_seconds(Instant::now()), 60);
+    }
+
+    // ---- ride integration tests on the simulated trainer ------------------
+
+    struct Rig {
+        hub: Arc<DeviceHub>,
+        storage: Arc<Storage>,
+        runner: WorkoutRunner,
+        _ride_files: tempfile::TempDir,
+    }
+
+    async fn rig() -> Rig {
+        let hub = Arc::new(DeviceHub::default());
+        hub.connect(DeviceRole::Trainer, simulated_devices().remove(0))
+            .await
+            .unwrap();
+        let ride_files = tempfile::tempdir().unwrap();
+        Rig {
+            hub,
+            storage: Arc::new(Storage::in_memory().unwrap()),
+            runner: WorkoutRunner::new(ride_files.path().to_path_buf()),
+            _ride_files: ride_files,
+        }
+    }
+
     async fn wait_for(
         runner: &WorkoutRunner,
         accept: impl Fn(&RunnerState) -> bool,
     ) -> RunnerState {
-        for _ in 0..200 {
+        for _ in 0..1_200 {
             let state = runner.state().await;
             if accept(&state) {
                 return state;
@@ -1072,68 +1674,43 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_control_failure_still_finalizes_the_session() {
-        let hub = Arc::new(DeviceHub::default());
-        hub.connect(
-            crate::devices::DeviceRole::Trainer,
-            crate::devices::trainer::simulated_devices().remove(0),
-        )
-        .await
-        .unwrap();
-        let storage = Arc::new(Storage::in_memory().unwrap());
-        let ride_files = tempfile::tempdir().unwrap();
-        let runner = WorkoutRunner::new(ride_files.path().to_path_buf());
+    fn control_of(state: &RunnerState) -> Option<ControlStatus> {
+        match state {
+            RunnerState::Running { control, .. } | RunnerState::Paused { control, .. } => {
+                Some(*control)
+            }
+            _ => None,
+        }
+    }
 
-        let session_id = runner
-            .start_free_ride(None, 800, 84.0, hub.clone(), storage.clone())
-            .await
-            .unwrap();
-        // Every control write from here on fails, like a trainer that stopped
-        // acknowledging. Phase 1 still aborts the ride on that; what must hold
-        // is that the session is closed and the UI knows which ride it was.
+    fn set_target_writes(hub: &DeviceHub) -> Vec<u16> {
         hub.simulated_faults()
-            .fail_writes
-            .store(u32::MAX, Ordering::Relaxed);
-
-        let state = wait_for(&runner, |state| matches!(state, RunnerState::Error { .. })).await;
-        let RunnerState::Error {
-            session_id: reported,
-            ..
-        } = state
-        else {
-            unreachable!()
-        };
-        assert_eq!(reported, Some(session_id));
-        let stored = storage.session(session_id).unwrap().unwrap().summary;
-        assert!(stored.ended_at.is_some(), "session was finalized");
-        assert!(!stored.completed);
-        hub.disconnect().await;
+            .commands
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, payload)| payload.first() == Some(&0x05) && payload.len() == 3)
+            .map(|(_, payload)| u16::from_le_bytes([payload[1], payload[2]]))
+            .collect()
     }
 
     #[tokio::test]
     async fn a_stopped_free_ride_is_finished_and_saved() {
-        let hub = Arc::new(DeviceHub::default());
-        hub.connect(
-            crate::devices::DeviceRole::Trainer,
-            crate::devices::trainer::simulated_devices().remove(0),
-        )
-        .await
-        .unwrap();
-        let storage = Arc::new(Storage::in_memory().unwrap());
-        let ride_files = tempfile::tempdir().unwrap();
-        let runner = WorkoutRunner::new(ride_files.path().to_path_buf());
-
-        let session_id = runner
-            .start_free_ride(None, 800, 84.0, hub.clone(), storage.clone())
+        let rig = rig().await;
+        let session_id = rig
+            .runner
+            .start_free_ride(None, 800, 84.0, rig.hub.clone(), rig.storage.clone())
             .await
             .unwrap();
-        wait_for(&runner, |state| {
+        wait_for(&rig.runner, |state| {
             matches!(state, RunnerState::Running { .. })
         })
         .await;
-        runner.stop(&hub).await.unwrap();
-        let state = wait_for(&runner, |state| {
+        // Real time here: the simulator reports every 500 ms and the fuser
+        // rate-limits on the wall clock, so ride long enough to record.
+        tokio::time::sleep(Duration::from_millis(1_300)).await;
+        rig.runner.stop().await.unwrap();
+        let state = wait_for(&rig.runner, |state| {
             matches!(state, RunnerState::Finished { .. })
         })
         .await;
@@ -1144,13 +1721,327 @@ mod tests {
                 ..
             }
         ));
-        let stored = storage.session(session_id).unwrap().unwrap().summary;
-        assert!(stored.ended_at.is_some());
-        assert!(stored.completed);
+        let stored = rig.storage.session(session_id).unwrap().unwrap();
         assert!(
-            std::fs::read_dir(ride_files.path()).unwrap().count() == 1,
+            stored.samples.len() >= 2,
+            "telemetry was recorded and flushed"
+        );
+        let summary = stored.summary;
+        assert!(summary.ended_at.is_some());
+        assert!(summary.completed);
+        assert!(summary.average_power_watts > 0);
+        assert_eq!(
+            std::fs::read_dir(rig._ride_files.path()).unwrap().count(),
+            1,
             "a FIT file was written"
         );
-        hub.disconnect().await;
+        // The trainer was told to stop, last.
+        let last = rig
+            .hub
+            .simulated_faults()
+            .commands
+            .lock()
+            .unwrap()
+            .last()
+            .map(|(_, payload)| payload.clone());
+        assert_eq!(last, Some(vec![0x08, 0x01]));
+        rig.hub.disconnect().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_clock_runs_on_wall_time_even_when_the_trainer_acks_slowly() {
+        let rig = rig().await;
+        // Every ack takes 950 ms, like the Hammer in the field logs.
+        rig.hub
+            .simulated_faults()
+            .ack_delay_ms
+            .store(950, Ordering::Relaxed);
+        let workout = Workout::new(
+            "Ramp then hold",
+            vec![
+                WorkoutStep::Ramp {
+                    duration_seconds: 3,
+                    start: PowerTarget::Watts(100),
+                    end: PowerTarget::Watts(200),
+                },
+                WorkoutStep::Steady {
+                    duration_seconds: 3,
+                    target: PowerTarget::Watts(200),
+                },
+            ],
+        );
+        let session_id = rig
+            .runner
+            .start(
+                None,
+                workout,
+                200,
+                800,
+                84.0,
+                rig.hub.clone(),
+                rig.storage.clone(),
+            )
+            .await
+            .unwrap();
+        // Time the ride itself, from the first Running state to Finished. The
+        // start handshake before it and the Stop acknowledgement after it each
+        // cost one slow ack and are not workout time.
+        wait_for(&rig.runner, |state| {
+            matches!(state, RunnerState::Running { .. })
+        })
+        .await;
+        let started = Instant::now();
+        let state = wait_for(&rig.runner, |state| {
+            matches!(state, RunnerState::Finished { .. })
+        })
+        .await;
+        let took = started.elapsed();
+        assert!(matches!(
+            state,
+            RunnerState::Finished {
+                completed: true,
+                ..
+            }
+        ));
+        assert!(
+            took >= Duration::from_secs(6) && took < Duration::from_millis(7_500),
+            "a 6 s workout took {took:?} (6 s plus one Stop ack)"
+        );
+        let stored = rig.storage.session(session_id).unwrap().unwrap().summary;
+        assert_eq!(stored.elapsed_seconds, 6);
+        // Ramp: 100, 150, 200. The steady block asks for 200 again, which is
+        // not re-sent; only a keepalive could add a write.
+        let writes = set_target_writes(&rig.hub);
+        assert!(
+            writes.starts_with(&[100, 150, 200]) && writes.len() <= 4,
+            "{writes:?}"
+        );
+        rig.hub.disconnect().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn command_failures_degrade_the_ride_and_recover_without_aborting() {
+        let rig = rig().await;
+        let session_id = rig
+            .runner
+            .start_free_ride(None, 800, 84.0, rig.hub.clone(), rig.storage.clone())
+            .await
+            .unwrap();
+        rig.hub
+            .simulated_faults()
+            .fail_writes
+            .store(3, Ordering::Relaxed);
+        let degraded = wait_for(&rig.runner, |state| {
+            control_of(state).is_some_and(|control| control != ControlStatus::Ok)
+        })
+        .await;
+        assert!(
+            matches!(degraded, RunnerState::Running { .. }),
+            "{degraded:?}"
+        );
+        let recovered = wait_for(&rig.runner, |state| {
+            control_of(state) == Some(ControlStatus::Ok)
+        })
+        .await;
+        assert!(matches!(recovered, RunnerState::Running { .. }));
+        rig.runner.stop().await.unwrap();
+        wait_for(&rig.runner, |state| {
+            matches!(
+                state,
+                RunnerState::Finished {
+                    completed: true,
+                    ..
+                }
+            )
+        })
+        .await;
+        let stored = rig.storage.session(session_id).unwrap().unwrap().summary;
+        assert!(stored.ended_at.is_some());
+        rig.hub.disconnect().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn link_loss_keeps_the_ride_running_and_controls_stay_responsive() {
+        let rig = rig().await;
+        rig.runner
+            .start_free_ride(None, 800, 84.0, rig.hub.clone(), rig.storage.clone())
+            .await
+            .unwrap();
+        wait_for(&rig.runner, |state| {
+            matches!(state, RunnerState::Running { .. })
+        })
+        .await;
+        rig.hub.simulated_faults().drop_link.notify_one();
+        let lost = wait_for(&rig.runner, |state| {
+            control_of(state) == Some(ControlStatus::Lost)
+        })
+        .await;
+        let RunnerState::Running {
+            elapsed_seconds: at_loss,
+            ..
+        } = lost
+        else {
+            panic!("{lost:?}");
+        };
+        // The clock keeps going without a trainer.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let later = wait_for(&rig.runner, |state| {
+            matches!(state, RunnerState::Running { elapsed_seconds, .. } if *elapsed_seconds >= at_loss + 3)
+        })
+        .await;
+        assert_eq!(control_of(&later), Some(ControlStatus::Lost));
+        // Manual adjustments answer immediately and are queued for the trainer.
+        let before = Instant::now();
+        let applied = rig
+            .runner
+            .adjust_manual_power(None, 5, 800, &rig.hub)
+            .await
+            .unwrap();
+        assert_eq!(applied, 105);
+        assert!(before.elapsed() < Duration::from_millis(50));
+        assert_eq!(rig.runner.controls.intent.borrow().target, Some(105));
+        // Pausing works without a trainer, and the clock freezes.
+        rig.runner.pause_or_resume().await.unwrap();
+        let paused = wait_for(&rig.runner, |state| {
+            matches!(state, RunnerState::Paused { .. })
+        })
+        .await;
+        let RunnerState::Paused {
+            elapsed_seconds: at_pause,
+            ..
+        } = paused
+        else {
+            panic!("{paused:?}");
+        };
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let still = rig.runner.state().await;
+        assert!(
+            matches!(still, RunnerState::Paused { elapsed_seconds, .. } if elapsed_seconds == at_pause)
+        );
+        rig.runner.pause_or_resume().await.unwrap();
+        rig.runner.stop().await.unwrap();
+        wait_for(&rig.runner, |state| {
+            matches!(state, RunnerState::Finished { .. })
+        })
+        .await;
+        rig.hub.disconnect().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn skipping_advances_the_workout_on_the_clock() {
+        let rig = rig().await;
+        let workout = Workout::new(
+            "Two blocks",
+            vec![
+                WorkoutStep::Steady {
+                    duration_seconds: 600,
+                    target: PowerTarget::Watts(120),
+                },
+                WorkoutStep::Steady {
+                    duration_seconds: 2,
+                    target: PowerTarget::Watts(180),
+                },
+            ],
+        );
+        let started = Instant::now();
+        rig.runner
+            .start(
+                None,
+                workout,
+                200,
+                800,
+                84.0,
+                rig.hub.clone(),
+                rig.storage.clone(),
+            )
+            .await
+            .unwrap();
+        wait_for(&rig.runner, |state| {
+            matches!(state, RunnerState::Running { .. })
+        })
+        .await;
+        rig.runner.skip().unwrap();
+        let second = wait_for(&rig.runner, |state| {
+            matches!(
+                state,
+                RunnerState::Running {
+                    interval_index: 1,
+                    ..
+                }
+            )
+        })
+        .await;
+        assert!(
+            matches!(
+                second,
+                RunnerState::Running {
+                    elapsed_seconds: 600,
+                    target_power_watts: Some(180),
+                    ..
+                }
+            ),
+            "{second:?}"
+        );
+        wait_for(&rig.runner, |state| {
+            matches!(
+                state,
+                RunnerState::Finished {
+                    completed: true,
+                    ..
+                }
+            )
+        })
+        .await;
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(set_target_writes(&rig.hub), vec![120, 180]);
+        rig.hub.disconnect().await;
+    }
+
+    struct FlakySink {
+        inner: Arc<Storage>,
+        remaining_failures: std::sync::Mutex<u32>,
+        calls: std::sync::Mutex<u32>,
+    }
+
+    impl SampleSink for FlakySink {
+        fn write_samples(&self, session_id: Uuid, samples: &[Telemetry]) -> Result<(), String> {
+            *self.calls.lock().unwrap() += 1;
+            let mut remaining = self.remaining_failures.lock().unwrap();
+            if *remaining > 0 {
+                *remaining -= 1;
+                return Err("disk on fire".into());
+            }
+            self.inner.write_samples(session_id, samples)
+        }
+    }
+
+    #[tokio::test]
+    async fn the_recorder_retries_failed_writes_and_flushes_everything() {
+        let storage = Arc::new(Storage::in_memory().unwrap());
+        let session = storage.start_session(None, "Flaky", 84.0).unwrap();
+        let sink = Arc::new(FlakySink {
+            inner: storage.clone(),
+            remaining_failures: std::sync::Mutex::new(2),
+            calls: std::sync::Mutex::new(0),
+        });
+        let recorder = Recorder::start(sink.clone(), session.id);
+        for index in 0..25_i64 {
+            recorder.push(Telemetry {
+                timestamp_ms: 1_700_000_000_000 + index * 200,
+                power_watts: 150,
+                ..Telemetry::default()
+            });
+        }
+        recorder.flush(Duration::from_secs(10)).await;
+        assert_eq!(recorder.dropped(), 0);
+        assert!(*sink.calls.lock().unwrap() >= 3);
+        assert_eq!(
+            storage.session(session.id).unwrap().unwrap().samples.len(),
+            25
+        );
     }
 }

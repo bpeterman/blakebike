@@ -2,9 +2,10 @@
 //! Data notification worker, plus the built-in simulator.
 
 use std::{
+    fmt,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -26,15 +27,58 @@ use super::{
 use crate::{
     domain::Telemetry,
     ftms::{
-        FITNESS_MACHINE_CONTROL_POINT, FITNESS_MACHINE_FEATURE, FITNESS_MACHINE_STATUS,
-        INDOOR_BIKE_DATA, SUPPORTED_POWER_RANGE, SpinDownStatus, parse_control_response,
-        parse_indoor_bike_data, parse_spin_down_response, parse_spin_down_status, request_control,
-        set_target_power, start_or_resume, start_spin_down, stop_or_pause, supports_spin_down,
+        FITNESS_MACHINE_CONTROL_POINT, FITNESS_MACHINE_FEATURE, FITNESS_MACHINE_STATUS, FtmsError,
+        INDOOR_BIKE_DATA, ResponseCode, SUPPORTED_POWER_RANGE, SpinDownStatus,
+        parse_control_response, parse_indoor_bike_data, parse_spin_down_response,
+        parse_spin_down_status, request_control, set_target_power, start_or_resume,
+        start_spin_down, stop_or_pause, supports_spin_down,
     },
 };
 
 pub const SIMULATED_TRAINER_ID: &str = "simulated-trainer";
 const CALIBRATION_TIMEOUT: Duration = Duration::from_secs(120);
+/// Budget for the GATT write of one control command. Trainers answer in well
+/// under a second; anything past this is a dead link, and a long wait only
+/// holds `command_lock` hostage.
+pub const CONTROL_WRITE_TIMEOUT: Duration = Duration::from_secs(4);
+/// Budget for the trainer's indication after a successful write.
+pub const CONTROL_ACK_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// Why a control-point command did not go through, classified so callers can
+/// tell "the trainer is gone" from "the trainer said no" from "try later".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ControlError {
+    /// No trainer, or its link is gone.
+    NotConnected,
+    /// The write went out (or was attempted) but nothing came back in time.
+    Timeout,
+    /// The trainer answered with an FTMS result code other than Success.
+    Refused(ResponseCode),
+    /// Transport failure: GATT write error, response stream closed, ...
+    Gatt(String),
+    /// A calibration is running; ERG control is on hold.
+    Busy(String),
+}
+
+impl fmt::Display for ControlError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ControlError::NotConnected => f.write_str("Trainer is not connected"),
+            ControlError::Timeout => f.write_str("Trainer control command timed out"),
+            ControlError::Refused(code) => write!(f, "Trainer refused the command: {code:?}"),
+            ControlError::Gatt(detail) => write!(f, "Trainer rejected control command: {detail}"),
+            ControlError::Busy(detail) => f.write_str(detail),
+        }
+    }
+}
+
+impl std::error::Error for ControlError {}
+
+impl From<ControlError> for String {
+    fn from(error: ControlError) -> Self {
+        error.to_string()
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -64,11 +108,22 @@ pub struct SimFaults {
     /// The next N control writes fail as if the GATT write errored
     /// (`u32::MAX` means every write).
     pub fail_writes: AtomicU32,
+    /// How long the simulated GATT write takes; past `CONTROL_WRITE_TIMEOUT`
+    /// it times out like a dead link.
+    pub write_delay_ms: AtomicU64,
+    /// How long the simulator waits before acknowledging a command; past
+    /// `CONTROL_ACK_TIMEOUT` the command times out and the ack arrives late.
+    pub ack_delay_ms: AtomicU64,
+    /// FTMS result code the next acknowledgement carries instead of Success
+    /// (4 = OperationFailed, 5 = ControlNotPermitted); consumed once.
+    pub refuse_with: AtomicU8,
+    /// The next N simulated connects fail.
+    pub fail_connects: AtomicU32,
     /// Ends the simulator's telemetry loop, which is exactly what a real link
     /// loss looks like from the inside.
     pub drop_link: Notify,
     /// Every control payload the simulator has received, oldest first.
-    pub commands: std::sync::Mutex<Vec<(std::time::Instant, Vec<u8>)>>,
+    pub commands: std::sync::Mutex<Vec<(tokio::time::Instant, Vec<u8>)>>,
 }
 
 pub struct Trainer {
@@ -181,6 +236,13 @@ impl Trainer {
             })
             .await;
         if device.simulated {
+            let failures = self.faults.fail_connects.load(Ordering::Relaxed);
+            if failures > 0 {
+                self.faults
+                    .fail_connects
+                    .store(failures - 1, Ordering::Relaxed);
+                return Err("Simulated connect failure".into());
+            }
             self.calibration_supported.store(true, Ordering::Relaxed);
             self.slot.set_calibration(Some(true), None).await;
             self.slot
@@ -663,15 +725,17 @@ impl Trainer {
         .map_err(|_| "Trainer calibration timed out after 2 minutes".to_string())?
     }
 
-    pub async fn begin_control(&self) -> Result<(), String> {
+    pub async fn begin_control(&self) -> Result<(), ControlError> {
         if self.calibrating.load(Ordering::Relaxed) {
-            return Err("Wait for trainer calibration to finish".into());
+            return Err(ControlError::Busy(
+                "Wait for trainer calibration to finish".into(),
+            ));
         }
         let device = match self.slot.state().await {
             DeviceState::Ready { device } | DeviceState::Controlling { device } => device,
             other => {
                 tracing::warn!(state = ?other, "begin_control called without a connected trainer");
-                return Err("Connect a trainer before starting a workout".into());
+                return Err(ControlError::NotConnected);
             }
         };
         tracing::info!(name = %device.name, "Starting/resuming trainer control");
@@ -682,9 +746,24 @@ impl Trainer {
         Ok(())
     }
 
-    pub async fn set_target_power(&self, requested: u16, rider_max: u16) -> Result<u16, String> {
+    /// Request Control + Start/Resume again. Needed when the trainer answers
+    /// ControlNotPermitted mid-ride: another app or a firmware reset took
+    /// control while the link stayed up.
+    pub async fn reacquire_control(&self) -> Result<(), ControlError> {
+        tracing::info!("Re-acquiring trainer control");
+        self.write_control(&request_control()).await?;
+        self.write_control(&start_or_resume()).await
+    }
+
+    pub async fn set_target_power(
+        &self,
+        requested: u16,
+        rider_max: u16,
+    ) -> Result<u16, ControlError> {
         if self.calibrating.load(Ordering::Relaxed) {
-            return Err("Cannot change ERG power during trainer calibration".into());
+            return Err(ControlError::Busy(
+                "Cannot change ERG power during trainer calibration".into(),
+            ));
         }
         let clamped = self.clamp_target(requested, rider_max);
         if clamped != requested {
@@ -695,126 +774,178 @@ impl Trainer {
         Ok(clamped)
     }
 
-    pub async fn pause(&self) -> Result<(), String> {
+    pub async fn pause(&self) -> Result<(), ControlError> {
         tracing::info!("Pausing trainer");
         self.write_control(&stop_or_pause(true)).await
     }
 
-    pub async fn stop(&self) -> Result<(), String> {
+    pub async fn stop(&self) -> Result<(), ControlError> {
         tracing::info!("Stopping trainer");
         self.target_power.store(0, Ordering::Relaxed);
         match self.write_control(&stop_or_pause(false)).await {
-            // FTMS trainers answer OperationFailed / ControlNotPermitted to a
-            // Stop when they are already stopped, which is the state we want.
-            Err(error) if error.contains("rejected opcode 0x08") => {
-                tracing::debug!(error = %error, "Trainer was already stopped");
+            // An already-stopped trainer answers OperationFailed or
+            // ControlNotPermitted to Stop; that is the state we want.
+            Err(ControlError::Refused(
+                ResponseCode::OperationFailed | ResponseCode::ControlNotPermitted,
+            )) => {
+                tracing::debug!("Trainer was already stopped");
                 Ok(())
             }
             other => other,
         }
     }
 
-    async fn write_control(&self, payload: &[u8]) -> Result<(), String> {
+    async fn write_control(&self, payload: &[u8]) -> Result<(), ControlError> {
         let _guard = self.command_lock.lock().await;
         let response = self.write_control_locked(payload).await?;
         let expected_opcode = payload[0];
-        parse_control_response(&response, expected_opcode).map_err(|error| {
-            tracing::error!(
-                opcode = format_args!("0x{expected_opcode:02x}"),
-                error = %error,
-                "Trainer refused control command"
-            );
-            self.slot.note(
-                "error",
-                "Trainer refused control command",
-                Some(format!("op 0x{expected_opcode:02x} · {error}")),
-            );
-            error.to_string()
-        })
+        match parse_control_response(&response, expected_opcode) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                tracing::error!(
+                    opcode = format_args!("0x{expected_opcode:02x}"),
+                    error = %error,
+                    "Trainer refused control command"
+                );
+                self.slot.note(
+                    "error",
+                    "Trainer refused control command",
+                    Some(format!("op 0x{expected_opcode:02x} · {error}")),
+                );
+                Err(match error {
+                    FtmsError::Rejected { result, .. } => ControlError::Refused(result),
+                    other => ControlError::Gatt(other.to_string()),
+                })
+            }
+        }
     }
 
-    /// Write one FTMS command while the caller holds `command_lock`.
-    async fn write_control_locked(&self, payload: &[u8]) -> Result<Vec<u8>, String> {
-        // Once the link is known to be gone, fail at once instead of letting a
-        // GATT write to a dead handle run into its timeout.
-        if matches!(self.slot.state().await, DeviceState::Reconnecting { .. }) {
-            return Err("Trainer link lost; waiting to reconnect".into());
+    /// Write one FTMS command while the caller holds `command_lock` and wait
+    /// for the trainer's indication for it. Bounded by the control timeouts,
+    /// and abandoned at once if the link goes down meanwhile.
+    async fn write_control_locked(&self, payload: &[u8]) -> Result<Vec<u8>, ControlError> {
+        let expected_opcode = payload
+            .first()
+            .copied()
+            .ok_or_else(|| ControlError::Gatt("Cannot send an empty trainer command".into()))?;
+        let mut state_rx = self.slot.subscribe_state();
+        if state_rx.borrow().link_is_down() {
+            return Err(ControlError::NotConnected);
         }
         let peripheral = self.peripheral.read().await.clone();
         let control = self.control_point.read().await.clone();
-        if let (Some(peripheral), Some(control)) = (peripheral, control) {
-            let expected_opcode = payload
-                .first()
-                .copied()
-                .ok_or_else(|| "Cannot send an empty trainer command".to_string())?;
-            let mut responses = self.control_responses.subscribe();
-            tracing::debug!(opcode = format_args!("0x{expected_opcode:02x}"), payload = ?payload, "Writing control command");
-            let started = std::time::Instant::now();
-            with_timeout(
-                GATT_STEP_TIMEOUT,
-                "control write",
-                peripheral.write(&control, payload, WriteType::WithResponse),
-            )
-            .await
-            .map_err(|error| {
-                tracing::error!(opcode = format_args!("0x{expected_opcode:02x}"), error = %error, "Control write failed");
-                self.slot.note(
-                    "error",
-                    "Control write failed",
-                    Some(format!("op 0x{expected_opcode:02x} · {error}")),
-                );
-                format!("Trainer rejected control command: {error}")
-            })?;
-            let acknowledgement = tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    let response = responses
-                        .recv()
-                        .await
-                        .map_err(|error| format!("Lost trainer response: {error}"))?;
-                    if response.get(1) == Some(&expected_opcode) {
+        let simulated = peripheral.is_none();
+        if simulated && !self.simulated.load(Ordering::Relaxed) {
+            return Err(ControlError::NotConnected);
+        }
+        let mut responses = self.control_responses.subscribe();
+        tracing::debug!(opcode = format_args!("0x{expected_opcode:02x}"), payload = ?payload, "Writing control command");
+        let started = tokio::time::Instant::now();
+
+        let write = async {
+            match (&peripheral, &control) {
+                (Some(peripheral), Some(control)) => peripheral
+                    .write(control, payload, WriteType::WithResponse)
+                    .await
+                    .map_err(|error| ControlError::Gatt(error.to_string())),
+                _ => self.simulated_write(expected_opcode, payload).await,
+            }
+        };
+        let written = tokio::select! {
+            result = tokio::time::timeout(CONTROL_WRITE_TIMEOUT, write) => match result {
+                Ok(result) => result,
+                Err(_) => Err(ControlError::Timeout),
+            },
+            _ = state_rx.wait_for(DeviceState::link_is_down) => Err(ControlError::NotConnected),
+        };
+        if let Err(error) = written {
+            tracing::error!(opcode = format_args!("0x{expected_opcode:02x}"), error = %error, "Control write failed");
+            self.slot.note(
+                "error",
+                "Control write failed",
+                Some(format!("op 0x{expected_opcode:02x} · {error}")),
+            );
+            return Err(error);
+        }
+        // FTMS sends the indication for a procedure after the ATT write
+        // response, so anything already queued is a late answer to an earlier
+        // (timed-out) command and must not be mistaken for this one's.
+        loop {
+            match responses.try_recv() {
+                Ok(stale) => tracing::debug!(raw = ?stale, "Discarding stale control response"),
+                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            }
+        }
+        if simulated {
+            self.schedule_simulated_ack(expected_opcode);
+        }
+        let wait_for_ack = async {
+            loop {
+                match responses.recv().await {
+                    Ok(response) if response.get(1) == Some(&expected_opcode) => {
                         return Ok(response);
                     }
-                    tracing::trace!(raw = ?response, "Ignoring response for another opcode");
+                    Ok(other) => {
+                        tracing::trace!(raw = ?other, "Ignoring response for another opcode")
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => {
+                        return Err(ControlError::Gatt("Lost trainer response stream".into()));
+                    }
                 }
-            })
-            .await
-            .map_err(|_| {
+            }
+        };
+        let acknowledgement = tokio::select! {
+            result = tokio::time::timeout(CONTROL_ACK_TIMEOUT, wait_for_ack) => match result {
+                Ok(result) => result,
+                Err(_) => Err(ControlError::Timeout),
+            },
+            _ = state_rx.wait_for(DeviceState::link_is_down) => Err(ControlError::NotConnected),
+        };
+        match &acknowledgement {
+            Ok(_) => tracing::debug!(
+                opcode = format_args!("0x{expected_opcode:02x}"),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "Control command acknowledged"
+            ),
+            Err(ControlError::Timeout) => {
                 tracing::error!(
                     opcode = format_args!("0x{expected_opcode:02x}"),
-                    "No control response within 5s"
+                    timeout_secs = CONTROL_ACK_TIMEOUT.as_secs(),
+                    "No control response in time"
                 );
                 self.slot.note(
                     "error",
                     "Control command timed out",
-                    Some(format!("op 0x{expected_opcode:02x} · no response in 5 s")),
+                    Some(format!(
+                        "op 0x{expected_opcode:02x} · no response in {} s",
+                        CONTROL_ACK_TIMEOUT.as_secs()
+                    )),
                 );
-                "Trainer control command timed out".to_string()
-            })?;
-            match &acknowledgement {
-                Ok(_) => tracing::debug!(
-                    opcode = format_args!("0x{expected_opcode:02x}"),
-                    elapsed_ms = started.elapsed().as_millis() as u64,
-                    "Control command acknowledged"
-                ),
-                Err(error) => tracing::error!(
-                    opcode = format_args!("0x{expected_opcode:02x}"),
-                    error = %error,
-                    "Trainer control response failed"
-                ),
             }
-            return acknowledgement;
+            Err(error) => tracing::warn!(
+                opcode = format_args!("0x{expected_opcode:02x}"),
+                error = %error,
+                "Control command abandoned"
+            ),
         }
-        // No GATT link: either the simulator answers locally, or there is no
-        // trainer at all and the caller must hear that.
-        if !self.simulated.load(Ordering::Relaxed) {
-            return Err("Trainer is not connected".into());
-        }
-        let opcode = payload.first().copied().unwrap_or_default();
+        acknowledgement
+    }
+
+    /// The simulator's side of a control write: remember the command and
+    /// honor the fault knobs. The acknowledgement is posted separately so it
+    /// travels through the same response matching as a real trainer's.
+    async fn simulated_write(&self, opcode: u8, payload: &[u8]) -> Result<(), ControlError> {
         self.faults
             .commands
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push((std::time::Instant::now(), payload.to_vec()));
+            .push((tokio::time::Instant::now(), payload.to_vec()));
+        let delay = self.faults.write_delay_ms.load(Ordering::Relaxed);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
         let remaining = self.faults.fail_writes.load(Ordering::Relaxed);
         if remaining > 0 {
             if remaining != u32::MAX {
@@ -826,14 +957,24 @@ impl Trainer {
                 opcode = format_args!("0x{opcode:02x}"),
                 "Simulated control write failure"
             );
-            self.slot.note(
-                "error",
-                "Control write failed",
-                Some(format!("op 0x{opcode:02x} · simulated failure")),
-            );
-            return Err("Trainer rejected control command: simulated write failure".into());
+            return Err(ControlError::Gatt("simulated write failure".into()));
         }
-        Ok(vec![0x80, opcode, 0x01])
+        Ok(())
+    }
+
+    fn schedule_simulated_ack(&self, opcode: u8) {
+        let delay = Duration::from_millis(self.faults.ack_delay_ms.load(Ordering::Relaxed));
+        let result = match self.faults.refuse_with.swap(0, Ordering::Relaxed) {
+            0 => 0x01,
+            code => code,
+        };
+        let responses = self.control_responses.clone();
+        tokio::spawn(async move {
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            let _ = responses.send(vec![0x80, opcode, result]);
+        });
     }
 
     pub async fn disconnect(&self) {
@@ -928,7 +1069,7 @@ mod tests {
         // Nothing connected: commands must fail, not silently "succeed".
         assert_eq!(
             trainer.set_target_power(100, 800).await.unwrap_err(),
-            "Trainer is not connected"
+            ControlError::NotConnected
         );
         assert_eq!(trainer.clamp_target(900, 800), 800);
         trainer
@@ -978,7 +1119,93 @@ mod tests {
         ));
         assert_eq!(hub.slot(DeviceRole::Trainer).stats().drops, 1);
         // The link is gone, so control writes fail instead of pretending.
-        assert!(hub.set_target_power(150, 800).await.is_err());
+        assert_eq!(
+            hub.set_target_power(150, 800).await.unwrap_err(),
+            ControlError::NotConnected
+        );
+        hub.disconnect().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_late_ack_is_not_mistaken_for_the_next_commands_answer() {
+        let hub = super::super::DeviceHub::default();
+        hub.connect(DeviceRole::Trainer, simulated_devices().remove(0))
+            .await
+            .unwrap();
+        let faults = hub.simulated_faults();
+        // Command 1: the trainer answers only after the ack budget.
+        faults.ack_delay_ms.store(6_000, Ordering::Relaxed);
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            hub.set_target_power(200, 800).await.unwrap_err(),
+            ControlError::Timeout
+        );
+        let waited = started.elapsed();
+        assert!(
+            waited >= CONTROL_ACK_TIMEOUT
+                && waited < CONTROL_ACK_TIMEOUT + Duration::from_millis(100),
+            "{waited:?}"
+        );
+        // Command 2 goes out while that late success is still on its way (its
+        // write takes 3 s) and the trainer refuses it. Without the stale-ack
+        // drain the late success would be taken as command 2's answer.
+        faults.ack_delay_ms.store(0, Ordering::Relaxed);
+        faults.write_delay_ms.store(3_000, Ordering::Relaxed);
+        faults.refuse_with.store(4, Ordering::Relaxed);
+        assert_eq!(
+            hub.set_target_power(205, 800).await.unwrap_err(),
+            ControlError::Refused(ResponseCode::OperationFailed)
+        );
+        faults.write_delay_ms.store(0, Ordering::Relaxed);
+        hub.disconnect().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn link_loss_abandons_an_in_flight_write_at_once() {
+        let hub = Arc::new(super::super::DeviceHub::default());
+        hub.connect(DeviceRole::Trainer, simulated_devices().remove(0))
+            .await
+            .unwrap();
+        let faults = hub.simulated_faults();
+        faults.write_delay_ms.store(3_000, Ordering::Relaxed);
+        let writer = {
+            let hub = hub.clone();
+            tokio::spawn(async move {
+                let started = tokio::time::Instant::now();
+                (hub.set_target_power(200, 800).await, started.elapsed())
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        faults.drop_link.notify_one();
+        let (result, elapsed) = writer.await.unwrap();
+        assert_eq!(result.unwrap_err(), ControlError::NotConnected);
+        assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+        hub.disconnect().await;
+    }
+
+    #[tokio::test]
+    async fn refusals_are_classified_and_stop_tolerates_already_stopped() {
+        let hub = super::super::DeviceHub::default();
+        hub.connect(DeviceRole::Trainer, simulated_devices().remove(0))
+            .await
+            .unwrap();
+        let faults = hub.simulated_faults();
+        faults.refuse_with.store(5, Ordering::Relaxed);
+        assert_eq!(
+            hub.set_target_power(200, 800).await.unwrap_err(),
+            ControlError::Refused(ResponseCode::ControlNotPermitted)
+        );
+        faults.refuse_with.store(4, Ordering::Relaxed);
+        hub.stop().await.unwrap();
+        hub.reacquire_control().await.unwrap();
+        let opcodes: Vec<u8> = faults
+            .commands
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, payload)| payload[0])
+            .collect();
+        assert_eq!(&opcodes[opcodes.len() - 2..], &[0x00, 0x07]);
         hub.disconnect().await;
     }
 

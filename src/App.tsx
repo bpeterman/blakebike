@@ -1103,6 +1103,24 @@ export function Ride({
     <>
       {!active && <PageHeader eyebrow="TRAINING ROOM" title="Start a ride" />}
       {!connected && <div className="notice"><Bluetooth /><div><strong>No trainer connected</strong><p>Connect a trainer or the simulator to begin.</p></div><button className="primary" onClick={onConnect}>Connect</button></div>}
+      {riding && runner.control === "lost" && (
+        <div className="notice" role="status">
+          <Bluetooth />
+          <div>
+            <strong>Trainer link lost</strong>
+            <p>Reconnecting. The clock keeps running and the target is re-applied as soon as the trainer is back.</p>
+          </div>
+        </div>
+      )}
+      {riding && runner.control === "degraded" && (
+        <div className="notice" role="status">
+          <Bluetooth />
+          <div>
+            <strong>Trainer not acknowledging targets</strong>
+            <p>Retrying. The workout continues.</p>
+          </div>
+        </div>
+      )}
       {!active ? (
         <section className="ride-setup">
           <div className="card setup-card">

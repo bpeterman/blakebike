@@ -251,4 +251,35 @@ describe("Ride charts", () => {
     expect(alert).toHaveTextContent("Your ride was saved to History.");
     expect(screen.getByText("Start a ride")).toBeInTheDocument();
   });
+
+  it("tells the rider when the trainer link is lost or degraded, and nothing otherwise", () => {
+    const rideWith = (state: RunnerState) => (
+      <Ride
+        workouts={[]}
+        selectedWorkout={null}
+        setSelectedWorkout={vi.fn()}
+        connected
+        onConnect={vi.fn()}
+        runner={state}
+        telemetry={telemetry}
+        telemetryHistory={[telemetry]}
+        powerSmoothing="instant"
+        onPowerSmoothing={vi.fn()}
+        sourcePreferences={defaultSourcePreferences}
+        onSourcePreference={vi.fn()}
+        profile={profile}
+        trainingZones={defaultTrainingZoneSettings}
+        displayPreferences={defaultRideDisplayPreferences}
+        perform={async () => undefined}
+      />
+    );
+    const { rerender } = render(rideWith({ ...runner, control: "lost" }));
+    expect(screen.getByRole("status")).toHaveTextContent("Trainer link lost");
+    rerender(rideWith({ ...runner, control: "degraded" }));
+    expect(screen.getByRole("status")).toHaveTextContent("Trainer not acknowledging targets");
+    rerender(rideWith({ ...runner, control: "ok" }));
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    rerender(rideWith(runner));
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+  });
 });
