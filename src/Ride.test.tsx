@@ -78,9 +78,8 @@ const structuredWorkout: Workout = {
 afterEach(cleanup);
 
 describe("Ride charts", () => {
-  it("offers the persisted time-in-zone chart toggle", () => {
-    const onRideDisplay = vi.fn();
-    render(
+  it("always shows time in zone and collapses each session chart", () => {
+    const { container } = render(
       <Ride
         workouts={[]}
         selectedWorkout={null}
@@ -96,15 +95,24 @@ describe("Ride charts", () => {
         onSourcePreference={vi.fn()}
         profile={profile}
         trainingZones={defaultTrainingZoneSettings}
-        rideDisplay={{ showTimeInZone: false }}
-        onRideDisplay={onRideDisplay}
         perform={async () => undefined}
       />,
     );
-    fireEvent.click(screen.getByRole("checkbox", { name: "Time in zone" }));
-    expect(onRideDisplay).toHaveBeenCalledWith({ showTimeInZone: true });
-    expect(screen.getAllByText("Power").length).toBeGreaterThan(0);
-    expect(screen.getAllByText("Heart rate").length).toBeGreaterThan(0);
+    expect(screen.queryByRole("checkbox", { name: "Time in zone" })).not.toBeInTheDocument();
+    expect(screen.getByText("Power zones")).toBeInTheDocument();
+    expect(screen.getByText("Heart-rate zones")).toBeInTheDocument();
+
+    const [powerCollapse, heartRateCollapse] = screen.getAllByRole("button", { name: "Collapse" });
+    expect(container.querySelector("#ride-power-chart")).toBeInTheDocument();
+    expect(container.querySelector("#ride-heart-rate-chart")).toBeInTheDocument();
+
+    fireEvent.click(powerCollapse);
+    expect(powerCollapse).toHaveAttribute("aria-expanded", "false");
+    expect(container.querySelector("#ride-power-chart")).not.toBeInTheDocument();
+    expect(container.querySelector("#ride-heart-rate-chart")).toBeInTheDocument();
+
+    fireEvent.click(heartRateCollapse);
+    expect(container.querySelector("#ride-heart-rate-chart")).not.toBeInTheDocument();
   });
 
   it("shows expanded workout progress and both countdowns while running or paused", () => {
@@ -136,8 +144,6 @@ describe("Ride charts", () => {
       onSourcePreference: vi.fn(),
       profile,
       trainingZones: defaultTrainingZoneSettings,
-      rideDisplay: { showTimeInZone: false },
-      onRideDisplay: vi.fn(),
       perform: async () => undefined,
     };
     const { rerender } = render(<Ride {...commonProps} runner={structuredRunner} />);

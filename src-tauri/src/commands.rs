@@ -1,4 +1,9 @@
-use std::{fs, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use chrono::Utc;
 use tauri::{AppHandle, State};
@@ -25,6 +30,13 @@ pub struct TrainingSyncResult {
     zones: TrainingZoneSettings,
     power_zones_imported: bool,
     heart_rate_zones_imported: bool,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkoutExportResult {
+    exported_count: usize,
+    directory: String,
 }
 
 // Trainer-only commands kept for the pre-hub UI; they delegate to the hub.
@@ -332,6 +344,83 @@ pub fn export_zwo_workout(
 }
 
 #[tauri::command]
+pub fn export_all_zwo_workouts(
+    state: State<'_, AppState>,
+    directory: PathBuf,
+) -> Result<WorkoutExportResult, String> {
+    let workouts = state.storage.workouts()?;
+    let profile = state.storage.profile()?;
+    let exported_count = export_workouts_to_directory(&directory, &workouts, profile.ftp_watts)?;
+    tracing::info!(
+        exported_count,
+        directory = %directory.display(),
+        "Workout library exported"
+    );
+    Ok(WorkoutExportResult {
+        exported_count,
+        directory: directory.display().to_string(),
+    })
+}
+
+fn export_workouts_to_directory(
+    directory: &Path,
+    workouts: &[Workout],
+    ftp: u16,
+) -> Result<usize, String> {
+    if !directory.is_dir() {
+        return Err("Choose an existing folder for the workout export".into());
+    }
+
+    let bases: Vec<String> = workouts
+        .iter()
+        .map(|workout| safe_workout_filename(&workout.name, workout.id))
+        .collect();
+    let mut totals = HashMap::<String, usize>::new();
+    for base in &bases {
+        *totals.entry(base.clone()).or_default() += 1;
+    }
+
+    for (workout, base) in workouts.iter().zip(bases) {
+        let filename = if totals.get(&base).copied().unwrap_or_default() > 1 {
+            format!("{base}-{}.zwo", short_id(workout.id))
+        } else {
+            format!("{base}.zwo")
+        };
+        let path = directory.join(filename);
+        fs::write(&path, export_zwo(workout, ftp))
+            .map_err(|error| format!("Could not export {}: {error}", workout.name))?;
+    }
+    Ok(workouts.len())
+}
+
+fn safe_workout_filename(name: &str, id: Uuid) -> String {
+    let cleaned = name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let slug = cleaned
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    if slug.is_empty() {
+        format!("workout-{}", short_id(id))
+    } else {
+        slug
+    }
+}
+
+fn short_id(id: Uuid) -> String {
+    id.simple().to_string()[..8].to_string()
+}
+
+#[tauri::command]
 pub async fn runner_state(state: State<'_, AppState>) -> Result<RunnerState, String> {
     Ok(state.runner.state().await)
 }
@@ -593,4 +682,55 @@ pub fn report_client_error(context: String, message: String) {
 #[tauri::command]
 pub fn report_client_event(context: String, message: String) {
     tracing::info!(context = %context, detail = %message, "Frontend event");
+}
+
+#[cfg(test)]
+mod workout_export_tests {
+    use super::*;
+    use crate::domain::{PowerTarget, WorkoutStep};
+
+    fn workout(id: &str, name: &str) -> Workout {
+        let mut workout = Workout::new(
+            name,
+            vec![WorkoutStep::Steady {
+                duration_seconds: 60,
+                target: PowerTarget::PercentFtp(75),
+            }],
+        );
+        workout.id = Uuid::parse_str(id).unwrap();
+        workout
+    }
+
+    #[test]
+    fn exports_every_workout_and_disambiguates_duplicate_names() {
+        let directory = tempfile::tempdir().unwrap();
+        let workouts = vec![
+            workout("11111111-1111-4111-8111-111111111111", "Tempo / Ride"),
+            workout("22222222-2222-4222-8222-222222222222", "Tempo / Ride"),
+            workout("33333333-3333-4333-8333-333333333333", "Threshold"),
+        ];
+
+        assert_eq!(
+            export_workouts_to_directory(directory.path(), &workouts, 200).unwrap(),
+            3
+        );
+        assert!(directory.path().join("tempo-ride-11111111.zwo").is_file());
+        assert!(directory.path().join("tempo-ride-22222222.zwo").is_file());
+        assert!(directory.path().join("threshold.zwo").is_file());
+    }
+
+    #[test]
+    fn gives_empty_names_a_safe_filename() {
+        let id = Uuid::parse_str("44444444-4444-4444-8444-444444444444").unwrap();
+        assert_eq!(safe_workout_filename("///", id), "workout-44444444");
+    }
+
+    #[test]
+    fn rejects_a_destination_that_is_not_a_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("not-a-folder");
+        fs::write(&file, "blocked").unwrap();
+        let error = export_workouts_to_directory(&file, &[], 200).unwrap_err();
+        assert!(error.contains("existing folder"));
+    }
 }

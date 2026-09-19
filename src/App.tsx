@@ -3,6 +3,7 @@ import {
   Activity,
   Bike,
   Bluetooth,
+  ChevronDown,
   ChevronRight,
   CircleStop,
   Download,
@@ -41,7 +42,6 @@ import type {
   Metric as SourceMetric,
   PowerSmoothing,
   Profile,
-  RideDisplayPreferences,
   RunnerState,
   SessionDetail,
   SessionSummary,
@@ -57,7 +57,6 @@ import {
   BIAS_STEP_PERCENT,
   clampBias,
   compileWorkoutIntervals,
-  defaultRideDisplayPreferences,
   defaultTrainingZoneSettings,
   deviceRoleLabel,
   deviceRoles,
@@ -108,10 +107,8 @@ function App() {
   const [trainingZones, setTrainingZones] = useState<TrainingZoneSettings>(
     defaultTrainingZoneSettings,
   );
-  const [rideDisplay, setRideDisplay] = useState<RideDisplayPreferences>(
-    defaultRideDisplayPreferences,
-  );
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [devicePicker, setDevicePicker] = useState<DeviceRole | null>(null);
   const [editor, setEditor] = useState<Workout | null>(null);
   const [selectedWorkout, setSelectedWorkout] = useState<string | null>(null);
@@ -133,7 +130,6 @@ function App() {
         nextRunner,
         nextSmoothing,
         nextZones,
-        nextRideDisplay,
       ] =
         await Promise.all([
           api.profile(),
@@ -143,7 +139,6 @@ function App() {
           api.runnerState(),
           api.powerSmoothing(),
           api.trainingZones(),
-          api.rideDisplayPreferences(),
         ]);
       setProfile(nextProfile);
       setWorkouts(nextWorkouts);
@@ -153,7 +148,6 @@ function App() {
       runnerRef.current = nextRunner;
       setPowerSmoothing(nextSmoothing);
       setTrainingZones(nextZones);
-      setRideDisplay(nextRideDisplay);
       if (nextRunner.status === "running" || nextRunner.status === "paused") {
         liveSessionRef.current = nextRunner.sessionId;
         const session = await api.session(nextRunner.sessionId);
@@ -274,6 +268,7 @@ function App() {
   const perform = useCallback(async (action: () => Promise<unknown>, label = "user action") => {
     try {
       setError(null);
+      setNotice(null);
       await action();
     } catch (cause) {
       const message = messageOf(cause);
@@ -288,13 +283,6 @@ function App() {
     setPowerSmoothing(smoothing);
     void api.savePowerSmoothing(smoothing).catch((cause) =>
       void api.reportError("save power smoothing", messageOf(cause)).catch(() => undefined),
-    );
-  };
-
-  const changeRideDisplay = (preferences: RideDisplayPreferences) => {
-    setRideDisplay(preferences);
-    void api.saveRideDisplayPreferences(preferences).catch((cause) =>
-      void api.reportError("save ride display", messageOf(cause)).catch(() => undefined),
     );
   };
 
@@ -451,6 +439,15 @@ function App() {
               }, "delete workout")
             }
             onExport={(workout) => void perform(() => api.exportZwo(workout), "export zwo")}
+            onExportAll={() =>
+              void perform(async () => {
+                const result = await api.exportAllZwo();
+                if (result) {
+                  const label = result.exportedCount === 1 ? "workout" : "workouts";
+                  setNotice(`Exported ${result.exportedCount} ${label} to ${result.directory}`);
+                }
+              }, "export workout library")
+            }
             onImport={() => importRef.current?.click()}
           />
         )}
@@ -470,8 +467,6 @@ function App() {
             onSourcePreference={changeSourcePreference}
             profile={profile}
             trainingZones={trainingZones}
-            rideDisplay={rideDisplay}
-            onRideDisplay={changeRideDisplay}
             perform={perform}
           />
         )}
@@ -526,6 +521,12 @@ function App() {
         <div className="toast error-toast">
           <span>{error}</span>
           <button onClick={() => setError(null)} aria-label="Dismiss error"><X size={17} /></button>
+        </div>
+      )}
+      {notice && (
+        <div className="toast success-toast">
+          <span>{notice}</span>
+          <button onClick={() => setNotice(null)} aria-label="Dismiss notification"><X size={17} /></button>
         </div>
       )}
       {devicePicker && (
@@ -664,7 +665,7 @@ function Overview({
   );
 }
 
-function WorkoutLibrary({
+export function WorkoutLibrary({
   workouts,
   ftp,
   onCreate,
@@ -672,6 +673,7 @@ function WorkoutLibrary({
   onRide,
   onDelete,
   onExport,
+  onExportAll,
   onImport,
 }: {
   workouts: Workout[];
@@ -681,12 +683,14 @@ function WorkoutLibrary({
   onRide: (id: string) => void;
   onDelete: (workout: Workout) => void;
   onExport: (workout: Workout) => void;
+  onExportAll: () => void;
   onImport: () => void;
 }) {
   return (
     <>
       <PageHeader eyebrow={`${workouts.length} SAVED WORKOUTS`} title="Workout library" actions={<>
         <button className="secondary" onClick={onImport}><Upload size={16} /> Import ZWO</button>
+        <button className="secondary" disabled={workouts.length === 0} onClick={onExportAll}><Download size={16} /> Export all ZWO</button>
         <button className="primary" onClick={onCreate}><Plus size={17} /> New workout</button>
       </>} />
       <div className="library-grid">
@@ -728,8 +732,6 @@ export function Ride({
   onSourcePreference,
   profile,
   trainingZones,
-  rideDisplay,
-  onRideDisplay,
   perform,
 }: {
   workouts: Workout[];
@@ -746,11 +748,11 @@ export function Ride({
   onSourcePreference: (metric: SourceMetric, choice: SourceChoice) => void;
   profile: Profile;
   trainingZones: TrainingZoneSettings;
-  rideDisplay: RideDisplayPreferences;
-  onRideDisplay: (preferences: RideDisplayPreferences) => void;
   perform: (action: () => Promise<unknown>, label?: string) => Promise<void>;
 }) {
   const [targetDraft, setTargetDraft] = useState("100");
+  const [powerChartExpanded, setPowerChartExpanded] = useState(true);
+  const [heartRateChartExpanded, setHeartRateChartExpanded] = useState(true);
   const active = runner.status === "running" || runner.status === "paused" || runner.status === "countdown";
   const selected = workouts.find((workout) => workout.id === selectedWorkout);
   const activeWorkout = selected
@@ -981,9 +983,16 @@ export function Ride({
                   <button type="button" className="secondary" onClick={() => void adjustBias(-BIAS_STEP_PERCENT)}>−</button>
                   <strong className={biasPercent === 100 ? "" : "active"}>{biasPercent}%</strong>
                   <button type="button" className="secondary" onClick={() => void adjustBias(BIAS_STEP_PERCENT)}>+</button>
-                  {biasPercent !== 100 && (
-                    <button type="button" className="text-button" onClick={() => void perform(() => api.setBiasPercent(100), "reset workout bias")}>Reset</button>
-                  )}
+                  <button
+                    type="button"
+                    className={biasPercent === 100 ? "text-button bias-reset placeholder" : "text-button bias-reset"}
+                    disabled={biasPercent === 100}
+                    aria-hidden={biasPercent === 100}
+                    tabIndex={biasPercent === 100 ? -1 : 0}
+                    onClick={() => void perform(() => api.setBiasPercent(100), "reset workout bias")}
+                  >
+                    Reset
+                  </button>
                 </div>
               </div>
             )}
@@ -991,56 +1000,72 @@ export function Ride({
           <div className="card live-chart">
             <div className="chart-heading">
               <div><span className="label">FULL SESSION</span><h3>Power</h3></div>
-              <label className="chart-toggle">
-                <input
-                  type="checkbox"
-                  checked={rideDisplay.showTimeInZone}
-                  onChange={(event) =>
-                    onRideDisplay({ showTimeInZone: event.target.checked })
-                  }
-                />
-                Time in zone
-              </label>
+              <button
+                type="button"
+                className="chart-collapse"
+                aria-expanded={powerChartExpanded}
+                aria-controls="ride-power-chart"
+                onClick={() => setPowerChartExpanded((expanded) => !expanded)}
+              >
+                {powerChartExpanded ? "Collapse" : "Expand"}
+                <ChevronDown size={17} />
+              </button>
             </div>
-            <SessionAreaChart
-              samples={chartHistory}
-              dataKey="displayPowerWatts"
-              unit="W"
-              color="#c8ff32"
-              name={powerSmoothing === "instant" ? "Power" : `Power (${powerSmoothingLabel[powerSmoothing]})`}
-              domain={[0, "dataMax + 50"]}
-            />
-            {openEnded
-              ? <div className="open-ended-time"><span>Elapsed</span><strong>{formatDuration(elapsed)}</strong><span>Open ended</span></div>
-              : <div className="progress-meta"><span>{formatDuration(elapsed)}</span><div className="progress"><i style={{ width: `${progress}%` }} /></div><span>-{formatDuration(Math.max(0, (total ?? 0) - elapsed))}</span></div>}
+            {powerChartExpanded && (
+              <div id="ride-power-chart">
+                <SessionAreaChart
+                  samples={chartHistory}
+                  dataKey="displayPowerWatts"
+                  unit="W"
+                  color="#c8ff32"
+                  name={powerSmoothing === "instant" ? "Power" : `Power (${powerSmoothingLabel[powerSmoothing]})`}
+                  domain={[0, "dataMax + 50"]}
+                />
+                {openEnded
+                  ? <div className="open-ended-time"><span>Elapsed</span><strong>{formatDuration(elapsed)}</strong><span>Open ended</span></div>
+                  : <div className="progress-meta"><span>{formatDuration(elapsed)}</span><div className="progress"><i style={{ width: `${progress}%` }} /></div><span>-{formatDuration(Math.max(0, (total ?? 0) - elapsed))}</span></div>}
+              </div>
+            )}
           </div>
           <div className="card live-chart secondary-chart">
             <div className="chart-heading">
               <div><span className="label">FULL SESSION</span><h3>Heart rate</h3></div>
+              <button
+                type="button"
+                className="chart-collapse"
+                aria-expanded={heartRateChartExpanded}
+                aria-controls="ride-heart-rate-chart"
+                onClick={() => setHeartRateChartExpanded((expanded) => !expanded)}
+              >
+                {heartRateChartExpanded ? "Collapse" : "Expand"}
+                <ChevronDown size={17} />
+              </button>
             </div>
-            <SessionAreaChart
-              samples={chartHistory}
-              dataKey="heartRateBpm"
-              unit="bpm"
-              color="#ff6f7d"
-              name="Heart rate"
-              domain={["dataMin - 10", "dataMax + 10"]}
+            {heartRateChartExpanded && (
+              <div id="ride-heart-rate-chart">
+                <SessionAreaChart
+                  samples={chartHistory}
+                  dataKey="heartRateBpm"
+                  unit="bpm"
+                  color="#ff6f7d"
+                  name="Heart rate"
+                  domain={["dataMin - 10", "dataMax + 10"]}
+                />
+              </div>
+            )}
+          </div>
+          <div className="zone-chart-grid">
+            <TimeInZoneChart
+              title="Power zones"
+              zones={powerZones}
+              seconds={timeInZones(telemetryHistory, powerZones, "power")}
+            />
+            <TimeInZoneChart
+              title="Heart-rate zones"
+              zones={heartRateZones}
+              seconds={timeInZones(telemetryHistory, heartRateZones, "heartRate")}
             />
           </div>
-          {rideDisplay.showTimeInZone && (
-            <div className="zone-chart-grid">
-              <TimeInZoneChart
-                title="Power zones"
-                zones={powerZones}
-                seconds={timeInZones(telemetryHistory, powerZones, "power")}
-              />
-              <TimeInZoneChart
-                title="Heart-rate zones"
-                zones={heartRateZones}
-                seconds={timeInZones(telemetryHistory, heartRateZones, "heartRate")}
-              />
-            </div>
-          )}
         </section>
       )}
       {runner.status === "finished" && <div className="toast success-toast">Ride saved to history.</div>}
