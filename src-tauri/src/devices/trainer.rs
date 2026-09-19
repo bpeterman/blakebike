@@ -23,7 +23,7 @@ use super::{
     Capability, DeviceInfo, DeviceRole, DeviceSlot, DeviceState,
     ble::{self, Ble, GATT_CONNECT_TIMEOUT, GATT_STEP_TIMEOUT, bluetooth_uuid, hex, with_timeout},
     fuser::{Reading, TelemetryFuser},
-    spawn_link_worker,
+    spawn_ble_link_worker, spawn_link_worker,
 };
 use crate::{
     domain::Telemetry,
@@ -437,11 +437,12 @@ impl Trainer {
         let control_tx = self.control_responses.clone();
         let status_tx = self.status_responses.clone();
         let reconnect_name = device.name.clone();
-        let worker = spawn_link_worker(
+        let worker = spawn_ble_link_worker(
             slot.clone(),
             fuser.clone(),
             DeviceRole::Trainer,
             reconnect_name,
+            peripheral.clone(),
             async move {
                 let mut notifications = match peripheral.notifications().await {
                     Ok(stream) => stream,
@@ -773,6 +774,10 @@ impl Trainer {
         tracing::info!("Re-acquiring trainer control");
         self.write_control(&request_control()).await?;
         self.write_control(&start_or_resume()).await
+    }
+
+    pub async fn request_control(&self) -> Result<(), ControlError> {
+        self.write_control(&request_control()).await
     }
 
     pub async fn set_target_power(

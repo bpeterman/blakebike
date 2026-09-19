@@ -1,0 +1,42 @@
+Original audit output; the disposable checkout path and trailing whitespace are normalized below.
+
+   Compiling blakebike v0.1.0 (disposable-audit-checkout/src-tauri)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.95s
+     Running unittests src/lib.rs (src-tauri/target/debug/deps/blakebike_lib-baa03c1729b7027d)
+
+running 11 tests
+test devices::fuser::tests::audit_reproduces_clock_rollback_stopping_telemetry ... AUDIT: clock moved back 60s; all fused telemetry suppressed until old time caught up
+ok
+test runner::tests::audit_abrupt_process_exit_child ... ok
+test runner::tests::audit_committed_samples_survive_abrupt_process_exit ...
+running 1 test
+AUDIT: disposable process exited without destructors; all 100 committed samples recovered
+ok
+test runner::tests::audit_eight_hour_synthetic_recording_and_recovery ... AUDIT: synthetic 8h/5Hz ride: 144000 samples persisted/recovered/exported in 3820ms; FIT 2160378 bytes
+ok
+test runner::tests::audit_reproduces_failed_pause_never_retried ... AUDIT: one transient pause write failure; no second pause attempt after 20 seconds
+ok
+test runner::tests::audit_reproduces_finished_ride_with_no_persisted_samples ... AUDIT: all telemetry writes failed; zero saved samples but runner reports Finished/completed=true
+ok
+test runner::tests::audit_reproduces_flush_exceeding_deadline_before_ack_wait ... AUDIT: flush with 20ms grace blocked for 301ms
+ok
+test runner::tests::audit_reproduces_lost_control_without_reconnect ... AUDIT: 60 seconds after Lost, trainer slot still connected and no reconnect attempted
+ok
+test runner::tests::audit_reproduces_panic_leaving_trainer_active ...
+thread 'runner::tests::audit_reproduces_panic_leaving_trainer_active' panicked at src/runner.rs:887:62:
+investigation-only timeline failure injection
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+AUDIT: timeline panic reported, but phase stays Running, ride_active stays true, no Stop sent
+ok
+test runner::tests::audit_reproduces_samples_recorded_during_pause ... AUDIT: 3 samples recorded after pause while ride clock was stopped
+ok
+test runner::tests::audit_reproduces_two_concurrent_rides ... AUDIT: two simultaneous Start calls both succeeded with distinct session IDs
+ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 132 filtered out; finished in 11.16s
+
+     Running unittests src/main.rs (src-tauri/target/debug/deps/blakebike-ff14f42d9338dcf1)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

@@ -561,6 +561,7 @@ mod tests {
                 distance_source: None,
                 distance_weight_kg: 84.0,
                 completed: true,
+                recording_warning: None,
             },
             samples: vec![
                 Telemetry {
