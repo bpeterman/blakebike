@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Activity, ChevronRight, Radio, X } from "lucide-react";
+import { Activity, Bluetooth, ChevronRight, Radio, X } from "lucide-react";
 import { api } from "./api";
 import type { AntAdapterStatus, DeviceInfo, DeviceLogLine, DeviceRole, DeviceSlot, KnownDevice } from "./types";
 import { deviceRoleLabel } from "./types";
@@ -38,6 +38,7 @@ export function DevicePicker({
   const startedAt = useRef(0);
   const scannedOnce = useRef(false);
   const label = deviceRoleLabel[role];
+  const supportsAnt = role === "heartRate" && antAdapter?.status === "ready";
 
   const scan = useCallback(async () => {
     setScanning(true);
@@ -109,8 +110,12 @@ export function DevicePicker({
         <button className="modal-close" disabled={busy} onClick={close} aria-label="Close">
           <X />
         </button>
-        <div className="modal-icon">{busy ? <span className="spinner" /> : <Radio />}</div>
-        <span className="label">SENSORS · {label.toUpperCase()}</span>
+        <div className="modal-icon">
+          {busy ? <span className="spinner" /> : supportsAnt ? <Radio /> : <Bluetooth />}
+        </div>
+        <span className="label">
+          {supportsAnt ? "BLUETOOTH + ANT+" : "BLUETOOTH"} · {label.toUpperCase()}
+        </span>
         <h2>
           {connecting
             ? outcome === "connected"

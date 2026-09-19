@@ -139,7 +139,7 @@ export function DevicesPage({
                     <strong>{device.name}</strong>
                     <span>
                       {deviceRoleLabel[device.role]}
-                      {` · ${transportLabel(device)}`}
+                      {!device.simulated && ` · ${transportLabel(device)}`}
                       {makeAndModel(device.manufacturer, device.model) && ` · ${makeAndModel(device.manufacturer, device.model)}`}
                       {device.simulated && " · simulated"}
                     </span>
@@ -313,7 +313,7 @@ function DeviceCard({
           <h3>{name ?? (slot.state.status === "connecting" || slot.state.status === "reconnecting" ? slot.state.name : "Not connected")}</h3>
           {activeDevice && (
             <span className="device-make">
-              {transportLabel(activeDevice)}
+              {activeDevice.simulated ? "Simulated" : transportLabel(activeDevice)}
               {makeAndModel(stats.manufacturer, stats.model) && ` · ${makeAndModel(stats.manufacturer, stats.model)}`}
             </span>
           )}

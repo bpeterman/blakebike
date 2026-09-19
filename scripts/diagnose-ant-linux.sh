@@ -271,4 +271,4 @@ else
 fi
 
 echo
-echo "Paste this complete output back into the shared troubleshooting note."
+echo "Attach this complete output to the bug report."

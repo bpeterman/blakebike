@@ -64,8 +64,8 @@ If the stick or monitor is still missing, collect a read-only Linux diagnostic:
 
 The report checks USB descriptors, sysfs interfaces and drivers, raw USB and
 serial permissions, process holders, udev rules, kernel messages, and recent
-BlakeBike ANT log lines. Paste the complete `ant-diagnostics.txt` into the
-shared troubleshooting note. It does not use `sudo` or modify the system.
+BlakeBike ANT log lines. Attach the complete `ant-diagnostics.txt` to the bug
+report. It does not use `sudo` or modify the system.
 
 ## Debugging
 
