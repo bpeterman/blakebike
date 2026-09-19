@@ -175,6 +175,15 @@ p { color: #8d9587; font-size: 13px; }
 .preview-chart { height: 160px; margin-top: 30px; }
 .preview-stats { display: flex; gap: 40px; margin-top: 20px; }
 .metrics-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+.live-ride-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px 10px; }
+.ride-card-cell { min-width: 0; }
+.ride-card-cell.compact { grid-column: span 1; }
+.ride-card-cell.wide { grid-column: 1 / -1; }
+.ride-card-compact, .ride-card-compact .live-metric { height: 100%; }
+.live-ride-grid .workout-timeline,
+.live-ride-grid .workout-controls-card,
+.live-ride-grid .live-chart,
+.live-ride-grid .zone-chart-grid { margin-top: 0; }
 .live-metric { padding: 17px; border: 1px solid #2d322b; border-radius: 11px; background: #191c18; }
 .live-metric > span { display: flex; align-items: center; gap: 6px; color: #768071; font-size: 9px; font-weight: 700; letter-spacing: .08em; }
 .live-metric > strong { display: block; margin-top: 7px; font-size: 35px; line-height: 1; letter-spacing: -.04em; }
@@ -272,6 +281,15 @@ textarea { min-height: 70px; resize: vertical; }
 .zone-sync-toggle input { width: 16px; height: 16px; margin-top: 2px; accent-color: #c8ff32; }
 .zone-sync-toggle span { display: grid; gap: 2px; color: #dce5d3; font-size: 11px; }
 .zone-sync-toggle small { color: #7f887a; font-size: 10px; font-weight: 400; }
+.ride-layout-settings { display: grid; gap: 14px; }
+.ride-card-list { display: grid; gap: 6px; }
+.ride-card-setting { display: flex; align-items: center; gap: 12px; min-height: 46px; padding: 7px 8px 7px 12px; border: 1px solid #2d322b; border-radius: 8px; background: #151814; }
+.ride-card-setting > label { display: flex; align-items: center; gap: 10px; flex: 1; cursor: pointer; }
+.ride-card-setting input { width: 16px; height: 16px; accent-color: #c8ff32; }
+.ride-card-setting label span { color: #dce5d3; }
+.ride-card-order { display: flex; gap: 4px; }
+.ride-card-order .icon-button { width: 32px; height: 30px; }
+.ride-card-order .icon-button:disabled { opacity: .28; cursor: default; }
 .zone-editor { display: grid; gap: 9px; }
 .zone-editor-head { display: flex; align-items: center; gap: 9px; }
 .zone-editor-head > span { padding: 2px 7px; border: 1px solid #3a4137; border-radius: 99px; color: #8f9988; font-size: 9px; text-transform: uppercase; letter-spacing: .07em; }
@@ -348,6 +366,7 @@ textarea { min-height: 70px; resize: vertical; }
   .workout-row { grid-template-columns: repeat(2, 1fr); }
   .workout-row .workout-card:last-child { display: none; }
   .metrics-grid { grid-template-columns: repeat(2, 1fr); }
+  .live-ride-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .timeline-heading { align-items: start; }
   .timeline-countdowns { gap: 18px; }
   .zone-chart-grid { grid-template-columns: 1fr; }

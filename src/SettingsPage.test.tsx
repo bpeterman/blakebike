@@ -18,6 +18,7 @@ vi.mock("./api", () => ({
 import { api } from "./api";
 import { SettingsPage } from "./App";
 import {
+  defaultRideDisplayPreferences,
   defaultTrainingZoneSettings,
   type Profile,
 } from "./types";
@@ -50,11 +51,13 @@ describe("Intervals.icu settings", () => {
       <SettingsPage
         profile={profile}
         trainingZones={defaultTrainingZoneSettings}
+        rideDisplayPreferences={defaultRideDisplayPreferences}
         perform={perform}
         onProfileUpdate={vi.fn()}
         onTrainingZonesUpdate={vi.fn()}
         onSave={vi.fn()}
         onSaveTrainingZones={onSaveTrainingZones}
+        onSaveRideDisplayPreferences={vi.fn()}
         onForgetDevices={() => Promise.resolve()}
       />,
     );
@@ -92,11 +95,13 @@ describe("Intervals.icu settings", () => {
       <SettingsPage
         profile={profile}
         trainingZones={defaultTrainingZoneSettings}
+        rideDisplayPreferences={defaultRideDisplayPreferences}
         perform={perform}
         onProfileUpdate={vi.fn()}
         onTrainingZonesUpdate={vi.fn()}
         onSave={vi.fn()}
         onSaveTrainingZones={vi.fn()}
+        onSaveRideDisplayPreferences={vi.fn()}
         onForgetDevices={() => Promise.resolve()}
       />,
     );
@@ -138,11 +143,13 @@ describe("Intervals.icu settings", () => {
       <SettingsPage
         profile={profile}
         trainingZones={defaultTrainingZoneSettings}
+        rideDisplayPreferences={defaultRideDisplayPreferences}
         perform={perform}
         onProfileUpdate={onProfileUpdate}
         onTrainingZonesUpdate={vi.fn()}
         onSave={vi.fn()}
         onSaveTrainingZones={vi.fn()}
+        onSaveRideDisplayPreferences={vi.fn()}
         onForgetDevices={() => Promise.resolve()}
       />,
     );
@@ -171,5 +178,46 @@ describe("Intervals.icu settings", () => {
     expect(
       screen.getByRole("button", { name: "Refresh training settings" }),
     ).toBeEnabled();
+  });
+
+  it("drafts, reorders, resets, and saves the ride layout", () => {
+    const onSaveRideDisplayPreferences = vi.fn();
+    render(
+      <SettingsPage
+        profile={profile}
+        trainingZones={defaultTrainingZoneSettings}
+        rideDisplayPreferences={defaultRideDisplayPreferences}
+        perform={perform}
+        onProfileUpdate={vi.fn()}
+        onTrainingZonesUpdate={vi.fn()}
+        onSave={vi.fn()}
+        onSaveTrainingZones={vi.fn()}
+        onSaveRideDisplayPreferences={onSaveRideDisplayPreferences}
+        onForgetDevices={() => Promise.resolve()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("checkbox", { name: "Power" }));
+    fireEvent.click(screen.getByRole("button", { name: "Move Cadence up" }));
+    expect(onSaveRideDisplayPreferences).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Save ride layout" }));
+    expect(onSaveRideDisplayPreferences).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        version: 2,
+        cards: expect.arrayContaining([
+          { id: "power", visible: false },
+        ]),
+      }),
+    );
+    expect(onSaveRideDisplayPreferences.mock.calls[0][0].cards[0].id).toBe(
+      "cadence",
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Reset to default" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save ride layout" }));
+    expect(onSaveRideDisplayPreferences.mock.calls[1][0]).toEqual(
+      defaultRideDisplayPreferences,
+    );
   });
 });
