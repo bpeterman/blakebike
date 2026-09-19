@@ -1,0 +1,221 @@
+--- a/src-tauri/src/runner.rs
++++ b/src-tauri/src/runner.rs
+@@ -879,7 +879,12 @@
+ /// Drive the ride to its end on wall time. Never fails: trainer and storage
+ /// trouble are handled by the writer and the recorder. Returns whether the
+ /// ride counts as completed (ran to the end, or a free ride the rider ended).
++#[cfg(test)]
++static AUDIT_PANIC_TIMELINE: AtomicBool = AtomicBool::new(false);
++
+ async fn run_timeline(ride: &mut Ride, stats: &mut RideStats) -> bool {
++    #[cfg(test)]
++    if AUDIT_PANIC_TIMELINE.swap(false, Ordering::Relaxed) { panic!("investigation-only timeline failure injection"); }
+     let controls = ride.controls.clone();
+     let mut telemetry_rx = ride.devices.subscribe();
+     let mut tick = tokio::time::interval(Duration::from_secs(1));
+@@ -2176,4 +2181,183 @@
+             25
+         );
+     }
+-}
++
++    // Investigation-only probes. A passing test confirms the undesirable behavior.
++    #[tokio::test(start_paused = true)]
++    async fn audit_reproduces_lost_control_without_reconnect() {
++        let rig = rig().await;
++        rig.runner.start_free_ride(None, 800, 84.0, rig.hub.clone(), rig.storage.clone()).await.unwrap();
++        wait_for(&rig.runner, |s| matches!(s, RunnerState::Running { .. })).await;
++        // Model a transport whose notification stream remains open but silent.
++        rig.hub.slot(DeviceRole::Trainer).abort_worker().await;
++        rig.hub.simulated_faults().fail_writes.store(u32::MAX, Ordering::Relaxed);
++        wait_for(&rig.runner, |s| control_of(s) == Some(ControlStatus::Lost)).await;
++        for _ in 0..120 { tokio::time::sleep(Duration::from_millis(500)).await; }
++        assert!(rig.hub.state().await.is_connected());
++        assert_eq!(rig.hub.slot(DeviceRole::Trainer).stats().reconnect_attempt, 0);
++        assert!(matches!(rig.runner.state().await, RunnerState::Running { control: ControlStatus::Lost, .. }));
++        println!("AUDIT: 60 seconds after Lost, trainer slot still connected and no reconnect attempted");
++        rig.hub.simulated_faults().fail_writes.store(0, Ordering::Relaxed);
++        rig.runner.stop_and_wait(Duration::from_secs(5)).await;
++        rig.hub.disconnect().await;
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn audit_reproduces_failed_pause_never_retried() {
++        let rig = rig().await;
++        rig.runner.start_free_ride(None, 800, 84.0, rig.hub.clone(), rig.storage.clone()).await.unwrap();
++        wait_for(&rig.runner, |s| matches!(s, RunnerState::Running { .. })).await;
++        for _ in 0..20 { tokio::task::yield_now().await; }
++        rig.hub.simulated_faults().fail_writes.store(1, Ordering::Relaxed);
++        rig.runner.pause_or_resume().await.unwrap();
++        wait_for(&rig.runner, |s| matches!(s, RunnerState::Paused { control: ControlStatus::Degraded, .. })).await;
++        for _ in 0..20 { tokio::time::sleep(Duration::from_secs(1)).await; }
++        let pauses=rig.hub.simulated_faults().commands.lock().unwrap().iter().filter(|(_, p)| p.as_slice()==[0x08, 0x02]).count();
++        assert_eq!(pauses, 1);
++        assert_eq!(rig.hub.simulated_faults().fail_writes.load(Ordering::Relaxed), 0);
++        assert!(matches!(rig.runner.state().await, RunnerState::Paused { control: ControlStatus::Degraded, .. }));
++        println!("AUDIT: one transient pause write failure; no second pause attempt after 20 seconds");
++        rig.runner.stop_and_wait(Duration::from_secs(5)).await;
++        rig.hub.disconnect().await;
++    }
++
++    #[tokio::test]
++    async fn audit_reproduces_flush_exceeding_deadline_before_ack_wait() {
++        let (tx, rx) = sync_channel(1);
++        tx.send(RecorderMessage::Sample(Telemetry::default())).unwrap();
++        let consumer=std::thread::spawn(move || {
++            std::thread::sleep(Duration::from_millis(300));
++            rx.recv().unwrap();
++            if let RecorderMessage::Flush(ack)=rx.recv().unwrap() { let _=ack.send(()); }
++        });
++        let recorder=Recorder { tx:Some(tx), dropped: Arc::new(AtomicU32::new(0)) };
++        let started=std::time::Instant::now();
++        recorder.flush(Duration::from_millis(20)).await;
++        let elapsed=started.elapsed();
++        assert!(elapsed >= Duration::from_millis(250));
++        println!("AUDIT: flush with 20ms grace blocked for {}ms",elapsed.as_millis());
++        consumer.join().unwrap();
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn audit_reproduces_two_concurrent_rides() {
++        let rig = rig().await;
++        rig.hub.simulated_faults().ack_delay_ms.store(100, Ordering::Relaxed);
++        let (a,b)=tokio::join!(
++            rig.runner.start_free_ride(None,800,84.0,rig.hub.clone(),rig.storage.clone()),
++            rig.runner.start_free_ride(None,800,84.0,rig.hub.clone(),rig.storage.clone())
++        );
++        let a=a.unwrap(); let b=b.unwrap();
++        assert_ne!(a,b);
++        println!("AUDIT: two simultaneous Start calls both succeeded with distinct session IDs");
++        rig.runner.stop_and_wait(Duration::from_secs(5)).await;
++        rig.hub.disconnect().await;
++    }
++
++    #[tokio::test]
++    async fn audit_reproduces_samples_recorded_during_pause() {
++        let rig = rig().await;
++        let id=rig.runner.start_free_ride(None,800,84.0,rig.hub.clone(),rig.storage.clone()).await.unwrap();
++        wait_for(&rig.runner, |s| matches!(s, RunnerState::Running { .. })).await;
++        rig.runner.pause_or_resume().await.unwrap();
++        wait_for(&rig.runner, |s| matches!(s, RunnerState::Paused { .. })).await;
++        let paused_at=Utc::now().timestamp_millis();
++        tokio::time::sleep(Duration::from_millis(1600)).await;
++        rig.runner.stop_and_wait(Duration::from_secs(5)).await;
++        let detail=rig.storage.session(id).unwrap().unwrap();
++        let paused_samples=detail.samples.iter().filter(|s|s.timestamp_ms>paused_at+100).count();
++        assert!(paused_samples>=2);
++        println!("AUDIT: {} samples recorded after pause while ride clock was stopped",paused_samples);
++        rig.hub.disconnect().await;
++    }
++
++    #[tokio::test]
++    async fn audit_reproduces_finished_ride_with_no_persisted_samples() {
++        let mut rig=rig().await;
++        let folder=tempfile::tempdir().unwrap();
++        let path=folder.path().join("fault.sqlite");
++        rig.storage=Arc::new(Storage::open(&path).unwrap());
++        let fault=rusqlite::Connection::open(&path).unwrap();
++        fault.execute_batch("CREATE TRIGGER fail_samples BEFORE INSERT ON telemetry_samples BEGIN SELECT RAISE(FAIL, 'injected storage failure'); END;").unwrap();
++        let id=rig.runner.start_free_ride(None,800,84.0,rig.hub.clone(),rig.storage.clone()).await.unwrap();
++        wait_for(&rig.runner, |s| matches!(s,RunnerState::Running{..})).await;
++        tokio::time::sleep(Duration::from_millis(1600)).await;
++        rig.runner.stop_and_wait(Duration::from_secs(10)).await;
++        let stored=rig.storage.session(id).unwrap().unwrap();
++        assert!(stored.samples.is_empty());
++        assert!(stored.summary.ended_at.is_some());
++        assert!(stored.summary.completed);
++        assert!(matches!(rig.runner.state().await,RunnerState::Finished{completed:true,..}));
++        println!("AUDIT: all telemetry writes failed; zero saved samples but runner reports Finished/completed=true");
++        fault.execute_batch("DROP TRIGGER fail_samples;").unwrap();
++        rig.hub.disconnect().await;
++    }
++
++    #[tokio::test]
++    async fn audit_reproduces_panic_leaving_trainer_active() {
++        let rig=rig().await;
++        AUDIT_PANIC_TIMELINE.store(true, Ordering::Relaxed);
++        rig.runner.start_free_ride(None,800,84.0,rig.hub.clone(),rig.storage.clone()).await.unwrap();
++        wait_for(&rig.runner,|s|matches!(s,RunnerState::Error{..})).await;
++        assert!(rig.hub.ride_active());
++        assert!(matches!(rig.controls_phase(),Phase::Running));
++        let stops=rig.hub.simulated_faults().commands.lock().unwrap().iter().filter(|(_,p)|p.as_slice()==[0x08,0x01]).count();
++        assert_eq!(stops,0);
++        println!("AUDIT: timeline panic reported, but phase stays Running, ride_active stays true, no Stop sent");
++        rig.runner.controls.set_phase(Phase::Stopped);
++        rig.hub.set_ride_active(false);
++        rig.hub.disconnect().await;
++    }
++    impl Rig {
++        fn controls_phase(&self)->Phase { self.runner.controls.intent.borrow().phase }
++    }
++
++    #[test]
++    fn audit_eight_hour_synthetic_recording_and_recovery() {
++        let temp=tempfile::tempdir().unwrap();
++        let db=temp.path().join("long-ride.sqlite");
++        let storage=Storage::open(&db).unwrap();
++        let session=storage.start_session(None,"8-hour synthetic audit",84.0).unwrap();
++        let began=std::time::Instant::now();
++        let samples:Vec<Telemetry>=(0..144_000_i64).map(|i|Telemetry{
++            timestamp_ms:session.started_at.timestamp_millis()+i*200,
++            power_watts:200,cadence_rpm:Some(85.0),speed_kph:Some(30.0),heart_rate_bpm:Some(140),..Telemetry::default()
++        }).collect();
++        for batch in samples.chunks(1000) { storage.record_samples(session.id,batch).unwrap(); }
++        drop(storage);
++        let reopened=Storage::open(&db).unwrap();
++        assert_eq!(reopened.finalize_orphaned_sessions().unwrap().finalized,1);
++        let detail=reopened.session(session.id).unwrap().unwrap();
++        assert_eq!(detail.samples.len(),144_000);
++        let file=crate::fit::ensure_ride_file(&temp.path().join("fits"),&detail).unwrap();
++        assert!(file.is_file());
++        println!("AUDIT: synthetic 8h/5Hz ride: {} samples persisted/recovered/exported in {}ms; FIT {} bytes",detail.samples.len(),began.elapsed().as_millis(),std::fs::metadata(file).unwrap().len());
++    }
++
++    #[test]
++    fn audit_abrupt_process_exit_child() {
++        let Ok(path)=std::env::var("BLAKEBIKE_AUDIT_CHILD_DB") else { return; };
++        let storage=Storage::open(Path::new(&path)).unwrap();
++        let session=storage.start_session(None,"abrupt child exit",84.0).unwrap();
++        let samples:Vec<Telemetry>=(0..100).map(|i|Telemetry{timestamp_ms:session.started_at.timestamp_millis()+i*200,power_watts:200,..Telemetry::default()}).collect();
++        storage.record_samples(session.id,&samples).unwrap();
++        // Exit only this disposable test process without destructors/finalization.
++        std::process::exit(77);
++    }
++
++    #[test]
++    fn audit_committed_samples_survive_abrupt_process_exit() {
++        let temp=tempfile::tempdir().unwrap();
++        let db=temp.path().join("crashed.sqlite");
++        let status=std::process::Command::new(std::env::current_exe().unwrap())
++            .args(["--exact","runner::tests::audit_abrupt_process_exit_child"])
++            .env("BLAKEBIKE_AUDIT_CHILD_DB",&db).status().unwrap();
++        assert_eq!(status.code(),Some(77));
++        let storage=Storage::open(&db).unwrap();
++        assert_eq!(storage.finalize_orphaned_sessions().unwrap().finalized,1);
++        let summary=storage.sessions().unwrap().remove(0);
++        assert_eq!(storage.session(summary.id).unwrap().unwrap().samples.len(),100);
++        println!("AUDIT: disposable process exited without destructors; all 100 committed samples recovered");
++    }
++
++}
+--- a/src-tauri/src/devices/fuser.rs
++++ b/src-tauri/src/devices/fuser.rs
+@@ -617,4 +617,17 @@
+         assert_eq!(json["sources"]["power"]["role"], "trainer");
+         assert!(json["sources"]["heartRate"].is_null());
+     }
+-}
++    #[test]
++    fn audit_reproduces_clock_rollback_stopping_telemetry() {
++        let (tx,_) = broadcast::channel(16);
++        let fuser=TelemetryFuser::new(None,tx);
++        let reading=||Reading::Trainer(Telemetry::default());
++        assert!(fuser.ingest(DeviceRole::Trainer,reading(),100_000).is_some());
++        for now in (40_000..100_000).step_by(200) {
++            assert!(fuser.ingest(DeviceRole::Trainer,reading(),now).is_none());
++        }
++        assert!(fuser.ingest(DeviceRole::Trainer,reading(),100_200).is_some());
++        println!("AUDIT: clock moved back 60s; all fused telemetry suppressed until old time caught up");
++    }
++
++}

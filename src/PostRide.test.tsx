@@ -148,4 +148,20 @@ describe("post-ride flow", () => {
     expect(onExportFit).toHaveBeenCalledWith(session.summary);
     expect(onExport).toHaveBeenCalledWith(session.summary);
   });
+
+  it("never claims a ride was saved when finalization reports a problem", () => {
+    render(<PostRidePrompt errorMessage={null} saveWarning="No ride measurements were saved."
+      onView={vi.fn()} onDismiss={vi.fn()} />);
+    expect(screen.getByRole("alert")).toHaveTextContent("Ride ended with a save problem");
+    expect(screen.getByRole("alert")).toHaveTextContent("No ride measurements were saved.");
+    expect(screen.queryByText("Ride saved")).not.toBeInTheDocument();
+  });
+
+  it("keeps a recording warning visible when a saved ride is opened from history", () => {
+    render(<RideDetailModal session={{ ...session, summary: { ...session.summary, recordingWarning: "Recording is incomplete." } }}
+      profile={profile} trainingZones={defaultTrainingZoneSettings} onClose={vi.fn()}
+      onExport={vi.fn()} onExportFit={vi.fn()} onGarmin={vi.fn()} />);
+    expect(screen.getByRole("alert")).toHaveTextContent("Recording is incomplete.");
+  });
+
 });
