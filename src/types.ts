@@ -1,3 +1,5 @@
+import { expandWorkoutSteps, type LeafStep } from "./workoutSteps";
+
 export type Profile = {
   id: string;
   name: string;
@@ -353,7 +355,7 @@ export const effectiveHeartRateZones = (
     ? settings.heartRateZones
     : derivedHeartRateZones(maxHeartRateBpm);
 
-export const zoneIndex = (value: number, zones: ZoneDefinition[]): number =>
+export const zoneIndex = (value: number, zones: readonly ZoneDefinition[]): number =>
   zones.findIndex((zone) => zone.upperBound === null || value <= zone.upperBound);
 
 export const timeInZones = (
@@ -415,58 +417,53 @@ export const downsampleTelemetry = <T extends Telemetry>(
   return result;
 };
 
-export const workoutDuration = (steps: WorkoutStep[]): number =>
-  steps.reduce((total, step) => {
-    if (step.kind === "repeat") {
-      return total + step.repetitions * workoutDuration(step.steps);
-    }
-    return total + step.durationSeconds;
-  }, 0);
+export const workoutDuration = (steps: readonly WorkoutStep[]): number => {
+  const expanded = expandWorkoutSteps(steps);
+  return expanded.length === 0 ? 0 : expanded[expanded.length - 1].endSeconds;
+};
 
-const targetWatts = (target: PowerTarget, ftpWatts: number): number =>
+/** Mirrors the Rust target resolution, including its u16 clamp on `% FTP` targets. */
+export const targetWatts = (target: PowerTarget, ftpWatts: number): number =>
   target.unit === "watts"
     ? target.value
     : Math.min(65_535, Math.floor((ftpWatts * target.value) / 100));
 
-/** Mirrors the Rust workout compiler so interval indexes align with the runner. */
-export const compileWorkoutIntervals = (
-  steps: WorkoutStep[],
-  ftpWatts: number,
-): WorkoutInterval[] =>
-  steps.flatMap((step): WorkoutInterval[] => {
-    if (step.kind === "repeat") {
-      return Array.from(
-        { length: step.repetitions },
-        () => compileWorkoutIntervals(step.steps, ftpWatts),
-      ).flat();
-    }
-    if (step.kind === "steady") {
-      const watts = targetWatts(step.target, ftpWatts);
-      return [{
-        kind: step.kind,
-        durationSeconds: step.durationSeconds,
-        startWatts: watts,
-        endWatts: watts,
-        freeRide: false,
-      }];
-    }
-    if (step.kind === "ramp") {
-      return [{
-        kind: step.kind,
-        durationSeconds: step.durationSeconds,
-        startWatts: targetWatts(step.start, ftpWatts),
-        endWatts: targetWatts(step.end, ftpWatts),
-        freeRide: false,
-      }];
-    }
-    return [{
+/** Compiles one executed block. Mirrors the Rust workout compiler's per-step output. */
+export const compileWorkoutInterval = (step: LeafStep, ftpWatts: number): WorkoutInterval => {
+  if (step.kind === "steady") {
+    const watts = targetWatts(step.target, ftpWatts);
+    return {
       kind: step.kind,
       durationSeconds: step.durationSeconds,
-      startWatts: null,
-      endWatts: null,
-      freeRide: true,
-    }];
-  });
+      startWatts: watts,
+      endWatts: watts,
+      freeRide: false,
+    };
+  }
+  if (step.kind === "ramp") {
+    return {
+      kind: step.kind,
+      durationSeconds: step.durationSeconds,
+      startWatts: targetWatts(step.start, ftpWatts),
+      endWatts: targetWatts(step.end, ftpWatts),
+      freeRide: false,
+    };
+  }
+  return {
+    kind: step.kind,
+    durationSeconds: step.durationSeconds,
+    startWatts: null,
+    endWatts: null,
+    freeRide: true,
+  };
+};
+
+/** Mirrors the Rust workout compiler so interval indexes align with the runner. */
+export const compileWorkoutIntervals = (
+  steps: readonly WorkoutStep[],
+  ftpWatts: number,
+): WorkoutInterval[] =>
+  expandWorkoutSteps(steps).map(({ step }) => compileWorkoutInterval(step, ftpWatts));
 
 export const formatDuration = (seconds: number): string => {
   const hours = Math.floor(seconds / 3600);
