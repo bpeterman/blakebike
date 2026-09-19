@@ -32,12 +32,12 @@
     "linux": {
       "deb": {
         "files": {
-          "/lib/udev/rules.d/99-blakebike-ant.rules": "../resources/99-blakebike-ant.rules"
+          "/lib/udev/rules.d/70-blakebike-ant.rules": "../resources/70-blakebike-ant.rules"
         }
       },
       "appimage": {
         "files": {
-          "/usr/share/blakebike/99-blakebike-ant.rules": "../resources/99-blakebike-ant.rules"
+          "/usr/share/blakebike/70-blakebike-ant.rules": "../resources/70-blakebike-ant.rules"
         }
       }
     },

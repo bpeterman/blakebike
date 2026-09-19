@@ -7,7 +7,7 @@ shopt -s nullglob
 
 readonly ant_vid="0fcf"
 readonly ant_pid="1008"
-readonly diagnostic_version="1"
+readonly diagnostic_version="2"
 
 section() {
   printf '\n===== %s =====\n' "$1"
@@ -60,7 +60,7 @@ if [[ -r /etc/os-release ]]; then
 fi
 
 section "Required commands"
-for command_name in lsusb udevadm fuser lsof journalctl dmesg; do
+for command_name in lsusb udevadm getfacl fuser lsof journalctl dmesg; do
   if command -v "${command_name}" >/dev/null 2>&1; then
     printf '%-12s %s\n' "${command_name}" "$(command -v "${command_name}")"
   else
@@ -116,6 +116,10 @@ else
       raw_usb_nodes+=("${raw_node}")
       if [[ -e "${raw_node}" ]]; then
         stat -Lc 'raw_usb: %A %U:%G %n' "${raw_node}" 2>&1 || true
+        if command -v getfacl >/dev/null 2>&1; then
+          echo "raw_usb_acl:"
+          getfacl -cp "${raw_node}" 2>&1 || true
+        fi
         [[ -r "${raw_node}" ]] && raw_read="yes" || raw_read="no"
         [[ -w "${raw_node}" ]] && raw_write="yes" || raw_write="no"
         echo "raw_usb_access: read=${raw_read} write=${raw_write}"
@@ -162,6 +166,10 @@ else
     echo "tty: ${tty_node}"
     if [[ -e "${tty_node}" ]]; then
       stat -Lc 'permissions: %A %U:%G %n' "${tty_node}" 2>&1 || true
+      if command -v getfacl >/dev/null 2>&1; then
+        echo "acl:"
+        getfacl -cp "${tty_node}" 2>&1 || true
+      fi
       [[ -r "${tty_node}" ]] && tty_read="yes" || tty_read="no"
       [[ -w "${tty_node}" ]] && tty_write="yes" || tty_write="no"
       echo "access: read=${tty_read} write=${tty_write}"
@@ -193,12 +201,18 @@ fi
 
 section "Installed BlakeBike udev rules"
 rules=(/etc/udev/rules.d/*blakebike*ant*.rules /lib/udev/rules.d/*blakebike*ant*.rules /usr/lib/udev/rules.d/*blakebike*ant*.rules)
+late_uaccess_rule="no"
 if ((${#rules[@]} == 0)); then
   echo "No BlakeBike ANT udev rule found"
 else
   for rule in "${rules[@]}"; do
     echo "-- ${rule} --"
     sed -n '1,120p' "${rule}" 2>&1 || true
+    rule_name="$(basename "${rule}")"
+    if [[ "${rule_name}" > "73-seat-late.rules" ]] && grep -q 'TAG+="uaccess"' "${rule}"; then
+      late_uaccess_rule="yes"
+      echo "WARNING: ${rule_name} sorts after systemd's 73-seat-late.rules; its uaccess tag is too late."
+    fi
   done
 fi
 
@@ -239,6 +253,7 @@ section "Summary"
 echo "usb_devices: ${#usb_devices[@]}"
 echo "raw_usb_nodes: ${#raw_usb_nodes[@]}"
 echo "associated_tty_nodes: ${#tty_nodes[@]}"
+echo "late_uaccess_rule: ${late_uaccess_rule}"
 if ((${#usb_devices[@]} == 0)); then
   echo "result: dongle_not_visible_to_linux"
 elif ((${#tty_nodes[@]} == 0)); then

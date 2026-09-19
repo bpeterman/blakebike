@@ -43,7 +43,7 @@ and the signed-in user must have access to its system D-Bus service.
 ### ANT+ heart rate on Linux
 
 BlakeBike supports the Dynastream ANT USBStick2 (`0fcf:1008`) through its
-CP210x serial interface. The Debian package installs the least-privilege udev
+Linux USB serial interface. The Debian package installs the least-privilege udev
 rule. For development or AppImage use, install the included rule once:
 
 ```sh
