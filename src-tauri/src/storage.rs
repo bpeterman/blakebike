@@ -133,16 +133,19 @@ fn validate_zones(
     Ok(())
 }
 
-const RIDE_CARD_IDS: [&str; 9] = [
-    "power",
-    "cadence",
-    "speed",
-    "heartRate",
-    "workoutTimeline",
-    "targetAndBias",
-    "powerChart",
-    "heartRateChart",
-    "timeInZone",
+/// Every ride card, in default order, with whether it is shown to a rider who
+/// has not chosen for themselves. Diagnostics cards default to hidden.
+const RIDE_CARDS: [(&str, bool); 10] = [
+    ("power", true),
+    ("cadence", true),
+    ("speed", true),
+    ("heartRate", true),
+    ("workoutTimeline", true),
+    ("targetAndBias", true),
+    ("powerChart", true),
+    ("heartRateChart", true),
+    ("timeInZone", true),
+    ("deviceStats", false),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -163,11 +166,11 @@ impl Default for RideDisplayPreferences {
     fn default() -> Self {
         Self {
             version: 2,
-            cards: RIDE_CARD_IDS
+            cards: RIDE_CARDS
                 .iter()
-                .map(|id| RideCardPreference {
+                .map(|(id, visible)| RideCardPreference {
                     id: (*id).to_owned(),
-                    visible: true,
+                    visible: *visible,
                 })
                 .collect(),
         }
@@ -176,9 +179,9 @@ impl Default for RideDisplayPreferences {
 
 impl RideDisplayPreferences {
     fn normalized(self) -> Self {
-        let mut cards = Vec::with_capacity(RIDE_CARD_IDS.len());
+        let mut cards = Vec::with_capacity(RIDE_CARDS.len());
         for card in self.cards {
-            if RIDE_CARD_IDS.contains(&card.id.as_str())
+            if RIDE_CARDS.iter().any(|(id, _)| *id == card.id)
                 && !cards
                     .iter()
                     .any(|existing: &RideCardPreference| existing.id == card.id)
@@ -186,11 +189,11 @@ impl RideDisplayPreferences {
                 cards.push(card);
             }
         }
-        for id in RIDE_CARD_IDS {
+        for (id, visible) in RIDE_CARDS {
             if !cards.iter().any(|card| card.id == id) {
                 cards.push(RideCardPreference {
                     id: id.to_owned(),
-                    visible: true,
+                    visible,
                 });
             }
         }
@@ -1397,9 +1400,42 @@ mod tests {
         storage.save_ride_display_preferences(&partial).unwrap();
         let normalized = storage.ride_display_preferences().unwrap();
         assert_eq!(normalized.version, 2);
-        assert_eq!(normalized.cards.len(), RIDE_CARD_IDS.len());
+        assert_eq!(normalized.cards.len(), RIDE_CARDS.len());
         assert_eq!(normalized.cards[0].id, "speed");
         assert!(!normalized.cards[0].visible);
+        // A card the saved preferences never heard of is filled in at its own
+        // default, so a diagnostics card stays off for existing riders.
+        let filled = |id: &str| {
+            normalized
+                .cards
+                .iter()
+                .find(|card| card.id == id)
+                .unwrap()
+                .visible
+        };
+        assert!(filled("power"));
+        assert!(!filled("deviceStats"));
+    }
+
+    #[test]
+    fn device_stats_card_defaults_off_and_can_be_turned_on() {
+        let storage = Storage::in_memory().unwrap();
+        let defaults = storage.ride_display_preferences().unwrap();
+        let nerd = defaults
+            .cards
+            .iter()
+            .find(|card| card.id == "deviceStats")
+            .expect("deviceStats is a ride card");
+        assert!(!nerd.visible);
+
+        let mut chosen = defaults.clone();
+        for card in &mut chosen.cards {
+            if card.id == "deviceStats" {
+                card.visible = true;
+            }
+        }
+        storage.save_ride_display_preferences(&chosen).unwrap();
+        assert_eq!(storage.ride_display_preferences().unwrap(), chosen);
     }
 
     #[test]

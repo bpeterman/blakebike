@@ -279,9 +279,27 @@ export const rideCardIds = [
   "powerChart",
   "heartRateChart",
   "timeInZone",
+  "deviceStats",
 ] as const;
 
 export type RideCardId = (typeof rideCardIds)[number];
+
+/**
+ * Whether a card is shown to a rider who has not chosen for themselves.
+ * Diagnostics cards default to hidden. Mirrors `RIDE_CARDS` in storage.rs.
+ */
+export const rideCardDefaultVisible: Record<RideCardId, boolean> = {
+  power: true,
+  cadence: true,
+  speed: true,
+  heartRate: true,
+  workoutTimeline: true,
+  targetAndBias: true,
+  powerChart: true,
+  heartRateChart: true,
+  timeInZone: true,
+  deviceStats: false,
+};
 
 export type RideCardPreference = {
   id: RideCardId;
@@ -304,7 +322,7 @@ export const defaultTrainingZoneSettings: TrainingZoneSettings = {
 
 export const defaultRideDisplayPreferences: RideDisplayPreferences = {
   version: 2,
-  cards: rideCardIds.map((id) => ({ id, visible: true })),
+  cards: rideCardIds.map((id) => ({ id, visible: rideCardDefaultVisible[id] })),
 };
 
 export function normalizeRideDisplayPreferences(
@@ -318,7 +336,7 @@ export function normalizeRideDisplayPreferences(
     return true;
   });
   for (const id of rideCardIds) {
-    if (!seen.has(id)) cards.push({ id, visible: true });
+    if (!seen.has(id)) cards.push({ id, visible: rideCardDefaultVisible[id] });
   }
   return { version: 2, cards };
 }

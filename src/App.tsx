@@ -108,6 +108,7 @@ import { DevicePicker } from "./DevicePicker";
 import { DevicesPage } from "./DevicesPage";
 import { TrainerCalibrationModal } from "./TrainerCalibrationModal";
 import { isConnected as slotConnected, sourceNote } from "./devices";
+import { DeviceStatsCard } from "./DeviceStats";
 import { SourceSelect } from "./SourceSelect";
 import { defaultSourcePreferences, withSourcePreference } from "./sourcePreferences";
 import { shouldPromptForPostRide } from "./postRide";
@@ -606,6 +607,7 @@ function App() {
             onPowerSmoothing={changePowerSmoothing}
             sourcePreferences={hub?.sourcePreferences ?? defaultSourcePreferences}
             onSourcePreference={changeSourcePreference}
+            hub={hub}
             profile={profile}
             trainingZones={trainingZones}
             displayPreferences={rideDisplayPreferences}
@@ -958,6 +960,7 @@ export function Ride({
   onPowerSmoothing,
   sourcePreferences,
   onSourcePreference,
+  hub,
   profile,
   trainingZones,
   displayPreferences,
@@ -976,6 +979,8 @@ export function Ride({
   onPowerSmoothing: (smoothing: PowerSmoothing) => void;
   sourcePreferences: SourcePreferences;
   onSourcePreference: (metric: SourceMetric, choice: SourceChoice) => void;
+  /** The devices hub, for the stats-for-nerds card. */
+  hub: DevicesSnapshot | null;
   profile: Profile;
   trainingZones: TrainingZoneSettings;
   displayPreferences: RideDisplayPreferences;
@@ -1290,6 +1295,16 @@ export function Ride({
         )}
       </div>
     ),
+    deviceStats: (
+      <DeviceStatsCard
+        hub={hub}
+        telemetry={telemetry}
+        displayPowerWatts={displayedPower}
+        powerSmoothing={powerSmoothing}
+        historySampleCount={telemetryHistory.length}
+        control={riding ? runner.control : undefined}
+      />
+    ),
     timeInZone: (
       <div className="zone-chart-grid">
         <TimeInZoneChart
@@ -1518,6 +1533,7 @@ const rideCardLabels: Record<RideCardId, string> = {
   powerChart: "Power chart",
   heartRateChart: "Heart-rate chart",
   timeInZone: "Time in zone",
+  deviceStats: "Stats for nerds",
 };
 
 function displayedWeight(kg: number, unit: Profile["weightUnit"]) {
@@ -1641,7 +1657,7 @@ export function SettingsPage({
         <div>
           <span className="label">RIDE LAYOUT</span>
           <h2>Live ride cards</h2>
-          <p>Choose which cards appear during a ride and arrange them in the order you want.</p>
+          <p>Choose which cards appear during a ride and arrange them in the order you want. Stats for nerds is off by default; turn it on to see what every connected device is reporting while you ride.</p>
         </div>
         <div className="ride-layout-settings">
           <div className="ride-card-list">
