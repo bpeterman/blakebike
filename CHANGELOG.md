@@ -19,6 +19,10 @@ Conventions:
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-19
+
+A live workout preview in the builder, a bigger built-in workout library, ride-history chart statistics, and one-click reconnection for remembered devices.
+
 ### Added
 
 - Drag across the power or heart-rate chart in a ride's detail view to highlight a section and see its average, maximum, and minimum power and heart rate. Click the chart, press Clear, or press Escape to dismiss it.
