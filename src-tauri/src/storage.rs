@@ -426,6 +426,9 @@ impl Storage {
             .unwrap_or_else(Utc::now);
         for workout in default_workouts(newest) {
             // A rider who already has a workout by this name keeps theirs.
+            // Matching on the name is deliberate: rename a default and a later
+            // version seeds a fresh copy alongside yours, which is the wanted
+            // behaviour — the renamed one is now the rider's own workout.
             if taken.contains(&workout.name.as_str()) {
                 continue;
             }
@@ -1215,6 +1218,37 @@ mod tests {
             1
         );
         // Both of the rider's workouts, plus every default but the skipped one.
+        assert_eq!(names.len(), default_workouts(Utc::now()).len() + 1);
+    }
+
+    /// Renaming a default makes it the rider's own, so the next version of the
+    /// library is free to seed a fresh copy under the original name.
+    #[test]
+    fn a_renamed_default_does_not_block_a_later_reseed() {
+        let path = std::env::temp_dir().join(format!("blakebike-{}.sqlite", Uuid::new_v4()));
+        let storage = Storage::open(&path).unwrap();
+        let mut renamed = storage
+            .workouts()
+            .unwrap()
+            .into_iter()
+            .find(|workout| workout.name == "Recovery Spin")
+            .unwrap();
+        renamed.name = "My easy spin".into();
+        renamed.updated_at = Utc::now();
+        storage.save_workout(&renamed).unwrap();
+        // Stand in for a future DEFAULT_WORKOUTS_VERSION bump.
+        storage.save_setting(DEFAULT_WORKOUTS_KEY, &0u32).unwrap();
+
+        storage.seed_default_workouts().unwrap();
+
+        let names: Vec<String> = storage
+            .workouts()
+            .unwrap()
+            .into_iter()
+            .map(|workout| workout.name)
+            .collect();
+        assert!(names.contains(&"My easy spin".to_string()));
+        assert!(names.contains(&"Recovery Spin".to_string()));
         assert_eq!(names.len(), default_workouts(Utc::now()).len() + 1);
     }
 
