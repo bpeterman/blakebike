@@ -88,6 +88,8 @@ export type SlotStats = {
   lastRawHex: string | null;
   /** Human summary of the latest decoded reading, e.g. "215 W · 88 rpm". */
   lastReading: string | null;
+  calibrationSupported: boolean;
+  calibrating: boolean;
 };
 
 export type DeviceSlot = {
@@ -132,6 +134,13 @@ export type ConnectProgress = {
   step: string;
   detail: string | null;
   level: "info" | "ok" | "warn";
+};
+
+export type CalibrationProgress = {
+  phase: "preparing" | "accelerate" | "stopPedaling" | "success" | "error";
+  targetLowKph: number | null;
+  targetHighKph: number | null;
+  message: string | null;
 };
 
 export type DeviceState =

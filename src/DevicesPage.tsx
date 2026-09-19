@@ -57,12 +57,14 @@ export function DevicesPage({
   hub,
   sources,
   onConnect,
+  onCalibrate,
   onSourcePreference,
   perform,
 }: {
   hub: DevicesSnapshot | null;
   sources: TelemetrySources | undefined;
   onConnect: (role: DeviceRole) => void;
+  onCalibrate: () => void;
   onSourcePreference: (metric: Metric, choice: SourceChoice) => void;
   perform: (action: () => Promise<unknown>, label?: string) => Promise<void>;
 }) {
@@ -181,6 +183,7 @@ export function DevicesPage({
             now={now}
             feeding={metricsFedBy(slot.role, liveSources)}
             onConnect={() => onConnect(slot.role)}
+            onCalibrate={onCalibrate}
             onDisconnect={() => void perform(() => api.disconnectDevice(slot.role), `disconnect ${slot.role}`)}
           />
         ))}
@@ -261,12 +264,14 @@ function DeviceCard({
   now,
   feeding,
   onConnect,
+  onCalibrate,
   onDisconnect,
 }: {
   slot: DeviceSlot;
   now: number;
   feeding: Metric[];
   onConnect: () => void;
+  onCalibrate: () => void;
   onDisconnect: () => void;
 }) {
   const [showLog, setShowLog] = useState(false);
@@ -327,6 +332,26 @@ function DeviceCard({
       <div className="card-actions device-actions">
         {connected ? (
           <>
+            {slot.role === "trainer" && (
+              <button
+                className="secondary"
+                onClick={onCalibrate}
+                disabled={
+                  slot.state.status !== "ready" ||
+                  !slot.stats.calibrationSupported ||
+                  slot.stats.calibrating
+                }
+                title={
+                  slot.state.status === "controlling"
+                    ? "Calibration is unavailable during a workout"
+                    : !slot.stats.calibrationSupported
+                      ? "This trainer does not advertise FTMS spin-down calibration"
+                      : undefined
+                }
+              >
+                <Gauge size={15} /> {slot.stats.calibrating ? "Calibrating…" : "Calibrate"}
+              </button>
+            )}
             <button className="secondary" onClick={onConnect}>Change</button>
             <button className="danger-button" onClick={onDisconnect}>Disconnect</button>
           </>
@@ -340,6 +365,12 @@ function DeviceCard({
           {slot.log.length > 0 && <span className="log-count">{slot.log.length}</span>}
         </button>
       </div>
+      {connected && slot.role === "trainer" && slot.state.status === "controlling" && (
+        <small className="calibration-unavailable">Calibration is unavailable during a workout.</small>
+      )}
+      {connected && slot.role === "trainer" && slot.state.status === "ready" && !slot.stats.calibrationSupported && (
+        <small className="calibration-unavailable">This trainer does not advertise FTMS spin-down calibration.</small>
+      )}
 
       {showLog && (
         <div className="device-log">
@@ -428,6 +459,8 @@ function emptySlot(role: DeviceRole): DeviceSlot {
       drops: 0,
       lastRawHex: null,
       lastReading: null,
+      calibrationSupported: false,
+      calibrating: false,
     },
     log: [],
   };
