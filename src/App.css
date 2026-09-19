@@ -571,7 +571,7 @@ textarea { min-height: 70px; resize: vertical; }
 .workout-profile-progress { fill: rgba(200,255,50,.35); pointer-events: none; }
 .workout-profile-block-label { fill: #141814; font-weight: 700; font-variant-numeric: tabular-nums; letter-spacing: .01em; pointer-events: none; }
 .workout-profile-block-label[data-placement="above"], .workout-profile-block-label[data-kind="freeRide"] { fill: #dfe6d9; }
-.workout-profile-block-duration { font-weight: 500; }
+.workout-profile-block-duration, .workout-profile-block-separator { font-weight: 500; }
 .workout-profile-baseline, .workout-profile-tick { stroke: #3a4137; }
 .workout-profile-ftp { stroke: #8f9988; stroke-dasharray: 3 4; }
 .workout-profile-label { fill: #7f887a; font-size: 9px; font-weight: 700; letter-spacing: .06em; }

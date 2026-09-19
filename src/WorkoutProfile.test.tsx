@@ -145,6 +145,40 @@ describe("WorkoutProfile", () => {
     expect(labels[1].querySelector(".workout-profile-block-target")).toHaveTextContent("100–220 W");
   });
 
+  it("rotates the label in narrow blocks and drops the duration when even that is too long", () => {
+    // Over-unders: 40 × (30 s at 110 %, 15 s at 55 %) on the 600 px canvas gives 20 px and 10 px blocks.
+    const overUnders: WorkoutStep[] = [
+      { kind: "repeat", repetitions: 20, steps: [steady(30, 110), steady(15, 55)] },
+    ];
+    const { container } = render(
+      <WorkoutProfile steps={overUnders} ftpWatts={FTP} powerZones={zones} labels />,
+    );
+    const labels = [...container.querySelectorAll<SVGTextElement>(".workout-profile-block-label")];
+    expect(labels).toHaveLength(20);
+    expect(new Set(labels.map((label) => label.dataset.labelFor))).toEqual(new Set(["0.0"]));
+    const [first] = labels;
+    expect(first.dataset.placement).toBe("vertical");
+    expect(first.getAttribute("transform")).toMatch(/^rotate\(-90 [\d.]+ 116\)$/);
+    expect(first.getAttribute("text-anchor")).toBe("start");
+    expect(first.getAttribute("dominant-baseline")).toBe("central");
+    expect(first.querySelector(".workout-profile-block-target")).toHaveTextContent("220 W");
+    expect(first.querySelector(".workout-profile-block-separator")).toHaveTextContent("·");
+    expect(first.querySelector(".workout-profile-block-duration")).toHaveTextContent("0:30");
+    expect(first.querySelector(".workout-profile-block-duration")).not.toHaveAttribute("dy");
+
+    // A 400 W peak squashes the 220 W block to 66 px: the full line no longer fits, the target alone does.
+    // The 40 W block is 12 px tall and gets nothing.
+    cleanup();
+    const short = render(
+      <WorkoutProfile steps={[steady(30, 110), steady(30, 20), steady(600, 200)]} ftpWatts={FTP} powerZones={zones} labels />,
+    );
+    const shortLabels = [...short.container.querySelectorAll<SVGTextElement>(".workout-profile-block-label")];
+    expect(shortLabels.map((label) => label.dataset.labelFor)).toEqual(["0", "2"]);
+    expect(shortLabels[0].dataset.placement).toBe("vertical");
+    expect(shortLabels[0].querySelector(".workout-profile-block-target")).toHaveTextContent("220 W");
+    expect(shortLabels[0].querySelector(".workout-profile-block-duration")).toBeNull();
+  });
+
   it("scales every block and label with the ride bias while FTP stays put", () => {
     const { container, rerender } = render(
       <WorkoutProfile steps={[steady(600, 100)]} ftpWatts={FTP} powerZones={zones} variant="editor" labels />,

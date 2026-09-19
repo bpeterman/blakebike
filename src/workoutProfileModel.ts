@@ -182,13 +182,22 @@ export const profileShapes = (
 export type ProfileLabel = {
   /** Horizontal centre of the block, in pixels. */
   x: number;
-  /** Baseline of the first (target) line; the duration sits one `lineHeight` below. */
+  /**
+   * `inside`/`above`: baseline of the target line; the duration sits one
+   * `lineHeight` below. `vertical`: the anchor at the block's baseline that
+   * the single line reads upward from.
+   */
   y: number;
   lineHeight: number;
-  /** Inside the block just above the baseline, or floating above a block too short to hold it. */
-  placement: "inside" | "above";
+  /**
+   * Two horizontal lines inside the block just above the baseline, or
+   * floating above a block too short to hold them; or one line stood on end
+   * in a block too narrow for horizontal text.
+   */
+  placement: "inside" | "above" | "vertical";
   target: string;
-  duration: string;
+  /** Null when only the target fits. */
+  duration: string | null;
 };
 
 /** Width of a glyph relative to the font size, generous for a sans face with tabular digits. */
@@ -196,11 +205,17 @@ const LABEL_GLYPH_RATIO = 0.62;
 const LABEL_PADDING_PX = 4;
 /** Room above the first line's baseline for its cap height. */
 const LABEL_CAP_RATIO = 0.75;
+/** Separator between target and duration when they share one line. */
+export const LABEL_SEPARATOR = " · ";
+
+const textWidth = (text: string, fontSize: number) => text.length * fontSize * LABEL_GLYPH_RATIO;
 
 /**
- * Where to write a block's target and duration, or null when the block is
- * too narrow for either line. Labels never spill outside their own column,
- * so neighbours cannot collide.
+ * Where to write a block's target and duration, or null when the block has
+ * room for neither. Wide blocks get two horizontal lines; narrow but tall
+ * blocks get a single vertical line, dropping the duration if even that is
+ * too long. Labels never spill outside their own column, so neighbours
+ * cannot collide.
  */
 export const profileLabel = (
   shape: ProfileShape,
@@ -209,21 +224,29 @@ export const profileLabel = (
 ): ProfileLabel | null => {
   const target = formatIntervalTarget(shape.startWatts, shape.endWatts);
   const duration = formatDuration(shape.endSeconds - shape.startSeconds);
-  const widthNeeded =
-    Math.max(target.length, duration.length) * fontSize * LABEL_GLYPH_RATIO + LABEL_PADDING_PX * 2;
-  if (shape.width < widthNeeded) return null;
-
   const lineHeight = fontSize * 1.25;
-  const heightNeeded = lineHeight * 2 + fontSize * LABEL_CAP_RATIO + LABEL_PADDING_PX * 2;
   const [[, startY], [, endY]] = shape.points;
-  const label = { x: shape.x + shape.width / 2, lineHeight, target, duration };
   const lowerTop = Math.max(startY, endY);
-  if (scale.height - lowerTop >= heightNeeded) {
-    return { ...label, placement: "inside", y: scale.height - LABEL_PADDING_PX - lineHeight };
-  }
   const upperTop = Math.min(startY, endY);
-  if (upperTop >= heightNeeded) {
-    return { ...label, placement: "above", y: upperTop - LABEL_PADDING_PX - lineHeight };
+  const label = { x: shape.x + shape.width / 2, lineHeight, target };
+
+  const widthNeeded = Math.max(textWidth(target, fontSize), textWidth(duration, fontSize)) + LABEL_PADDING_PX * 2;
+  if (shape.width >= widthNeeded) {
+    const heightNeeded = lineHeight * 2 + fontSize * LABEL_CAP_RATIO + LABEL_PADDING_PX * 2;
+    if (scale.height - lowerTop >= heightNeeded) {
+      return { ...label, duration, placement: "inside", y: scale.height - LABEL_PADDING_PX - lineHeight };
+    }
+    if (upperTop >= heightNeeded) {
+      return { ...label, duration, placement: "above", y: upperTop - LABEL_PADDING_PX - lineHeight };
+    }
+  }
+
+  // Stood on end, the line needs a glyph's height of width and reads upward from the baseline.
+  if (shape.width >= fontSize + 2) {
+    const room = scale.height - lowerTop - LABEL_PADDING_PX * 2;
+    const vertical = { ...label, placement: "vertical" as const, y: scale.height - LABEL_PADDING_PX };
+    if (textWidth(`${target}${LABEL_SEPARATOR}${duration}`, fontSize) <= room) return { ...vertical, duration };
+    if (textWidth(target, fontSize) <= room) return { ...vertical, duration: null };
   }
   return null;
 };

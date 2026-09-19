@@ -7,6 +7,7 @@ import {
 } from "./types";
 import { pathStartsWith, type StepPath } from "./workoutSteps";
 import {
+  LABEL_SEPARATOR,
   profileLabel,
   profileScale,
   profileSegments,
@@ -218,12 +219,26 @@ export const WorkoutProfile = memo(function WorkoutProfile({
                         x={round(label.x)}
                         y={round(label.y)}
                         fontSize={LABEL_FONT_PX}
-                        textAnchor="middle"
+                        textAnchor={label.placement === "vertical" ? "start" : "middle"}
+                        dominantBaseline={label.placement === "vertical" ? "central" : undefined}
+                        transform={
+                          label.placement === "vertical"
+                            ? `rotate(-90 ${round(label.x)} ${round(label.y)})`
+                            : undefined
+                        }
                       >
                         <tspan className="workout-profile-block-target">{label.target}</tspan>
-                        <tspan className="workout-profile-block-duration" x={round(label.x)} dy={round(label.lineHeight)}>
-                          {label.duration}
-                        </tspan>
+                        {label.duration !== null && label.placement === "vertical" && (
+                          <>
+                            <tspan className="workout-profile-block-separator">{LABEL_SEPARATOR}</tspan>
+                            <tspan className="workout-profile-block-duration">{label.duration}</tspan>
+                          </>
+                        )}
+                        {label.duration !== null && label.placement !== "vertical" && (
+                          <tspan className="workout-profile-block-duration" x={round(label.x)} dy={round(label.lineHeight)}>
+                            {label.duration}
+                          </tspan>
+                        )}
                       </text>
                     )}
                   </g>

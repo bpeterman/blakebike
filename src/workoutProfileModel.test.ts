@@ -83,13 +83,27 @@ describe("profileLabel", () => {
     expect(free).toMatchObject({ placement: "inside", target: "Free ride", duration: "5:00" });
   });
 
-  it("is omitted for blocks too narrow for either line or too cramped for both placements", () => {
-    // "Free ride" needs about 64 px; 50 px blocks hold "200 W" but not that.
+  it("stands a single line on end in a block too narrow for horizontal text", () => {
+    // 30 px and 15 px wide; 220 W is 91.7 px tall and 110 W is 45.8 px tall on a 100 px plot.
+    const [over, under] = labelsFor([steady(120, 110), steady(60, 55)], 45, 100);
+    expect(over).toEqual({
+      x: 14.5, y: 96, lineHeight: 12.5, placement: "vertical", target: "220 W", duration: "2:00",
+    });
+    // "110 W · 1:00" needs 74 px but the block only has 38 px of room: drop the duration.
+    expect(under).toMatchObject({ placement: "vertical", target: "110 W", duration: null });
+    expect(under?.x).toBeCloseTo(37.5, 5);
+  });
+
+  it("is omitted for blocks narrower than a glyph or too short for even the target", () => {
+    // 20 px and 10 px wide: a glyph needs 12 px.
+    const [over, under] = labelsFor([steady(120, 110), steady(60, 55)], 30, 100);
+    expect(over?.placement).toBe("vertical");
+    expect(under).toBeNull();
+    // "Free ride" is too wide for 50 px and, at 42 px of room, too tall to stand on end.
     const [steady50, free50] = labelsFor([steady(300, 100), { kind: "freeRide", durationSeconds: 300 }], 100, 100);
-    expect(steady50).not.toBeNull();
+    expect(steady50?.placement).toBe("inside");
     expect(free50).toBeNull();
-    expect(labelsFor([steady(30, 100), steady(30, 50)], 60, 100)).toEqual([null, null]);
-    // A 20 px plot has no room inside or above.
+    // A 20 px plot has no room inside, above, or on end.
     expect(labelsFor([steady(300, 100)], 200, 20)).toEqual([null]);
   });
 
