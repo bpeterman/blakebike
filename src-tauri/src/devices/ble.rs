@@ -102,14 +102,39 @@ impl DeviceDetails {
 }
 
 /// Owns the adapter and the peripherals seen in the last scan.
-#[derive(Default)]
 pub struct Ble {
     adapter: Mutex<Option<Adapter>>,
     discovered: Mutex<HashMap<String, Peripheral>>,
+    /// When false, `adapter()` fails without ever touching the OS Bluetooth
+    /// stack. Headless hubs (unit tests) use this: CoreBluetooth aborts an
+    /// unsigned test binary on macOS, and BlueZ may be absent on CI.
+    enabled: bool,
+}
+
+impl Default for Ble {
+    fn default() -> Self {
+        Self::new(true)
+    }
 }
 
 impl Ble {
+    pub fn new(enabled: bool) -> Self {
+        Self {
+            adapter: Mutex::new(None),
+            discovered: Mutex::new(HashMap::new()),
+            enabled,
+        }
+    }
+
+    /// A Bluetooth layer with no adapter; only simulated devices work.
+    pub fn disabled() -> Self {
+        Self::new(false)
+    }
+
     pub async fn adapter(&self) -> Result<Adapter, String> {
+        if !self.enabled {
+            return Err("Bluetooth is disabled in this environment".into());
+        }
         if let Some(adapter) = self.adapter.lock().await.clone() {
             return Ok(adapter);
         }
