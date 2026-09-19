@@ -7,6 +7,7 @@ import {
   type Profile,
   type RunnerState,
   type Telemetry,
+  type Workout,
 } from "./types";
 
 const profile: Profile = {
@@ -45,6 +46,35 @@ const telemetry: Telemetry = {
   targetPowerWatts: 100,
 };
 
+const structuredWorkout: Workout = {
+  id: "workout",
+  name: "Repeat Builder",
+  description: "Expanded repeat test",
+  source: "local",
+  version: 1,
+  createdAt: "2026-01-01T00:00:00Z",
+  updatedAt: "2026-01-01T00:00:00Z",
+  steps: [
+    {
+      kind: "steady",
+      durationSeconds: 60,
+      target: { unit: "percentFtp", value: 50 },
+    },
+    {
+      kind: "repeat",
+      repetitions: 2,
+      steps: [
+        {
+          kind: "steady",
+          durationSeconds: 30,
+          target: { unit: "percentFtp", value: 100 },
+        },
+        { kind: "freeRide", durationSeconds: 15 },
+      ],
+    },
+  ],
+};
+
 afterEach(cleanup);
 
 describe("Ride charts", () => {
@@ -75,5 +105,62 @@ describe("Ride charts", () => {
     expect(onRideDisplay).toHaveBeenCalledWith({ showTimeInZone: true });
     expect(screen.getAllByText("Power").length).toBeGreaterThan(0);
     expect(screen.getAllByText("Heart rate").length).toBeGreaterThan(0);
+  });
+
+  it("shows expanded workout progress and both countdowns while running or paused", () => {
+    const structuredRunner: RunnerState = {
+      status: "running",
+      sessionId: "session",
+      workoutName: structuredWorkout.name,
+      elapsedSeconds: 70,
+      totalSeconds: 150,
+      intervalIndex: 1,
+      intervalElapsedSeconds: 10,
+      targetPowerWatts: 200,
+      plannedTargetWatts: 200,
+      manualErg: false,
+      overrideActive: false,
+      biasPercent: 100,
+    };
+    const commonProps = {
+      workouts: [structuredWorkout],
+      selectedWorkout: structuredWorkout.id,
+      setSelectedWorkout: vi.fn(),
+      connected: true,
+      onConnect: vi.fn(),
+      telemetry,
+      telemetryHistory: [telemetry],
+      powerSmoothing: "instant" as const,
+      onPowerSmoothing: vi.fn(),
+      sourcePreferences: defaultSourcePreferences,
+      onSourcePreference: vi.fn(),
+      profile,
+      trainingZones: defaultTrainingZoneSettings,
+      rideDisplay: { showTimeInZone: false },
+      onRideDisplay: vi.fn(),
+      perform: async () => undefined,
+    };
+    const { rerender } = render(<Ride {...commonProps} runner={structuredRunner} />);
+
+    expect(screen.queryByRole("heading", { name: structuredWorkout.name })).not.toBeInTheDocument();
+    expect(screen.getByText(structuredWorkout.name)).toHaveClass("label");
+    expect(screen.getByText("Block 2 of 5")).toBeInTheDocument();
+    expect(screen.getByLabelText("Block 1 of 5, completed")).toHaveAttribute("data-state", "completed");
+    expect(screen.getByLabelText("Block 2 of 5, current")).toHaveAttribute("data-state", "current");
+    expect(screen.getByLabelText("Block 3 of 5, upcoming")).toHaveAttribute("data-state", "upcoming");
+    expect(screen.getByText("0:20")).toBeInTheDocument();
+    expect(screen.getByText("1:20")).toBeInTheDocument();
+    const controls = screen.getByRole("button", { name: "Pause" }).parentElement;
+    const powerChart = screen.getAllByText("FULL SESSION")[0].closest(".live-chart");
+    expect(controls?.nextElementSibling).toBe(powerChart);
+
+    const pausedRunner: RunnerState = {
+      ...structuredRunner,
+      status: "paused",
+      intervalElapsedSeconds: 10,
+    };
+    rerender(<Ride {...commonProps} runner={pausedRunner} />);
+    expect(screen.getByText("200 W · Paused")).toBeInTheDocument();
+    expect(screen.getByText("0:20")).toBeInTheDocument();
   });
 });

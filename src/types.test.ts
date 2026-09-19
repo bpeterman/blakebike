@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  compileWorkoutIntervals,
   formatDistance,
   formatDuration,
   formatSpeed,
@@ -11,6 +12,7 @@ import {
   clampBias,
   withSmoothedPower,
   timeInZones,
+  withActiveElapsed,
   zoneIndex,
   workoutDuration,
   type WorkoutStep,
@@ -33,6 +35,67 @@ describe("workout helpers", () => {
       },
     ];
     expect(workoutDuration(steps)).toBe(180);
+  });
+
+  it("compiles runner-aligned intervals with expanded repeats", () => {
+    const steps: WorkoutStep[] = [
+      {
+        kind: "steady",
+        durationSeconds: 60,
+        target: { unit: "percentFtp", value: 75 },
+      },
+      {
+        kind: "repeat",
+        repetitions: 2,
+        steps: [
+          {
+            kind: "ramp",
+            durationSeconds: 30,
+            start: { unit: "watts", value: 180 },
+            end: { unit: "percentFtp", value: 125 },
+          },
+          { kind: "freeRide", durationSeconds: 15 },
+        ],
+      },
+    ];
+
+    expect(compileWorkoutIntervals(steps, 201)).toEqual([
+      {
+        kind: "steady",
+        durationSeconds: 60,
+        startWatts: 150,
+        endWatts: 150,
+        freeRide: false,
+      },
+      {
+        kind: "ramp",
+        durationSeconds: 30,
+        startWatts: 180,
+        endWatts: 251,
+        freeRide: false,
+      },
+      {
+        kind: "freeRide",
+        durationSeconds: 15,
+        startWatts: null,
+        endWatts: null,
+        freeRide: true,
+      },
+      {
+        kind: "ramp",
+        durationSeconds: 30,
+        startWatts: 180,
+        endWatts: 251,
+        freeRide: false,
+      },
+      {
+        kind: "freeRide",
+        durationSeconds: 15,
+        startWatts: null,
+        endWatts: null,
+        freeRide: true,
+      },
+    ]);
   });
 
   it("formats short and long durations", () => {
@@ -135,5 +198,21 @@ describe("workout helpers", () => {
     expect(result).toHaveLength(10);
     expect(result[0]).toBe(samples[0]);
     expect(result[9]).toBe(samples[99]);
+  });
+
+  it("compresses pause gaps and aligns chart time to elapsed ride time", () => {
+    const samples = [0, 1000, 2000, 62_000, 63_000].map((timestampMs) => ({
+      timestampMs,
+      powerWatts: 100,
+      cadenceRpm: null,
+      speedKph: null,
+      heartRateBpm: null,
+      targetPowerWatts: null,
+    }));
+    expect(withActiveElapsed(samples).map((sample) => sample.activeElapsedMs)).toEqual([
+      0, 1000, 2000, 2000, 3000,
+    ]);
+    const aligned = withActiveElapsed(samples, 4);
+    expect(aligned[aligned.length - 1].activeElapsedMs).toBe(4000);
   });
 });
