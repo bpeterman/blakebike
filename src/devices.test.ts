@@ -10,6 +10,8 @@ import {
   metricsFedBy,
   readoutMark,
   sourceNote,
+  deviceTransport,
+  transportLabel,
 } from "./devices";
 import type { DeviceInfo, DeviceState } from "./types";
 
@@ -22,6 +24,12 @@ const device = (capabilities?: DeviceInfo["capabilities"]): DeviceInfo => ({
 });
 
 describe("device roles", () => {
+  it("defaults old device records to BLE and labels ANT devices", () => {
+    expect(deviceTransport(device(["heartRate"]))).toBe("ble");
+    expect(transportLabel(device(["heartRate"]))).toBe("BLE");
+    expect(transportLabel({ ...device(["heartRate"]), transport: "ant" })).toBe("ANT+");
+  });
+
   it("matches devices to roles by advertised service", () => {
     expect(deviceFitsRole(device(["ftms"]), "trainer")).toBe(true);
     expect(deviceFitsRole(device(["ftms"]), "heartRate")).toBe(false);

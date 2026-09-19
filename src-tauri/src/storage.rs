@@ -1288,6 +1288,7 @@ mod tests {
         let strap = KnownDevice {
             id: "strap".into(),
             name: "HRM-Pro".into(),
+            transport: Default::default(),
             role: DeviceRole::HeartRate,
             capabilities: vec![Capability::HeartRate],
             simulated: false,
@@ -1298,6 +1299,7 @@ mod tests {
         let trainer = KnownDevice {
             id: "kickr".into(),
             name: "KICKR CORE".into(),
+            transport: Default::default(),
             role: DeviceRole::Trainer,
             capabilities: vec![Capability::Ftms, Capability::CyclingPower],
             simulated: false,

@@ -309,6 +309,10 @@ function App() {
       const message = messageOf(cause);
       setError(message);
       void api.reportError(label, message).catch(() => undefined);
+    } finally {
+      // Scan-level state (including the optional ANT adapter) is not tied to a
+      // role slot event, so refresh the compact hub snapshot after actions.
+      void api.devicesSnapshot().then(setHub).catch(() => undefined);
     }
   }, []);
 
@@ -596,6 +600,7 @@ function App() {
           role={devicePicker}
           slot={hub?.slots.find((slot) => slot.role === devicePicker)}
           scanError={hub?.scanError ?? null}
+          antAdapter={hub?.antAdapter}
           close={() => setDevicePicker(null)}
           perform={perform}
         />

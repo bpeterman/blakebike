@@ -7,6 +7,7 @@ FTMS smart trainers. The initial target platforms are macOS and Ubuntu/Pop!_OS
 ## Features
 
 - FTMS trainer discovery, telemetry, ERG power control, and safe stop behavior
+- BLE and ANT+ heart-rate monitors (ANT USBStick2 support is Linux-first)
 - Built-in simulated trainer for development and hardware-free use
 - Structured workout editor with steady, ramp, free-ride, and imported repeat blocks
 - ZWO import/export, rider FTP and safety power limit
@@ -38,6 +39,33 @@ pnpm tauri dev
 
 macOS asks for Bluetooth access on first scan. On Linux, BlueZ must be running
 and the signed-in user must have access to its system D-Bus service.
+
+### ANT+ heart rate on Linux
+
+BlakeBike supports the Dynastream ANT USBStick2 (`0fcf:1008`) through its
+Linux USB serial interface. The Debian package installs the least-privilege udev
+rule. For development or AppImage use, install the included rule once:
+
+```sh
+./scripts/install-ant-udev.sh
+```
+
+Then unplug and reconnect the stick. Open Devices, choose Heart rate, and scan
+while wearing the strap. ANT devices are marked `ANT+`; Bluetooth devices are
+marked `BLE`. A missing ANT stick is ignored, while permission and busy-device
+failures are shown alongside the scan results. Close Garmin Express or another
+fitness app if it has exclusive access to the stick.
+
+If the stick or monitor is still missing, collect a read-only Linux diagnostic:
+
+```sh
+./scripts/diagnose-ant-linux.sh 2>&1 | tee ant-diagnostics.txt
+```
+
+The report checks USB descriptors, sysfs interfaces and drivers, raw USB and
+serial permissions, process holders, udev rules, kernel messages, and recent
+BlakeBike ANT log lines. Attach the complete `ant-diagnostics.txt` to the bug
+report. It does not use `sudo` or modify the system.
 
 ## Debugging
 
