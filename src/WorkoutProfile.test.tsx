@@ -126,6 +126,42 @@ describe("WorkoutProfile", () => {
     expect(onHighlightPath).toHaveBeenLastCalledWith(null);
   });
 
+  it("labels each block with its target and duration only when asked", () => {
+    const silent = render(<WorkoutProfile steps={steps} ftpWatts={FTP} powerZones={zones} />);
+    expect(silent.container.querySelector(".workout-profile-block-label")).not.toBeInTheDocument();
+    cleanup();
+
+    const { container } = render(
+      <WorkoutProfile steps={steps} ftpWatts={FTP} powerZones={zones} labels />,
+    );
+    // The 600 px fallback canvas gives the 60 s blocks about 42 px: room for "240 W" but not "Free ride".
+    const labels = [...container.querySelectorAll<SVGTextElement>(".workout-profile-block-label")];
+    expect(labels.map((label) => label.dataset.labelFor)).toEqual(["0", "1", "2.0", "2.0"]);
+    expect(labels[2].querySelector(".workout-profile-block-target")).toHaveTextContent("240 W");
+    expect(labels[2].querySelector(".workout-profile-block-duration")).toHaveTextContent("1:00");
+    expect(labels[0].querySelector(".workout-profile-block-target")).toHaveTextContent("120 W");
+    expect(labels[0].querySelector(".workout-profile-block-duration")).toHaveTextContent("5:00");
+    expect(labels[0].dataset.placement).toBe("inside");
+    expect(labels[1].querySelector(".workout-profile-block-target")).toHaveTextContent("100–220 W");
+  });
+
+  it("scales every block and label with the ride bias while FTP stays put", () => {
+    const { container, rerender } = render(
+      <WorkoutProfile steps={[steady(600, 100)]} ftpWatts={FTP} powerZones={zones} variant="editor" labels />,
+    );
+    const topOf = () => Number(polygons(container)[0].getAttribute("points")!.split(" ")[0].split(",")[1]);
+    const ftpLine = () => Number(container.querySelector("[data-ftp-line]")?.getAttribute("y1"));
+    expect(topOf()).toBeCloseTo(ftpLine(), 5);
+    expect(container.querySelector(".workout-profile-block-target")).toHaveTextContent("200 W");
+
+    rerender(
+      <WorkoutProfile steps={[steady(600, 100)]} ftpWatts={FTP} biasPercent={110} powerZones={zones} variant="editor" labels />,
+    );
+    expect(container.querySelector(".workout-profile-block-target")).toHaveTextContent("220 W");
+    expect(topOf()).toBeLessThan(ftpLine());
+    expect(screen.getByRole("img", { name: "10:00 workout, 1 block, peak 110% FTP" })).toBeInTheDocument();
+  });
+
   it("overlays per-block progress supplied by the host", () => {
     const { container } = render(
       <WorkoutProfile

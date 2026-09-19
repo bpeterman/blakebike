@@ -183,6 +183,63 @@ describe("Ride charts", () => {
     expect(screen.getByRole("button", { name: "Reset override · 200 W" })).toBeInTheDocument();
   });
 
+  it("labels timeline blocks with biased targets and durations that follow the bias", () => {
+    const structuredRunner: RunnerState = {
+      status: "running",
+      sessionId: "session",
+      workoutName: structuredWorkout.name,
+      elapsedSeconds: 70,
+      totalSeconds: 150,
+      intervalIndex: 1,
+      intervalElapsedSeconds: 10,
+      targetPowerWatts: 200,
+      plannedTargetWatts: 200,
+      manualErg: false,
+      overrideActive: false,
+      biasPercent: 100,
+    };
+    const commonProps = {
+      workouts: [structuredWorkout],
+      selectedWorkout: structuredWorkout.id,
+      setSelectedWorkout: vi.fn(),
+      connected: true,
+      onConnect: vi.fn(),
+      telemetry,
+      telemetryHistory: [telemetry],
+      powerSmoothing: "instant" as const,
+      onPowerSmoothing: vi.fn(),
+      sourcePreferences: defaultSourcePreferences,
+      onSourcePreference: vi.fn(),
+      profile,
+      trainingZones: defaultTrainingZoneSettings,
+      displayPreferences: defaultRideDisplayPreferences,
+      perform: async () => undefined,
+    };
+    const { container, rerender } = render(<Ride {...commonProps} runner={structuredRunner} />);
+    const labelText = () =>
+      [...container.querySelectorAll<SVGTextElement>(".workout-timeline .workout-profile-block-label")].map((label) => [
+        label.dataset.labelFor,
+        label.querySelector(".workout-profile-block-target")?.textContent,
+        label.querySelector(".workout-profile-block-duration")?.textContent,
+      ]);
+    // 60 s and 30 s blocks are wide enough on the fallback canvas; 15 s free-ride blocks are not.
+    expect(labelText()).toEqual([
+      ["0", "100 W", "1:00"],
+      ["1.0", "200 W", "0:30"],
+      ["1.0", "200 W", "0:30"],
+    ]);
+    expect(container.querySelector(".timeline-target")).toHaveTextContent("200 W");
+
+    rerender(<Ride {...commonProps} runner={{ ...structuredRunner, biasPercent: 110, targetPowerWatts: 220 }} />);
+    expect(labelText()).toEqual([
+      ["0", "110 W", "1:00"],
+      ["1.0", "220 W", "0:30"],
+      ["1.0", "220 W", "0:30"],
+    ]);
+    expect(container.querySelector(".timeline-target")).toHaveTextContent("220 W");
+    expect(screen.getByText("Plan 200 W · 110% bias")).toBeInTheDocument();
+  });
+
   it("hides cards and renders visible cards in the saved order", () => {
     const displayPreferences = {
       version: 2 as const,

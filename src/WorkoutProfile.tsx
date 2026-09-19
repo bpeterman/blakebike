@@ -1,7 +1,13 @@
 import { memo, useId, useMemo } from "react";
-import { formatDuration, type WorkoutStep, type ZoneDefinition } from "./types";
+import {
+  DEFAULT_BIAS_PERCENT,
+  formatDuration,
+  type WorkoutStep,
+  type ZoneDefinition,
+} from "./types";
 import { pathStartsWith, type StepPath } from "./workoutSteps";
 import {
+  profileLabel,
   profileScale,
   profileSegments,
   profileShapes,
@@ -28,9 +34,13 @@ export type SegmentState = {
 export type WorkoutProfileProps = {
   steps: readonly WorkoutStep[];
   ftpWatts: number;
+  /** Ride bias applied to every target, so the drawing matches what the trainer is asked for. */
+  biasPercent?: number;
   powerZones: readonly ZoneDefinition[];
   /** `editor` adds the FTP line, time axis, and repeat brackets. `compact` draws shapes only. */
   variant?: WorkoutProfileVariant;
+  /** Write each block's target and duration on it wherever there is room. */
+  labels?: boolean;
   /** Blocks at or inside this path are emphasised and the rest dimmed. */
   highlightedPath?: StepPath | null;
   onHighlightPath?: (path: StepPath | null) => void;
@@ -42,6 +52,7 @@ export type WorkoutProfileProps = {
 
 const AXIS_HEIGHT = 16;
 const REPEAT_BAND_HEIGHT = 14;
+const LABEL_FONT_PX = 10;
 const FALLBACK_SIZE = { width: 600, height: 120 };
 
 const pathKey = (path: StepPath) => path.join(".");
@@ -59,8 +70,10 @@ const round = (value: number) => Math.round(value * 100) / 100;
 export const WorkoutProfile = memo(function WorkoutProfile({
   steps,
   ftpWatts,
+  biasPercent = DEFAULT_BIAS_PERCENT,
   powerZones,
   variant = "compact",
+  labels = false,
   highlightedPath = null,
   onHighlightPath,
   onSelectPath,
@@ -72,7 +85,10 @@ export const WorkoutProfile = memo(function WorkoutProfile({
   const idPrefix = useId().replace(/[^a-zA-Z0-9_-]/g, "");
   const editor = variant === "editor";
 
-  const segments = useMemo(() => profileSegments(steps, ftpWatts), [steps, ftpWatts]);
+  const segments = useMemo(
+    () => profileSegments(steps, ftpWatts, biasPercent),
+    [steps, ftpWatts, biasPercent],
+  );
   const stats = useMemo(() => profileStats(segments, ftpWatts), [segments, ftpWatts]);
   const spans = useMemo(() => (editor ? repeatSpans(steps, segments) : []), [editor, steps, segments]);
 
@@ -166,6 +182,7 @@ export const WorkoutProfile = memo(function WorkoutProfile({
                     : shape.kind === "ramp"
                       ? `url(#${idPrefix}-ramp-${index})`
                       : zoneColor(shape.startWatts, powerZones);
+                const label = labels ? profileLabel(shape, scale, LABEL_FONT_PX) : null;
                 return (
                   <g key={`${pathKey(shape.path)}:${shape.iterations.join(".")}`}>
                     <polygon
@@ -190,6 +207,24 @@ export const WorkoutProfile = memo(function WorkoutProfile({
                         width={round(shape.width * Math.min(1, state.progress))}
                         height={scale.height}
                       />
+                    )}
+                    {label && (
+                      <text
+                        className="workout-profile-block-label"
+                        data-label-for={pathKey(shape.path)}
+                        data-placement={label.placement}
+                        data-kind={shape.kind}
+                        data-state={state?.state}
+                        x={round(label.x)}
+                        y={round(label.y)}
+                        fontSize={LABEL_FONT_PX}
+                        textAnchor="middle"
+                      >
+                        <tspan className="workout-profile-block-target">{label.target}</tspan>
+                        <tspan className="workout-profile-block-duration" x={round(label.x)} dy={round(label.lineHeight)}>
+                          {label.duration}
+                        </tspan>
+                      </text>
                     )}
                   </g>
                 );

@@ -437,10 +437,33 @@ export const targetWatts = (target: PowerTarget, ftpWatts: number): number =>
     ? target.value
     : Math.min(65_535, Math.floor((ftpWatts * target.value) / 100));
 
-/** Compiles one executed block. Mirrors the Rust workout compiler's per-step output. */
-export const compileWorkoutInterval = (step: LeafStep, ftpWatts: number): WorkoutInterval => {
+export const BIAS_STEP_PERCENT = 1;
+export const MIN_BIAS_PERCENT = 50;
+export const MAX_BIAS_PERCENT = 150;
+export const DEFAULT_BIAS_PERCENT = 100;
+
+export const clampBias = (percent: number): number =>
+  Math.min(MAX_BIAS_PERCENT, Math.max(MIN_BIAS_PERCENT, Math.round(percent)));
+
+/**
+ * Scales a planned target by the ride's bias. Mirrors the Rust runner's
+ * `biased_target`: nearest watt, never zero (ERG treats 0 W as "no target").
+ */
+export const biasedWatts = (plannedWatts: number, biasPercent: number): number =>
+  Math.min(65_535, Math.max(1, Math.floor((plannedWatts * clampBias(biasPercent) + 50) / 100)));
+
+/**
+ * Compiles one executed block, with the ride's bias applied to its targets.
+ * Mirrors the Rust workout compiler's per-step output and the runner's bias.
+ */
+export const compileWorkoutInterval = (
+  step: LeafStep,
+  ftpWatts: number,
+  biasPercent = DEFAULT_BIAS_PERCENT,
+): WorkoutInterval => {
+  const biased = (target: PowerTarget) => biasedWatts(targetWatts(target, ftpWatts), biasPercent);
   if (step.kind === "steady") {
-    const watts = targetWatts(step.target, ftpWatts);
+    const watts = biased(step.target);
     return {
       kind: step.kind,
       durationSeconds: step.durationSeconds,
@@ -453,8 +476,8 @@ export const compileWorkoutInterval = (step: LeafStep, ftpWatts: number): Workou
     return {
       kind: step.kind,
       durationSeconds: step.durationSeconds,
-      startWatts: targetWatts(step.start, ftpWatts),
-      endWatts: targetWatts(step.end, ftpWatts),
+      startWatts: biased(step.start),
+      endWatts: biased(step.end),
       freeRide: false,
     };
   }
@@ -471,8 +494,20 @@ export const compileWorkoutInterval = (step: LeafStep, ftpWatts: number): Workou
 export const compileWorkoutIntervals = (
   steps: readonly WorkoutStep[],
   ftpWatts: number,
+  biasPercent = DEFAULT_BIAS_PERCENT,
 ): WorkoutInterval[] =>
-  expandWorkoutSteps(steps).map(({ step }) => compileWorkoutInterval(step, ftpWatts));
+  expandWorkoutSteps(steps).map(({ step }) => compileWorkoutInterval(step, ftpWatts, biasPercent));
+
+/** "Free ride", "200 W", or "150–220 W" for a ramp. */
+export const formatIntervalTarget = (
+  startWatts: number | null,
+  endWatts: number | null,
+): string =>
+  startWatts === null || endWatts === null
+    ? "Free ride"
+    : startWatts === endWatts
+      ? `${startWatts} W`
+      : `${startWatts}–${endWatts} W`;
 
 export const formatDuration = (seconds: number): string => {
   const hours = Math.floor(seconds / 3600);
@@ -511,13 +546,6 @@ export const manualPowerDeltaForKey = (
   if (key === "ArrowDown") return -5;
   return null;
 };
-
-export const BIAS_STEP_PERCENT = 1;
-export const MIN_BIAS_PERCENT = 50;
-export const MAX_BIAS_PERCENT = 150;
-
-export const clampBias = (percent: number): number =>
-  Math.min(MAX_BIAS_PERCENT, Math.max(MIN_BIAS_PERCENT, Math.round(percent)));
 
 export type RideKeyAction =
   | { kind: "power"; delta: number }

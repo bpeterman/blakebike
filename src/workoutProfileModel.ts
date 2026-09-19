@@ -1,6 +1,8 @@
 import {
   compileWorkoutInterval,
+  DEFAULT_BIAS_PERCENT,
   formatDuration,
+  formatIntervalTarget,
   type WorkoutInterval,
   type WorkoutStep,
 } from "./types";
@@ -20,17 +22,18 @@ import {
  */
 
 export type ProfileSegment = ExpandedStep & {
-  /** Exactly what the runner will execute for this block. */
+  /** Exactly what the runner will execute for this block, bias included. */
   interval: WorkoutInterval;
 };
 
 export const profileSegments = (
   steps: readonly WorkoutStep[],
   ftpWatts: number,
+  biasPercent = DEFAULT_BIAS_PERCENT,
 ): ProfileSegment[] =>
   expandWorkoutSteps(steps).map((expanded) => ({
     ...expanded,
-    interval: compileWorkoutInterval(expanded.step, ftpWatts),
+    interval: compileWorkoutInterval(expanded.step, ftpWatts, biasPercent),
   }));
 
 export type ProfileStats = {
@@ -175,6 +178,55 @@ export const profileShapes = (
       ],
     };
   });
+
+export type ProfileLabel = {
+  /** Horizontal centre of the block, in pixels. */
+  x: number;
+  /** Baseline of the first (target) line; the duration sits one `lineHeight` below. */
+  y: number;
+  lineHeight: number;
+  /** Inside the block just above the baseline, or floating above a block too short to hold it. */
+  placement: "inside" | "above";
+  target: string;
+  duration: string;
+};
+
+/** Width of a glyph relative to the font size, generous for a sans face with tabular digits. */
+const LABEL_GLYPH_RATIO = 0.62;
+const LABEL_PADDING_PX = 4;
+/** Room above the first line's baseline for its cap height. */
+const LABEL_CAP_RATIO = 0.75;
+
+/**
+ * Where to write a block's target and duration, or null when the block is
+ * too narrow for either line. Labels never spill outside their own column,
+ * so neighbours cannot collide.
+ */
+export const profileLabel = (
+  shape: ProfileShape,
+  scale: ProfileScale,
+  fontSize: number,
+): ProfileLabel | null => {
+  const target = formatIntervalTarget(shape.startWatts, shape.endWatts);
+  const duration = formatDuration(shape.endSeconds - shape.startSeconds);
+  const widthNeeded =
+    Math.max(target.length, duration.length) * fontSize * LABEL_GLYPH_RATIO + LABEL_PADDING_PX * 2;
+  if (shape.width < widthNeeded) return null;
+
+  const lineHeight = fontSize * 1.25;
+  const heightNeeded = lineHeight * 2 + fontSize * LABEL_CAP_RATIO + LABEL_PADDING_PX * 2;
+  const [[, startY], [, endY]] = shape.points;
+  const label = { x: shape.x + shape.width / 2, lineHeight, target, duration };
+  const lowerTop = Math.max(startY, endY);
+  if (scale.height - lowerTop >= heightNeeded) {
+    return { ...label, placement: "inside", y: scale.height - LABEL_PADDING_PX - lineHeight };
+  }
+  const upperTop = Math.min(startY, endY);
+  if (upperTop >= heightNeeded) {
+    return { ...label, placement: "above", y: upperTop - LABEL_PADDING_PX - lineHeight };
+  }
+  return null;
+};
 
 const tickSpacingsSeconds = [60, 300, 600, 900, 1800, 3600] as const;
 
