@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { compileWorkoutIntervals, type WorkoutStep } from "./types";
 import {
+  profileLabel,
   profileScale,
   profileSegments,
   profileShapes,
@@ -44,6 +45,88 @@ describe("profileSegments", () => {
       [0], [1, 0], [1, 1], [1, 0], [1, 1], [1, 0], [1, 1], [2],
     ]);
   });
+
+  it("applies the ride bias to every target, leaving durations and free ride alone", () => {
+    const biased = profileSegments(mixed, FTP, 110);
+    expect(biased.map((segment) => segment.interval)).toEqual(
+      compileWorkoutIntervals(mixed, FTP, 110),
+    );
+    expect(biased[0].interval).toMatchObject({ startWatts: 110, endWatts: 165, durationSeconds: 600 });
+    expect(biased[1].interval.startWatts).toBe(220);
+    expect(biased[7].interval).toMatchObject({ startWatts: null, endWatts: null, freeRide: true });
+    expect(profileStats(biased, FTP).peakWatts).toBe(220);
+  });
+});
+
+describe("profileLabel", () => {
+  const FONT = 10;
+  const labelsFor = (steps: WorkoutStep[], width: number, height: number, bias = 100) => {
+    const segments = profileSegments(steps, FTP, bias);
+    const scale = profileScale(segments, { width, height, ftpWatts: FTP });
+    return profileShapes(segments, scale).map((shape) => profileLabel(shape, scale, FONT));
+  };
+
+  it("writes the target and duration inside a block that can hold both lines", () => {
+    const [label] = labelsFor([steady(300, 100)], 200, 100);
+    expect(label).toMatchObject({ placement: "inside", target: "200 W", duration: "5:00", x: 100 });
+    // Two lines of 12.5 px sit 4 px above the baseline.
+    expect(label?.y).toBe(100 - 4 - 12.5);
+    expect(label?.lineHeight).toBe(12.5);
+  });
+
+  it("floats the label above a block too short to hold it, and describes ramps and free ride", () => {
+    // 20 % of FTP against a 240 W axis is 8.3 px tall on a 100 px plot.
+    const [short, sloped, free] = labelsFor([steady(300, 20), ramp(300, 50, 100), { kind: "freeRide", durationSeconds: 300 }], 600, 100);
+    expect(short).toMatchObject({ placement: "above", target: "40 W" });
+    expect(short?.y).toBeCloseTo(100 - 100 / 6 - 4 - 12.5, 5);
+    expect(sloped).toMatchObject({ placement: "inside", target: "100–200 W" });
+    expect(free).toMatchObject({ placement: "inside", target: "Free ride", duration: "5:00" });
+  });
+
+  it("stands a single line on end in a block too narrow for horizontal text", () => {
+    // 30 px and 15 px wide; 220 W is 91.7 px tall and 110 W is 45.8 px tall on a 100 px plot.
+    const [over, under] = labelsFor([steady(120, 110), steady(60, 55)], 45, 100);
+    expect(over).toEqual({
+      x: 14.5, y: 96, lineHeight: 12.5, placement: "vertical", target: "220 W", duration: "2:00",
+    });
+    // "110 W · 1:00" needs 74 px but the block only has 38 px of room: drop the duration.
+    expect(under).toMatchObject({ placement: "vertical", target: "110 W", duration: null });
+    expect(under?.x).toBeCloseTo(37.5, 5);
+  });
+
+  it("is omitted for blocks narrower than a glyph or too short for even the target", () => {
+    // 20 px and 10 px wide: a glyph needs 12 px.
+    const [over, under] = labelsFor([steady(120, 110), steady(60, 55)], 30, 100);
+    expect(over?.placement).toBe("vertical");
+    expect(under).toBeNull();
+    // "Free ride" is too wide for 50 px and, at 42 px of room, too tall to stand on end.
+    const [steady50, free50] = labelsFor([steady(300, 100), { kind: "freeRide", durationSeconds: 300 }], 100, 100);
+    expect(steady50?.placement).toBe("inside");
+    expect(free50).toBeNull();
+    // A 20 px plot has no room inside, above, or on end.
+    expect(labelsFor([steady(300, 100)], 200, 20)).toEqual([null]);
+  });
+
+  it("uses real text metrics when the drawing supplies them", () => {
+    // The estimate puts "110 W · 1:00" at 74 px, too long for the 38 px of room in a 15 px wide 110 W block.
+    // A measurer that knows the type is narrower lets the duration back in.
+    const segments = profileSegments([steady(120, 110), steady(60, 55)], FTP);
+    const scale = profileScale(segments, { width: 45, height: 100, ftpWatts: FTP });
+    const [, under] = profileShapes(segments, scale);
+    const calls: [string, string][] = [];
+    const narrow = (text: string, role: string) => {
+      calls.push([text, role]);
+      return text.length * 3;
+    };
+    expect(profileLabel(under, scale, FONT, narrow)).toMatchObject({ placement: "vertical", duration: "1:00" });
+    expect(calls).toEqual([["110 W", "target"], ["1:00", "duration"], [" · 1:00", "duration"]]);
+    expect(profileLabel(under, scale, FONT)).toMatchObject({ placement: "vertical", duration: null });
+  });
+
+  it("follows the bias", () => {
+    expect(labelsFor([steady(300, 100)], 200, 100, 110)[0]?.target).toBe("220 W");
+    expect(labelsFor([steady(300, 100)], 200, 100, 90)[0]?.target).toBe("180 W");
+  });
 });
 
 describe("profileStats", () => {
@@ -64,9 +147,10 @@ describe("profileStats", () => {
     expect(hour.estimatedStress).toBeCloseTo(100, 5);
     const halfHour = profileStats(profileSegments([steady(1800, 80)], FTP), FTP);
     expect(halfHour.estimatedStress).toBeCloseTo(0.64 * 0.5 * 100, 5);
-    // A ramp from 0 to FTP has mean square 1/3, not (1/2)² = 1/4.
+    // A ramp from 0 to FTP has mean square 1/3, not (1/2)² = 1/4. The runner
+    // floors targets at 1 W, so the ramp actually starts at 1 W.
     const rampUp = profileStats(profileSegments([ramp(3600, 0, 100)], FTP), FTP);
-    expect(rampUp.estimatedStress).toBeCloseTo(100 / 3, 5);
+    expect(rampUp.estimatedStress).toBeCloseTo(((1 + FTP + FTP * FTP) / 3 / (FTP * FTP)) * 100, 5);
   });
 
   it("returns null intensity figures when nothing is targeted", () => {

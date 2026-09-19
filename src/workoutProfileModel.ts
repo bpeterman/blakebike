@@ -1,6 +1,8 @@
 import {
   compileWorkoutInterval,
+  DEFAULT_BIAS_PERCENT,
   formatDuration,
+  formatIntervalTarget,
   type WorkoutInterval,
   type WorkoutStep,
 } from "./types";
@@ -20,17 +22,18 @@ import {
  */
 
 export type ProfileSegment = ExpandedStep & {
-  /** Exactly what the runner will execute for this block. */
+  /** Exactly what the runner will execute for this block, bias included. */
   interval: WorkoutInterval;
 };
 
 export const profileSegments = (
   steps: readonly WorkoutStep[],
   ftpWatts: number,
+  biasPercent = DEFAULT_BIAS_PERCENT,
 ): ProfileSegment[] =>
   expandWorkoutSteps(steps).map((expanded) => ({
     ...expanded,
-    interval: compileWorkoutInterval(expanded.step, ftpWatts),
+    interval: compileWorkoutInterval(expanded.step, ftpWatts, biasPercent),
   }));
 
 export type ProfileStats = {
@@ -175,6 +178,96 @@ export const profileShapes = (
       ],
     };
   });
+
+export type ProfileLabel = {
+  /** Horizontal centre of the block, in pixels. */
+  x: number;
+  /**
+   * `inside`/`above`: baseline of the target line; the duration sits one
+   * `lineHeight` below. `vertical`: the anchor at the block's baseline that
+   * the single line reads upward from.
+   */
+  y: number;
+  lineHeight: number;
+  /**
+   * Two horizontal lines inside the block just above the baseline, or
+   * floating above a block too short to hold them; or one line stood on end
+   * in a block too narrow for horizontal text.
+   */
+  placement: "inside" | "above" | "vertical";
+  target: string;
+  /** Null when only the target fits. */
+  duration: string | null;
+};
+
+/** The two type styles a label is set in; the duration and separator share the lighter one. */
+export type LabelRole = "target" | "duration";
+
+/** Rendered width in pixels of `text` set in the style for `role`. */
+export type LabelMeasure = (text: string, role: LabelRole) => number;
+
+/** Width of a glyph relative to the font size, generous for a sans face with tabular digits. */
+const LABEL_GLYPH_RATIO = 0.62;
+/** Clearance between a label and the block's baseline or top. */
+const LABEL_PADDING_PX = 4;
+/** Clearance between a horizontal label and each side of its column; neighbours end up twice this apart. */
+const LABEL_GUTTER_PX = 2;
+/** Room above the first line's baseline for its cap height. */
+const LABEL_CAP_RATIO = 0.75;
+/** Separator between target and duration when they share one line. */
+export const LABEL_SEPARATOR = " · ";
+
+/**
+ * Fallback measurer for environments without text metrics. It overestimates
+ * on purpose so a label is never drawn where it might not fit.
+ */
+export const estimateLabelWidth =
+  (fontSize: number): LabelMeasure =>
+  (text) =>
+    text.length * fontSize * LABEL_GLYPH_RATIO;
+
+/**
+ * Where to write a block's target and duration, or null when the block has
+ * room for neither. Wide blocks get two horizontal lines; narrow but tall
+ * blocks get a single vertical line, dropping the duration if even that is
+ * too long. Labels never spill outside their own column, so neighbours
+ * cannot collide.
+ */
+export const profileLabel = (
+  shape: ProfileShape,
+  scale: ProfileScale,
+  fontSize: number,
+  measure: LabelMeasure = estimateLabelWidth(fontSize),
+): ProfileLabel | null => {
+  const target = formatIntervalTarget(shape.startWatts, shape.endWatts);
+  const duration = formatDuration(shape.endSeconds - shape.startSeconds);
+  const lineHeight = fontSize * 1.25;
+  const [[, startY], [, endY]] = shape.points;
+  const lowerTop = Math.max(startY, endY);
+  const upperTop = Math.min(startY, endY);
+  const label = { x: shape.x + shape.width / 2, lineHeight, target };
+  const targetWidth = measure(target, "target");
+
+  const widthNeeded = Math.max(targetWidth, measure(duration, "duration")) + LABEL_GUTTER_PX * 2;
+  if (shape.width >= widthNeeded) {
+    const heightNeeded = lineHeight * 2 + fontSize * LABEL_CAP_RATIO + LABEL_PADDING_PX * 2;
+    if (scale.height - lowerTop >= heightNeeded) {
+      return { ...label, duration, placement: "inside", y: scale.height - LABEL_PADDING_PX - lineHeight };
+    }
+    if (upperTop >= heightNeeded) {
+      return { ...label, duration, placement: "above", y: upperTop - LABEL_PADDING_PX - lineHeight };
+    }
+  }
+
+  // Stood on end, the line needs a glyph's height of width and reads upward from the baseline.
+  if (shape.width >= fontSize + 2) {
+    const room = scale.height - lowerTop - LABEL_PADDING_PX * 2;
+    const vertical = { ...label, placement: "vertical" as const, y: scale.height - LABEL_PADDING_PX };
+    if (targetWidth + measure(`${LABEL_SEPARATOR}${duration}`, "duration") <= room) return { ...vertical, duration };
+    if (targetWidth <= room) return { ...vertical, duration: null };
+  }
+  return null;
+};
 
 const tickSpacingsSeconds = [60, 300, 600, 900, 1800, 3600] as const;
 

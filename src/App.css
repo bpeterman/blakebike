@@ -569,6 +569,8 @@ textarea { min-height: 70px; resize: vertical; }
 .workout-profile-hatch { stroke: #7ed5ca; }
 .workout-profile-block[data-kind="freeRide"] { stroke: #3f5a57; stroke-width: 1; }
 .workout-profile-progress { fill: rgba(200,255,50,.35); pointer-events: none; }
+.workout-profile-block-label { fill: #141814; font-variant-numeric: tabular-nums; pointer-events: none; }
+.workout-profile-block-label[data-placement="above"], .workout-profile-block-label[data-kind="freeRide"] { fill: #dfe6d9; }
 .workout-profile-baseline, .workout-profile-tick { stroke: #3a4137; }
 .workout-profile-ftp { stroke: #8f9988; stroke-dasharray: 3 4; }
 .workout-profile-label { fill: #7f887a; font-size: 9px; font-weight: 700; letter-spacing: .06em; }
@@ -589,4 +591,6 @@ textarea { min-height: 70px; resize: vertical; }
 .preview-chart .workout-profile { height: 100%; }
 .workout-timeline .workout-profile-block.completed { opacity: .5; }
 .workout-timeline .workout-profile-block.upcoming { opacity: .7; }
+.workout-timeline .workout-profile-block-label[data-state="completed"] { opacity: .5; }
+.workout-timeline .workout-profile-block-label[data-state="upcoming"] { opacity: .8; }
 .workout-timeline .workout-profile-block.current { opacity: 1; stroke: #c8ff32; stroke-width: 2; }

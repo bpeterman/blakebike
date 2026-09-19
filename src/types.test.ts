@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
+  biasedWatts,
   compileWorkoutIntervals,
   formatDistance,
   formatDuration,
+  formatIntervalTarget,
   formatSpeed,
   derivedHeartRateZones,
   derivedPowerZones,
@@ -19,6 +21,41 @@ import {
 } from "./types";
 
 describe("workout helpers", () => {
+  it("scales targets by bias exactly like the Rust runner", () => {
+    expect(biasedWatts(200, 100)).toBe(200);
+    expect(biasedWatts(200, 105)).toBe(210);
+    expect(biasedWatts(201, 95)).toBe(191); // 190.95 rounds up
+    expect(biasedWatts(1, 50)).toBe(1); // never zero
+    expect(biasedWatts(0, 100)).toBe(1); // ERG treats 0 W as "no target"
+    expect(biasedWatts(200, 500)).toBe(300); // clamped to MAX_BIAS_PERCENT
+    expect(biasedWatts(200, 10)).toBe(100); // clamped to MIN_BIAS_PERCENT
+  });
+
+  it("compiles intervals with the ride's bias applied to every target", () => {
+    const steps: WorkoutStep[] = [
+      { kind: "steady", durationSeconds: 60, target: { unit: "percentFtp", value: 75 } },
+      {
+        kind: "ramp",
+        durationSeconds: 30,
+        start: { unit: "watts", value: 100 },
+        end: { unit: "percentFtp", value: 125 },
+      },
+      { kind: "freeRide", durationSeconds: 15 },
+    ];
+    expect(compileWorkoutIntervals(steps, 200, 110).map(({ startWatts, endWatts }) => [startWatts, endWatts])).toEqual([
+      [165, 165],
+      [110, 275],
+      [null, null],
+    ]);
+    expect(compileWorkoutIntervals(steps, 200, 100)).toEqual(compileWorkoutIntervals(steps, 200));
+  });
+
+  it("formats interval targets for labels and headings", () => {
+    expect(formatIntervalTarget(null, null)).toBe("Free ride");
+    expect(formatIntervalTarget(200, 200)).toBe("200 W");
+    expect(formatIntervalTarget(150, 220)).toBe("150–220 W");
+  });
+
   it("totals nested repeats", () => {
     const steps: WorkoutStep[] = [
       {

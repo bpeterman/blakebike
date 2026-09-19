@@ -90,6 +90,7 @@ import {
   deviceRoles,
   formatDistance,
   formatDuration,
+  formatIntervalTarget,
   formatSpeed,
   normalizeRideDisplayPreferences,
   downsampleTelemetry,
@@ -1033,11 +1034,12 @@ export function Ride({
     powerSmoothing === "instant"
       ? telemetry.powerWatts
       : smoothedHistory[smoothedHistory.length - 1]?.displayPowerWatts ?? telemetry.powerWatts;
+  // Biased like the runner's targets, so the timeline shows what the trainer is asked for.
   const workoutIntervals = useMemo(
     () => activeWorkout
-      ? compileWorkoutIntervals(activeWorkout.steps, profile.ftpWatts)
+      ? compileWorkoutIntervals(activeWorkout.steps, profile.ftpWatts, biasPercent)
       : [],
-    [activeWorkout, profile.ftpWatts],
+    [activeWorkout, profile.ftpWatts, biasPercent],
   );
 
   useEffect(() => {
@@ -1145,6 +1147,7 @@ export function Ride({
       <WorkoutTimeline
         steps={activeWorkout.steps}
         ftpWatts={profile.ftpWatts}
+        biasPercent={biasPercent}
         powerZones={powerZones}
         intervals={workoutIntervals}
         workoutName={runner.workoutName}
@@ -2146,6 +2149,7 @@ function ZoneEditor({
 function WorkoutTimeline({
   steps,
   ftpWatts,
+  biasPercent,
   powerZones,
   intervals,
   workoutName,
@@ -2158,8 +2162,9 @@ function WorkoutTimeline({
 }: {
   steps: WorkoutStep[];
   ftpWatts: number;
+  biasPercent: number;
   powerZones: readonly ZoneDefinition[];
-  /** Runner-aligned intervals; index-for-index the same blocks the profile draws. */
+  /** Runner-aligned, bias-applied intervals; index-for-index the same blocks the profile draws. */
   intervals: WorkoutInterval[];
   workoutName: string;
   currentIndex: number;
@@ -2183,11 +2188,7 @@ function WorkoutTimeline({
   };
   const currentRemaining = Math.max(0, current.durationSeconds - intervalElapsedSeconds);
   const workoutRemaining = Math.max(0, totalSeconds - elapsedSeconds);
-  const currentTarget = current.freeRide
-    ? "Free ride"
-    : current.startWatts === current.endWatts
-      ? `${current.startWatts} W`
-      : `${current.startWatts}–${current.endWatts} W`;
+  const currentTarget = formatIntervalTarget(current.startWatts, current.endWatts);
 
   return (
     <section className="card workout-timeline" aria-label="Workout timeline">
@@ -2219,7 +2220,9 @@ function WorkoutTimeline({
           <WorkoutProfile
             steps={steps}
             ftpWatts={ftpWatts}
+            biasPercent={biasPercent}
             powerZones={powerZones}
+            labels
             segmentState={blockState}
           />
         </div>
