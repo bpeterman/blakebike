@@ -1515,6 +1515,20 @@ type ChartDomain = [number | string, number | string];
 const powerDomain: ChartDomain = [0, "dataMax + 50"];
 const heartRateDomain: ChartDomain = ["dataMin - 10", "dataMax + 10"];
 
+// Recharts' default tooltip is a white box; on the dark theme the lime and
+// pink series values were unreadable on it. Match the modal surface instead
+// and let each series keep its own color for the value.
+const chartTooltipContentStyle = {
+  background: "#1b1f1a",
+  border: "1px solid #373d34",
+  borderRadius: 9,
+  boxShadow: "0 14px 40px rgba(0,0,0,.5)",
+  padding: "8px 12px",
+} as const;
+const chartTooltipLabelStyle = { color: "#c9d0c3", fontSize: 12, marginBottom: 4 } as const;
+const chartTooltipItemStyle = { fontSize: 13, padding: 0 } as const;
+const chartTooltipCursor = { stroke: "#6b7566", strokeWidth: 1 } as const;
+
 const zoneColors = [
   "#6ca8ff",
   "#63d6c6",
@@ -1565,6 +1579,10 @@ const SessionAreaChart = memo(function SessionAreaChart({
         <Tooltip
           labelFormatter={(value) => formatDuration(Math.max(0, Math.round(Number(value) / 1000)))}
           formatter={(value) => [`${value ?? "—"} ${unit}`, name]}
+          contentStyle={chartTooltipContentStyle}
+          labelStyle={chartTooltipLabelStyle}
+          itemStyle={chartTooltipItemStyle}
+          cursor={chartTooltipCursor}
         />
         <Area
           connectNulls={false}
@@ -1600,7 +1618,13 @@ const TimeInZoneChart = memo(function TimeInZoneChart({
         <BarChart data={data} layout="vertical" margin={{ left: 4, right: 12 }}>
           <XAxis type="number" hide />
           <YAxis type="category" dataKey="name" width={58} tick={{ fontSize: 10 }} />
-          <Tooltip formatter={(value) => [formatDuration(Number(value)), "Time"]} />
+          <Tooltip
+            formatter={(value) => [formatDuration(Number(value)), "Time"]}
+            contentStyle={chartTooltipContentStyle}
+            labelStyle={chartTooltipLabelStyle}
+            itemStyle={chartTooltipItemStyle}
+            cursor={{ fill: "rgba(255,255,255,.06)" }}
+          />
           <Bar dataKey="seconds" radius={[0, 4, 4, 0]} isAnimationActive={false}>
             {data.map((entry) => <Cell key={entry.name} fill={entry.fill} />)}
           </Bar>
