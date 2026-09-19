@@ -4,16 +4,17 @@ use std::{
     sync::{Mutex, MutexGuard},
 };
 
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, Duration, TimeZone, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
 use crate::{
+    default_workouts::{DEFAULT_WORKOUTS_VERSION, default_workouts, is_legacy_sample},
     devices::{KnownDevice, SourcePreferences},
     distance::estimate_distance,
     domain::{
-        DistanceSource, DistanceUnit, PowerTarget, Profile, SessionDetail, SessionSummary,
-        Telemetry, WeightUnit, Workout, WorkoutStep,
+        DistanceSource, DistanceUnit, Profile, SessionDetail, SessionSummary, Telemetry,
+        WeightUnit, Workout,
     },
 };
 
@@ -23,6 +24,7 @@ const INTERVALS_API_KEY: &str = "intervals_api_key";
 const TRAINING_ZONES_KEY: &str = "training_zones";
 const RIDE_DISPLAY_PREFERENCES_KEY: &str = "ride_display_preferences";
 const DEV_MODE_KEY: &str = "dev_mode";
+const DEFAULT_WORKOUTS_KEY: &str = "default_workouts_version";
 
 /// How the live power readout is averaged on the ride screens. Stored so the
 /// rider's last choice comes back on the next launch.
@@ -393,14 +395,43 @@ impl Storage {
                 )
                 .map_err(|error| error.to_string())?;
         }
-        let workout_count: u32 = connection
-            .query_row("SELECT COUNT(*) FROM workouts", [], |row| row.get(0))
-            .map_err(|error| error.to_string())?;
         drop(connection);
-        if workout_count == 0 {
-            self.save_workout(&sample_workout())?;
-        }
+        self.seed_default_workouts()?;
         Ok(())
+    }
+
+    /// Installs the built-in library, once per version of it. Existing riders
+    /// get the additions too, dated below whatever they already have so their
+    /// own workouts keep the top of the list.
+    fn seed_default_workouts(&self) -> Result<(), String> {
+        let seeded: u32 = self.setting(DEFAULT_WORKOUTS_KEY)?.unwrap_or(0);
+        if seeded >= DEFAULT_WORKOUTS_VERSION {
+            return Ok(());
+        }
+        let existing = self.workouts()?;
+        for workout in existing.iter().filter(|it| is_legacy_sample(it)) {
+            self.delete_workout(workout.id)?;
+        }
+        let taken: Vec<&str> = existing
+            .iter()
+            .filter(|it| !is_legacy_sample(it))
+            .map(|it| it.name.as_str())
+            .collect();
+        let newest = existing
+            .iter()
+            .filter(|it| !is_legacy_sample(it))
+            .map(|it| it.updated_at)
+            .min()
+            .map(|oldest| oldest - Duration::seconds(1))
+            .unwrap_or_else(Utc::now);
+        for workout in default_workouts(newest) {
+            // A rider who already has a workout by this name keeps theirs.
+            if taken.contains(&workout.name.as_str()) {
+                continue;
+            }
+            self.save_workout(&workout)?;
+        }
+        self.save_setting(DEFAULT_WORKOUTS_KEY, &DEFAULT_WORKOUTS_VERSION)
     }
 
     pub fn profile(&self) -> Result<Profile, String> {
@@ -1091,49 +1122,122 @@ fn parse_date(value: String) -> rusqlite::Result<DateTime<Utc>> {
         })
 }
 
-fn sample_workout() -> Workout {
-    let mut workout = Workout::new(
-        "FTP Builder",
-        vec![
-            WorkoutStep::Ramp {
-                duration_seconds: 300,
-                start: PowerTarget::PercentFtp(45),
-                end: PowerTarget::PercentFtp(70),
-            },
-            WorkoutStep::Repeat {
-                repetitions: 3,
-                steps: vec![
-                    WorkoutStep::Steady {
-                        duration_seconds: 180,
-                        target: PowerTarget::PercentFtp(100),
-                    },
-                    WorkoutStep::Steady {
-                        duration_seconds: 120,
-                        target: PowerTarget::PercentFtp(55),
-                    },
-                ],
-            },
-            WorkoutStep::Ramp {
-                duration_seconds: 300,
-                start: PowerTarget::PercentFtp(65),
-                end: PowerTarget::PercentFtp(40),
-            },
-        ],
-    );
-    workout.description = "A short progressive workout with three threshold efforts.".into();
-    workout
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::default_workouts::legacy_sample_steps;
+    use crate::domain::WorkoutStep;
+
+    fn free_ride(duration_seconds: u32) -> WorkoutStep {
+        WorkoutStep::FreeRide { duration_seconds }
+    }
 
     #[test]
     fn initializes_and_round_trips_workouts() {
         let storage = Storage::in_memory().unwrap();
         let workouts = storage.workouts().unwrap();
-        assert_eq!(workouts.len(), 1);
+        assert_eq!(workouts.len(), default_workouts(Utc::now()).len());
         assert!(storage.workout(workouts[0].id).unwrap().is_some());
+    }
+
+    /// The library list and the home screen both read `updated_at DESC`.
+    #[test]
+    fn a_fresh_library_leads_with_the_ftp_test() {
+        let storage = Storage::in_memory().unwrap();
+        let names: Vec<String> = storage
+            .workouts()
+            .unwrap()
+            .into_iter()
+            .map(|workout| workout.name)
+            .collect();
+        let expected: Vec<String> = default_workouts(Utc::now())
+            .into_iter()
+            .map(|workout| workout.name)
+            .collect();
+        assert_eq!(names, expected);
+    }
+
+    #[test]
+    fn seeding_the_defaults_happens_only_once() {
+        let path = std::env::temp_dir().join(format!("blakebike-{}.sqlite", Uuid::new_v4()));
+        let storage = Storage::open(&path).unwrap();
+        let seeded = storage.workouts().unwrap();
+        let removed = seeded
+            .iter()
+            .find(|workout| workout.name == "Recovery Spin")
+            .unwrap();
+        storage.delete_workout(removed.id).unwrap();
+        drop(storage);
+
+        let reopened = Storage::open(&path).unwrap();
+        assert_eq!(reopened.workouts().unwrap().len(), seeded.len() - 1);
+    }
+
+    #[test]
+    fn upgrading_keeps_the_riders_workouts_on_top_and_drops_the_old_sample() {
+        let path = std::env::temp_dir().join(format!("blakebike-{}.sqlite", Uuid::new_v4()));
+        let storage = Storage::open(&path).unwrap();
+        for workout in storage.workouts().unwrap() {
+            storage.delete_workout(workout.id).unwrap();
+        }
+        storage
+            .save_workout(&Workout::new("FTP Builder", legacy_sample_steps()))
+            .unwrap();
+        storage
+            .save_workout(&Workout::new("Recovery Spin", vec![free_ride(600)]))
+            .unwrap();
+        let mine = Workout::new("Tuesday nights", vec![free_ride(1800)]);
+        storage.save_workout(&mine).unwrap();
+        // Pretend this database predates the built-in library.
+        storage
+            .connection()
+            .unwrap()
+            .execute(
+                "DELETE FROM settings WHERE key = ?1",
+                params![DEFAULT_WORKOUTS_KEY],
+            )
+            .unwrap();
+        drop(storage);
+
+        let reopened = Storage::open(&path).unwrap();
+        let names: Vec<String> = reopened
+            .workouts()
+            .unwrap()
+            .into_iter()
+            .map(|workout| workout.name)
+            .collect();
+        assert!(!names.contains(&"FTP Builder".to_string()));
+        assert_eq!(&names[..2], ["Tuesday nights", "Recovery Spin"]);
+        assert_eq!(names[2], "FTP Test (20 min)");
+        // The rider's own "Recovery Spin" was not duplicated by the default.
+        assert_eq!(
+            names.iter().filter(|name| *name == "Recovery Spin").count(),
+            1
+        );
+        // Both of the rider's workouts, plus every default but the skipped one.
+        assert_eq!(names.len(), default_workouts(Utc::now()).len() + 1);
+    }
+
+    /// An edited copy of the old sample is the rider's work, not ours.
+    #[test]
+    fn upgrading_leaves_an_edited_ftp_builder_alone() {
+        let path = std::env::temp_dir().join(format!("blakebike-{}.sqlite", Uuid::new_v4()));
+        let storage = Storage::open(&path).unwrap();
+        let mut edited = Workout::new("FTP Builder", legacy_sample_steps());
+        edited.steps.push(free_ride(300));
+        storage.save_workout(&edited).unwrap();
+        storage
+            .connection()
+            .unwrap()
+            .execute(
+                "DELETE FROM settings WHERE key = ?1",
+                params![DEFAULT_WORKOUTS_KEY],
+            )
+            .unwrap();
+        drop(storage);
+
+        let reopened = Storage::open(&path).unwrap();
+        assert!(reopened.workout(edited.id).unwrap().is_some());
     }
 
     #[test]

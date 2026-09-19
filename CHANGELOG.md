@@ -22,6 +22,8 @@ Conventions:
 ### Added
 
 - Drag across the power or heart-rate chart in a ride's detail view to highlight a section and see its average, maximum, and minimum power and heart rate. Click the chart, press Clear, or press Escape to dismiss it.
+- The library now starts with nine built-in workouts instead of one sample: an FTP test, endurance rides at 60 and 90 minutes, tempo, sweet spot, threshold, over-unders, a VO2 max session, and a recovery spin. Each one names its structure and leads its description with duration and zone. The FTP test sits at the top, because every other target is a percentage of your FTP.
+- Existing libraries pick up the new workouts too, dated below your own so yours keep the top of the list. A workout of yours that shares a name with a built-in one is left alone, and the old "FTP Builder" sample is removed only if you never edited it.
 - The workout builder shows a live picture of the workout as you edit it: blocks are coloured by power zone, ramps slope, free ride is hatched, and an FTP line, time axis, and repeat brackets show the shape at a glance. A stats strip gives duration, average intensity, estimated training stress, and block count. Hover a block or a row to see its counterpart, and click a block to jump to its row.
 
 ### Changed

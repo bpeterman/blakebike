@@ -103,7 +103,7 @@ impl Workout {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
     tag = "kind",
     rename_all = "camelCase",
@@ -229,7 +229,7 @@ fn validate_duration(duration: u32) -> Result<(), String> {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "unit", content = "value", rename_all = "camelCase")]
 pub enum PowerTarget {
     Watts(u16),
