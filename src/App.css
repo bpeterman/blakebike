@@ -501,6 +501,32 @@ textarea { min-height: 70px; resize: vertical; }
 .device-details dd { margin: 0; color: #d7ddd2; overflow-wrap: anywhere; }
 .device-details code { color: #b9c2b3; font-size: 10px; }
 .readout.hub-log { margin: 0; max-height: 260px; }
+/* Stats for nerds: the opt-in ride card with every device's raw numbers. */
+.nerd-stats { display: grid; gap: 12px; }
+.nerd-stats-note { color: #737b6e; font-size: 11px; }
+.nerd-fusion { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; padding: 12px 14px; border: 1px solid #262b24; border-radius: 10px; background: #12150f; }
+.nerd-fusion-metric { display: grid; gap: 2px; align-content: start; }
+.nerd-fusion-metric strong { font-size: 20px; letter-spacing: -.02em; color: #edf2e8; }
+.nerd-fusion-metric small { color: #8d9587; font-size: 11px; }
+.nerd-fusion .device-details { grid-column: 1 / -1; padding-top: 10px; border-top: 1px solid #262b24; }
+.nerd-devices { display: grid; grid-template-columns: repeat(auto-fit, minmax(270px, 1fr)); gap: 10px; max-height: 460px; overflow-y: auto; }
+.nerd-device { display: grid; gap: 8px; align-content: start; padding: 12px 14px; border: 1px solid #2a2f28; border-radius: 10px; background: #151814; }
+.nerd-device.online { border-color: #3d4d22; }
+.nerd-device.error { border-color: #663c36; }
+.nerd-device header { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: 8px 10px; }
+.nerd-device header .status-chip { flex: 0 1 auto; }
+.nerd-device header div { display: grid; gap: 2px; min-width: 0; }
+.nerd-device header strong { font-size: 14px; letter-spacing: -.01em; overflow-wrap: anywhere; }
+.nerd-device header small { color: #737b6e; font-size: 11px; overflow-wrap: anywhere; }
+.nerd-reading { display: grid; gap: 3px; }
+.nerd-reading strong { font-size: 15px; color: #edf2e8; overflow-wrap: anywhere; }
+.nerd-reading .feeding { color: #b6e935; font-size: 10px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
+.nerd-packet { display: grid; gap: 3px; margin: 0; }
+.nerd-packet span { color: #737b6e; font-size: 9px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+.nerd-packet code { color: #b9c2b3; font-size: 10px; overflow-wrap: anywhere; }
+.nerd-error { margin: 0; color: #ff8a7a; font-size: 11px; }
+.nerd-empty { margin: 0; color: #737b6e; font-size: 11px; }
+
 .readout.hub-log .readout-line { grid-template-columns: 62px 16px auto 1fr; }
 .readout.empty { margin: 0; color: #687061; text-align: center; }
 .sources-card { display: grid; grid-template-columns: .8fr 1.2fr; gap: 40px; margin-top: 16px; padding: 24px; }

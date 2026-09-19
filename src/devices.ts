@@ -3,6 +3,7 @@ import type {
   DeviceInfo,
   DeviceLogLine,
   DeviceRole,
+  DeviceSlot,
   DeviceState,
   KnownConnectOutcome,
   KnownDevice,
@@ -156,4 +157,55 @@ export function formatClock(atMs: number): string {
   return [date.getHours(), date.getMinutes(), date.getSeconds()]
     .map((part) => String(part).padStart(2, "0"))
     .join(":");
+}
+
+export function statusOf(state: DeviceState, reconnectAttempt: number): { text: string; tone: "online" | "busy" | "off" | "error" } {
+  switch (state.status) {
+    case "ready":
+      return { text: "Connected", tone: "online" };
+    case "controlling":
+      return { text: "ERG control", tone: "online" };
+    case "connecting":
+      return { text: "Connecting…", tone: "busy" };
+    case "reconnecting":
+      return {
+        text: reconnectAttempt > 0 ? `Link lost · reconnecting (attempt ${reconnectAttempt})` : "Link lost",
+        tone: "error",
+      };
+    case "scanning":
+      return { text: "Scanning…", tone: "busy" };
+    case "error":
+      return { text: "Error", tone: "error" };
+    default:
+      return { text: "Idle", tone: "off" };
+  }
+}
+
+/** A slot with no device yet, so every role has a card even before a scan. */
+export function emptySlot(role: DeviceRole): DeviceSlot {
+  return {
+    role,
+    state: { status: "idle" },
+    stats: {
+      samples: 0,
+      parseFailures: 0,
+      lastSampleMs: null,
+      rateHz: 0,
+      rssi: null,
+      batteryPercent: null,
+      batteryStatus: null,
+      batteryVoltage: null,
+      manufacturer: null,
+      model: null,
+      firmware: null,
+      connectedSinceMs: null,
+      drops: 0,
+      reconnectAttempt: 0,
+      lastRawHex: null,
+      lastReading: null,
+      calibrationSupported: false,
+      calibrating: false,
+    },
+    log: [],
+  };
 }

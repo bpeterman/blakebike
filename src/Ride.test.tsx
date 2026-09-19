@@ -1,10 +1,13 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Ride } from "./App";
+import { emptySlot } from "./devices";
 import { defaultSourcePreferences } from "./sourcePreferences";
 import {
+  deviceRoles,
   defaultRideDisplayPreferences,
   defaultTrainingZoneSettings,
+  type DevicesSnapshot,
   type Profile,
   type RunnerState,
   type Telemetry,
@@ -76,6 +79,19 @@ const structuredWorkout: Workout = {
   ],
 };
 
+const hub: DevicesSnapshot = {
+  scanning: false,
+  scanError: null,
+  antAdapter: { status: "notAttached" },
+  sourcePreferences: defaultSourcePreferences,
+  sources: {
+    power: { role: "trainer", fallback: false },
+    cadence: { role: "trainer", fallback: false },
+    heartRate: { role: "heartRate", fallback: false },
+  },
+  slots: deviceRoles.map(emptySlot),
+};
+
 afterEach(cleanup);
 
 describe("Ride charts", () => {
@@ -94,6 +110,7 @@ describe("Ride charts", () => {
         onPowerSmoothing={vi.fn()}
         sourcePreferences={defaultSourcePreferences}
         onSourcePreference={vi.fn()}
+        hub={hub}
         profile={profile}
         trainingZones={defaultTrainingZoneSettings}
         displayPreferences={defaultRideDisplayPreferences}
@@ -144,6 +161,7 @@ describe("Ride charts", () => {
       onPowerSmoothing: vi.fn(),
       sourcePreferences: defaultSourcePreferences,
       onSourcePreference: vi.fn(),
+      hub,
       profile,
       trainingZones: defaultTrainingZoneSettings,
       displayPreferences: defaultRideDisplayPreferences,
@@ -210,6 +228,7 @@ describe("Ride charts", () => {
       onPowerSmoothing: vi.fn(),
       sourcePreferences: defaultSourcePreferences,
       onSourcePreference: vi.fn(),
+      hub,
       profile,
       trainingZones: defaultTrainingZoneSettings,
       displayPreferences: defaultRideDisplayPreferences,
@@ -269,6 +288,7 @@ describe("Ride charts", () => {
         onPowerSmoothing={vi.fn()}
         sourcePreferences={defaultSourcePreferences}
         onSourcePreference={vi.fn()}
+        hub={hub}
         profile={profile}
         trainingZones={defaultTrainingZoneSettings}
         displayPreferences={displayPreferences}
@@ -305,6 +325,7 @@ describe("Ride charts", () => {
         onPowerSmoothing={vi.fn()}
         sourcePreferences={defaultSourcePreferences}
         onSourcePreference={vi.fn()}
+        hub={hub}
         profile={profile}
         trainingZones={defaultTrainingZoneSettings}
         displayPreferences={defaultRideDisplayPreferences}
@@ -331,6 +352,7 @@ describe("Ride charts", () => {
         onPowerSmoothing={vi.fn()}
         sourcePreferences={defaultSourcePreferences}
         onSourcePreference={vi.fn()}
+        hub={hub}
         profile={profile}
         trainingZones={defaultTrainingZoneSettings}
         displayPreferences={defaultRideDisplayPreferences}
@@ -352,7 +374,7 @@ describe("Ride charts", () => {
       <Ride workouts={[]} selectedWorkout={null} setSelectedWorkout={vi.fn()} connected
         onConnect={vi.fn()} runner={state} telemetry={telemetry} telemetryHistory={[telemetry]}
         powerSmoothing="instant" onPowerSmoothing={vi.fn()} sourcePreferences={defaultSourcePreferences}
-        onSourcePreference={vi.fn()} profile={profile} trainingZones={defaultTrainingZoneSettings}
+        onSourcePreference={vi.fn()} hub={hub} profile={profile} trainingZones={defaultTrainingZoneSettings}
         displayPreferences={defaultRideDisplayPreferences} perform={async () => undefined} />
     );
     const message = "Ride data is not being saved. Retrying; check available disk space and keep the app open.";
@@ -369,7 +391,7 @@ describe("Ride charts", () => {
     const paused: RunnerState = { ...runner, status: "paused", control: "degraded" };
     const props = { workouts: [], selectedWorkout: null, setSelectedWorkout: vi.fn(), connected: true,
       onConnect: vi.fn(), telemetry, telemetryHistory: [telemetry], powerSmoothing: "instant" as const,
-      onPowerSmoothing: vi.fn(), sourcePreferences: defaultSourcePreferences, onSourcePreference: vi.fn(),
+      onPowerSmoothing: vi.fn(), sourcePreferences: defaultSourcePreferences, onSourcePreference: vi.fn(), hub,
       profile, trainingZones: defaultTrainingZoneSettings, displayPreferences: defaultRideDisplayPreferences,
       perform: async () => undefined };
     const { rerender } = render(<Ride {...props} runner={paused} />);
@@ -379,6 +401,114 @@ describe("Ride charts", () => {
     expect(screen.getByRole("status")).toHaveTextContent("ride clock is paused");
     rerender(<Ride {...props} runner={{ ...paused, control: "ok" }} />);
     expect(screen.queryByRole("status")).not.toBeInTheDocument();
+  });
+
+  it("keeps stats for nerds off by default and shows every device's data when it is on", () => {
+    const now = Date.now();
+    const nerdHub: DevicesSnapshot = {
+      ...hub,
+      sources: {
+        power: { role: "power", fallback: false },
+        cadence: { role: "power", fallback: false },
+        heartRate: { role: "trainer", fallback: true },
+      },
+      slots: [
+        {
+          ...emptySlot("trainer"),
+          state: {
+            status: "controlling",
+            device: { id: "k", name: "KICKR CORE", transport: "ble", simulated: false, rssi: -55, capabilities: ["ftms"] },
+          },
+          stats: {
+            ...emptySlot("trainer").stats,
+            samples: 1_200,
+            parseFailures: 2,
+            drops: 1,
+            rateHz: 2,
+            rssi: -55,
+            manufacturer: "Wahoo",
+            model: "KICKR CORE",
+            firmware: "1.2.3",
+            connectedSinceMs: now - 125_000,
+            lastSampleMs: now - 400,
+            lastRawHex: "44 02 c8 00",
+            lastReading: "200 W · 88 rpm",
+          },
+        },
+        {
+          ...emptySlot("heartRate"),
+          state: { status: "reconnecting", name: "HRM-Pro" },
+          stats: { ...emptySlot("heartRate").stats, drops: 3, reconnectAttempt: 2 },
+        },
+        {
+          ...emptySlot("power"),
+          state: {
+            status: "ready",
+            device: { id: "p", name: "Assioma", transport: "ant", simulated: false, rssi: null, capabilities: ["cyclingPower"] },
+          },
+          stats: { ...emptySlot("power").stats, rateHz: 1, lastReading: "204 W · 90 rpm", lastSampleMs: now - 200 },
+        },
+        emptySlot("cadence"),
+      ],
+    };
+    const displayPreferences = {
+      version: 2 as const,
+      cards: defaultRideDisplayPreferences.cards.map((card) => ({
+        ...card,
+        visible: card.id === "deviceStats",
+      })),
+    };
+    const props = {
+      workouts: [], selectedWorkout: null, setSelectedWorkout: vi.fn(), connected: true,
+      onConnect: vi.fn(), runner, telemetry, telemetryHistory: [telemetry],
+      powerSmoothing: "instant" as const, onPowerSmoothing: vi.fn(),
+      sourcePreferences: defaultSourcePreferences, onSourcePreference: vi.fn(),
+      profile, trainingZones: defaultTrainingZoneSettings, perform: async () => undefined,
+    };
+
+    const { container, rerender } = render(
+      <Ride {...props} hub={nerdHub} displayPreferences={defaultRideDisplayPreferences} />,
+    );
+    expect(screen.queryByText("STATS FOR NERDS")).not.toBeInTheDocument();
+
+    rerender(<Ride {...props} hub={nerdHub} displayPreferences={displayPreferences} />);
+    expect(screen.getByText("STATS FOR NERDS")).toBeInTheDocument();
+    expect(screen.getByText("2 of 4 connected")).toBeInTheDocument();
+
+    // Every device that has one gets a row, with its own link numbers.
+    expect(
+      [...container.querySelectorAll("[data-nerd-device]")].map((row) =>
+        row.getAttribute("data-nerd-device"),
+      ),
+    ).toEqual(["trainer", "heartRate", "power"]);
+    const trainerRow = container.querySelector('[data-nerd-device="trainer"]')!;
+    expect(trainerRow).toHaveTextContent("KICKR CORE");
+    expect(trainerRow).toHaveTextContent("Wahoo · KICKR CORE");
+    expect(trainerRow).toHaveTextContent("fw 1.2.3");
+    expect(trainerRow).toHaveTextContent("200 W · 88 rpm");
+    expect(trainerRow).toHaveTextContent("2.0 Hz");
+    expect(trainerRow).toHaveTextContent("1200");
+    expect(trainerRow).toHaveTextContent("44 02 c8 00");
+    expect(trainerRow).toHaveTextContent("-55 dBm");
+    expect(trainerRow).toHaveTextContent("feeding heart rate");
+    expect(container.querySelector('[data-nerd-device="heartRate"]')).toHaveTextContent(
+      "Link lost · reconnecting (attempt 2)",
+    );
+    expect(container.querySelector('[data-nerd-device="power"]')).toHaveTextContent("feeding power, cadence");
+    expect(screen.getByText("Not connected: cadence sensor.")).toBeInTheDocument();
+
+    // The fusion band names the source of each metric, fallback included.
+    const fusion = container.querySelector(".nerd-fusion")!;
+    expect(fusion).toHaveTextContent("POWER150 Wpower meter");
+    expect(fusion).toHaveTextContent("HEART RATE140 bpmtrainer (fallback)");
+    expect(fusion).toHaveTextContent("Power shown150 W");
+
+    rerender(
+      <Ride {...props} hub={nerdHub} displayPreferences={displayPreferences} powerSmoothing="3s" />,
+    );
+    expect(container.querySelector(".nerd-fusion")).toHaveTextContent(
+      "Power shown150 W · 3 s avg · raw 150 W",
+    );
   });
 
 });

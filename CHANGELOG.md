@@ -19,6 +19,10 @@ Conventions:
 
 ## [Unreleased]
 
+### Added
+
+- A "Stats for nerds" card for the ride screen, showing what every connected device is actually reporting: its live reading, sample rate, last packet, uptime, signal, battery, drops and bad packets, plus which device is feeding power, cadence and heart rate, and whether a metric has fallen back to another device. It also names the roles with nothing connected. Turn it on under Settings → Live ride cards, where it is off by default and can be reordered like any other card.
+
 ## [0.2.0] - 2026-09-19
 
 A live workout preview in the builder, a bigger built-in workout library, ride-history chart statistics, and one-click reconnection for remembered devices.

@@ -2,6 +2,10 @@ import { describe, expect, it } from "vitest";
 import {
   biasedWatts,
   compileWorkoutIntervals,
+  defaultRideDisplayPreferences,
+  normalizeRideDisplayPreferences,
+  rideCardDefaultVisible,
+  rideCardIds,
   formatDistance,
   formatDuration,
   formatIntervalTarget,
@@ -251,5 +255,43 @@ describe("workout helpers", () => {
     ]);
     const aligned = withActiveElapsed(samples, 4);
     expect(aligned[aligned.length - 1].activeElapsedMs).toBe(4000);
+  });
+});
+
+describe("ride display preferences", () => {
+  it("fills a missing card in at its own default, so diagnostics stay off", () => {
+    expect(
+      defaultRideDisplayPreferences.cards.find((card) => card.id === "deviceStats"),
+    ).toEqual({ id: "deviceStats", visible: false });
+    expect(
+      defaultRideDisplayPreferences.cards.every(
+        (card) => card.visible === rideCardDefaultVisible[card.id],
+      ),
+    ).toBe(true);
+
+    // Preferences saved before a card existed: it is appended at its default,
+    // and the rider's own choices are left alone.
+    const saved = normalizeRideDisplayPreferences({
+      version: 2,
+      cards: [{ id: "speed", visible: false }],
+    });
+    expect(saved.cards).toHaveLength(rideCardIds.length);
+    expect(saved.cards[0]).toEqual({ id: "speed", visible: false });
+    expect(saved.cards.find((card) => card.id === "power")?.visible).toBe(true);
+    expect(saved.cards.find((card) => card.id === "deviceStats")?.visible).toBe(false);
+  });
+
+  it("keeps a card the rider turned on, and drops duplicates and unknowns", () => {
+    const chosen = normalizeRideDisplayPreferences({
+      version: 2,
+      cards: [
+        { id: "deviceStats", visible: true },
+        { id: "deviceStats", visible: false },
+        { id: "nonsense" as never, visible: true },
+      ],
+    });
+    expect(chosen.cards[0]).toEqual({ id: "deviceStats", visible: true });
+    expect(chosen.cards).toHaveLength(rideCardIds.length);
+    expect(chosen.cards.filter((card) => card.id === "deviceStats")).toHaveLength(1);
   });
 });

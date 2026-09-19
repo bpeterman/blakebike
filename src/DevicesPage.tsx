@@ -16,6 +16,7 @@ import { api } from "./api";
 import {
   connectAllSummary,
   deviceName,
+  emptySlot,
   formatAge,
   formatClock,
   formatRelativeDate,
@@ -23,6 +24,7 @@ import {
   isConnected,
   knownToDeviceInfo,
   makeAndModel,
+  statusOf,
   transportLabel,
   metricsFedBy,
   readoutMark,
@@ -31,7 +33,6 @@ import type {
   DeviceLogLine,
   DeviceRole,
   DeviceSlot,
-  DeviceState,
   DevicesSnapshot,
   AntAdapterStatus,
   KnownDevice,
@@ -40,6 +41,8 @@ import type {
   TelemetrySources,
 } from "./types";
 import { deviceRoleLabel, deviceRoles } from "./types";
+import { Stat } from "./DeviceStats";
+import { useNowTick } from "./useNowTick";
 import { SourceSelect } from "./SourceSelect";
 import { metricLabel } from "./sourcePreferences";
 
@@ -89,11 +92,7 @@ export function DevicesPage({
   }, [refreshKnown, connectionKey]);
 
   // A one-second clock so uptime and "last sample" ages tick without new events.
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    const timer = window.setInterval(() => setNow(Date.now()), 1000);
-    return () => window.clearInterval(timer);
-  }, []);
+  const now = useNowTick();
 
   const slots = useMemo(() => {
     const byRole = new Map((hub?.slots ?? []).map((slot) => [slot.role, slot]));
@@ -479,15 +478,6 @@ function AntAdapterCard({ adapter }: { adapter: Exclude<AntAdapterStatus, { stat
   );
 }
 
-function Stat({ icon: Icon, label, value }: { icon: typeof Activity; label: string; value: string }) {
-  return (
-    <div className="device-stat">
-      <span><Icon size={13} /> {label}</span>
-      <strong>{value}</strong>
-    </div>
-  );
-}
-
 function LogReadout({ lines }: { lines: DeviceLogLine[] }) {
   if (lines.length === 0) {
     return <div className="readout empty">No activity yet.</div>;
@@ -509,54 +499,4 @@ function LogReadout({ lines }: { lines: DeviceLogLine[] }) {
 function slotDeviceId(slot: DeviceSlot | undefined): string | null {
   const state = slot?.state;
   return state && (state.status === "ready" || state.status === "controlling") ? state.device.id : null;
-}
-
-function statusOf(state: DeviceState, reconnectAttempt: number): { text: string; tone: "online" | "busy" | "off" | "error" } {
-  switch (state.status) {
-    case "ready":
-      return { text: "Connected", tone: "online" };
-    case "controlling":
-      return { text: "ERG control", tone: "online" };
-    case "connecting":
-      return { text: "Connecting…", tone: "busy" };
-    case "reconnecting":
-      return {
-        text: reconnectAttempt > 0 ? `Link lost · reconnecting (attempt ${reconnectAttempt})` : "Link lost",
-        tone: "error",
-      };
-    case "scanning":
-      return { text: "Scanning…", tone: "busy" };
-    case "error":
-      return { text: "Error", tone: "error" };
-    default:
-      return { text: "Idle", tone: "off" };
-  }
-}
-
-function emptySlot(role: DeviceRole): DeviceSlot {
-  return {
-    role,
-    state: { status: "idle" },
-    stats: {
-      samples: 0,
-      parseFailures: 0,
-      lastSampleMs: null,
-      rateHz: 0,
-      rssi: null,
-      batteryPercent: null,
-      batteryStatus: null,
-      batteryVoltage: null,
-      manufacturer: null,
-      model: null,
-      firmware: null,
-      connectedSinceMs: null,
-      drops: 0,
-      reconnectAttempt: 0,
-      lastRawHex: null,
-      lastReading: null,
-      calibrationSupported: false,
-      calibrating: false,
-    },
-    log: [],
-  };
 }

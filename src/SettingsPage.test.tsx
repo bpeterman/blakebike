@@ -235,6 +235,10 @@ describe("Intervals.icu settings", () => {
       />,
     );
 
+    // Stats for nerds is in the list but off until the rider asks for it.
+    const nerdStats = screen.getByRole("checkbox", { name: "Stats for nerds" });
+    expect(nerdStats).not.toBeChecked();
+    fireEvent.click(nerdStats);
     fireEvent.click(screen.getByRole("checkbox", { name: "Power" }));
     fireEvent.click(screen.getByRole("button", { name: "Move Cadence up" }));
     expect(onSaveRideDisplayPreferences).not.toHaveBeenCalled();
@@ -245,6 +249,7 @@ describe("Intervals.icu settings", () => {
         version: 2,
         cards: expect.arrayContaining([
           { id: "power", visible: false },
+          { id: "deviceStats", visible: true },
         ]),
       }),
     );
