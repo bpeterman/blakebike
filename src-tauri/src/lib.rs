@@ -78,6 +78,19 @@ pub fn run() {
                 tracing::error!(error = %error, database = %database_path.display(), "Storage init failed");
                 format!("Could not initialize local storage: {error}")
             })?;
+            // Rides the previous run never closed (crash, kill, power loss) get
+            // their summary from the samples that did make it to disk.
+            match storage.finalize_orphaned_sessions() {
+                Ok(report) => tracing::info!(
+                    finalized = report.finalized,
+                    deleted = report.deleted,
+                    failed = report.failed,
+                    "Unfinished sessions recovered"
+                ),
+                Err(error) => {
+                    tracing::warn!(error = %error, "Could not recover unfinished sessions")
+                }
+            }
             let reconciliation = fit::reconcile_ride_files(&ride_files_dir, &storage);
             tracing::info!(
                 generated = reconciliation.generated,
@@ -98,7 +111,7 @@ pub fn run() {
             }
             app.manage(AppState {
                 devices: Arc::new(devices),
-                runner: Arc::new(WorkoutRunner::default()),
+                runner: Arc::new(WorkoutRunner::new(ride_files_dir.clone())),
                 storage: Arc::new(storage),
                 log_path,
                 ride_files_dir,
@@ -174,6 +187,7 @@ pub fn run() {
             commands::reveal_log_file,
             commands::report_client_error,
             commands::report_client_event,
+            commands::debug_inject_trainer_fault,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

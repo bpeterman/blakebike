@@ -4,12 +4,13 @@ use std::{
     sync::{Mutex, MutexGuard},
 };
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
 use crate::{
     devices::{KnownDevice, SourcePreferences},
+    distance::estimate_distance,
     domain::{
         DistanceSource, DistanceUnit, PowerTarget, Profile, SessionDetail, SessionSummary,
         Telemetry, WeightUnit, Workout, WorkoutStep,
@@ -192,6 +193,37 @@ impl RideDisplayPreferences {
         }
         Self { version: 2, cards }
     }
+}
+
+/// Sample gaps longer than this are pauses (or a dead app) and do not count
+/// as riding time. Mirrors `withActiveElapsed` in the ride charts.
+const MAX_ACTIVE_GAP_MS: i64 = 5_000;
+
+/// Riding time in whole seconds, from the spacing of the recorded samples.
+pub fn active_seconds(samples: &[Telemetry]) -> u32 {
+    let active_ms: i64 = samples
+        .windows(2)
+        .map(|pair| pair[1].timestamp_ms - pair[0].timestamp_ms)
+        .filter(|delta| *delta > 0 && *delta <= MAX_ACTIVE_GAP_MS)
+        .sum();
+    ((active_ms + 500) / 1_000).max(0) as u32
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recovered {
+    /// The session got a summary computed from its samples.
+    Finalized,
+    /// The session had no samples and was removed.
+    Deleted,
+    /// The session was already finished or does not exist.
+    Untouched,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveryReport {
+    pub finalized: usize,
+    pub deleted: usize,
+    pub failed: usize,
 }
 
 pub struct Storage {
@@ -703,6 +735,112 @@ impl Storage {
         Ok(())
     }
 
+    /// Sessions that never got a summary: the app died, or a ride aborted
+    /// before it was closed out.
+    pub fn unfinished_sessions(&self) -> Result<Vec<Uuid>, String> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare("SELECT id FROM sessions WHERE ended_at IS NULL ORDER BY started_at")
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?;
+        let mut ids = Vec::new();
+        for row in rows {
+            let id = row.map_err(|error| error.to_string())?;
+            match Uuid::parse_str(&id) {
+                Ok(id) => ids.push(id),
+                Err(error) => tracing::warn!(%id, %error, "Skipping session with an unreadable id"),
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Close every unfinished session from its recorded samples (startup
+    /// crash recovery). Never fails as a whole; per-session errors are counted.
+    pub fn finalize_orphaned_sessions(&self) -> Result<RecoveryReport, String> {
+        let mut report = RecoveryReport::default();
+        for id in self.unfinished_sessions()? {
+            match self.finalize_orphaned_session(id) {
+                Ok(Recovered::Finalized) => report.finalized += 1,
+                Ok(Recovered::Deleted) => report.deleted += 1,
+                Ok(Recovered::Untouched) => {}
+                Err(error) => {
+                    tracing::warn!(session_id = %id, %error, "Could not recover unfinished session");
+                    report.failed += 1;
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    /// Give one unfinished session the summary `finish_session` would have
+    /// written: riding time from the samples, averages, distance, and
+    /// `ended_at` at the last sample. Sessions without samples are deleted;
+    /// finished sessions are left alone.
+    pub fn finalize_orphaned_session(&self, id: Uuid) -> Result<Recovered, String> {
+        let Some(detail) = self.session(id)? else {
+            return Ok(Recovered::Untouched);
+        };
+        if detail.summary.ended_at.is_some() {
+            return Ok(Recovered::Untouched);
+        }
+        if detail.samples.is_empty() {
+            self.delete_session(id)?;
+            tracing::info!(session_id = %id, "Deleted unfinished session without samples");
+            return Ok(Recovered::Deleted);
+        }
+        let samples = &detail.samples;
+        let mut summary = detail.summary;
+        summary.elapsed_seconds = active_seconds(samples);
+        summary.average_power_watts = (samples
+            .iter()
+            .map(|sample| u64::from(sample.power_watts))
+            .sum::<u64>()
+            / samples.len() as u64) as u16;
+        summary.max_power_watts = samples
+            .iter()
+            .map(|sample| sample.power_watts)
+            .max()
+            .unwrap_or(0);
+        let cadences: Vec<f64> = samples
+            .iter()
+            .filter_map(|sample| sample.cadence_rpm)
+            .map(f64::from)
+            .collect();
+        summary.average_cadence_rpm = (!cadences.is_empty())
+            .then(|| (cadences.iter().sum::<f64>() / cadences.len() as f64) as f32);
+        let estimate = estimate_distance(samples, summary.distance_weight_kg);
+        summary.estimated_distance_meters = estimate.total_meters;
+        summary.distance_source = estimate.source;
+        let last_ms = samples
+            .last()
+            .map(|sample| sample.timestamp_ms)
+            .unwrap_or_default();
+        let ended_at = Utc
+            .timestamp_millis_opt(last_ms)
+            .single()
+            .unwrap_or(summary.started_at)
+            .max(summary.started_at);
+        summary.ended_at = Some(ended_at);
+        summary.completed = false;
+        self.finish_session(&summary)?;
+        tracing::info!(
+            session_id = %id,
+            elapsed_seconds = summary.elapsed_seconds,
+            samples = samples.len(),
+            "Recovered unfinished session"
+        );
+        Ok(Recovered::Finalized)
+    }
+
+    pub fn delete_session(&self, id: Uuid) -> Result<(), String> {
+        self.connection()?
+            .execute("DELETE FROM sessions WHERE id = ?1", [id.to_string()])
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
     pub fn update_session_distance(
         &self,
         id: Uuid,
@@ -1141,6 +1279,86 @@ mod tests {
         assert_eq!(storage.known_devices().unwrap().len(), 1);
         assert_eq!(storage.forget_all_devices().unwrap(), 1);
         assert!(storage.known_devices().unwrap().is_empty());
+    }
+
+    #[test]
+    fn active_seconds_ignores_pause_sized_gaps() {
+        let sample = |timestamp_ms| Telemetry {
+            timestamp_ms,
+            power_watts: 100,
+            ..Telemetry::default()
+        };
+        assert_eq!(active_seconds(&[]), 0);
+        assert_eq!(
+            active_seconds(&[sample(0), sample(1_000), sample(2_000)]),
+            2
+        );
+        // A minute-long hole (a pause, or the app being dead) does not count.
+        assert_eq!(
+            active_seconds(&[sample(0), sample(1_000), sample(61_000), sample(62_000)]),
+            2
+        );
+    }
+
+    #[test]
+    fn unfinished_sessions_are_closed_from_samples_and_empty_ones_removed() {
+        let storage = Storage::in_memory().unwrap();
+        let mut finished = storage.start_session(None, "Done", 84.0).unwrap();
+        finished.ended_at = Some(Utc::now());
+        finished.elapsed_seconds = 7;
+        storage.finish_session(&finished).unwrap();
+        let orphan = storage.start_session(None, "Died", 84.0).unwrap();
+        for (index, watts) in [100_u16, 200, 300].into_iter().enumerate() {
+            storage
+                .record_sample(
+                    orphan.id,
+                    &Telemetry {
+                        timestamp_ms: 1_700_000_000_000 + 1_000 * index as i64,
+                        power_watts: watts,
+                        cadence_rpm: Some(90.0),
+                        speed_kph: Some(30.0),
+                        heart_rate_bpm: None,
+                        target_power_watts: None,
+                    },
+                )
+                .unwrap();
+        }
+        let empty = storage.start_session(None, "Empty", 84.0).unwrap();
+        assert_eq!(storage.unfinished_sessions().unwrap().len(), 2);
+
+        let report = storage.finalize_orphaned_sessions().unwrap();
+        assert_eq!(
+            report,
+            RecoveryReport {
+                finalized: 1,
+                deleted: 1,
+                failed: 0
+            }
+        );
+        let recovered = storage.session(orphan.id).unwrap().unwrap().summary;
+        assert!(recovered.ended_at.is_some());
+        assert!(!recovered.completed);
+        assert_eq!(recovered.elapsed_seconds, 2);
+        assert_eq!(recovered.average_power_watts, 200);
+        assert_eq!(recovered.max_power_watts, 300);
+        assert_eq!(recovered.average_cadence_rpm, Some(90.0));
+        assert!(recovered.estimated_distance_meters > 0.0);
+        assert!(storage.session(empty.id).unwrap().is_none());
+        // Finished rides are never touched.
+        assert_eq!(
+            storage
+                .session(finished.id)
+                .unwrap()
+                .unwrap()
+                .summary
+                .elapsed_seconds,
+            7
+        );
+        assert!(storage.unfinished_sessions().unwrap().is_empty());
+        assert_eq!(
+            storage.finalize_orphaned_sessions().unwrap(),
+            RecoveryReport::default()
+        );
     }
 
     #[test]

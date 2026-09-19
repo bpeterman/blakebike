@@ -1,4 +1,5 @@
 use std::{
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU8, AtomicU16, Ordering},
@@ -8,15 +9,14 @@ use std::{
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter};
 use tokio::{sync::RwLock, task::JoinHandle};
 use uuid::Uuid;
 
 use crate::{
-    AppState,
     devices::DeviceHub,
     distance::estimate_distance,
-    domain::{Interval, SessionSummary, Workout},
+    domain::{Interval, SessionSummary, Telemetry, Workout},
     fit::ensure_ride_file,
     storage::Storage,
 };
@@ -77,7 +77,44 @@ pub enum RunnerState {
     },
     Error {
         message: String,
+        /// The ride that was being recorded; it is finalized and in History.
+        session_id: Option<Uuid>,
     },
+}
+
+/// Running totals kept by the timeline and folded into the session summary.
+#[derive(Debug, Default, Clone, Copy)]
+struct RideStats {
+    elapsed: u32,
+    power_total: u64,
+    max_power: u16,
+    cadence_total: f64,
+    cadence_samples: u32,
+    samples: u32,
+}
+
+impl RideStats {
+    fn record(&mut self, sample: &Telemetry) {
+        self.samples += 1;
+        self.power_total += u64::from(sample.power_watts);
+        self.max_power = self.max_power.max(sample.power_watts);
+        if let Some(cadence) = sample.cadence_rpm {
+            self.cadence_total += f64::from(cadence);
+            self.cadence_samples += 1;
+        }
+    }
+
+    fn apply(&self, summary: &mut SessionSummary) {
+        summary.elapsed_seconds = self.elapsed;
+        summary.average_power_watts = if self.samples == 0 {
+            0
+        } else {
+            (self.power_total / u64::from(self.samples)) as u16
+        };
+        summary.max_power_watts = self.max_power;
+        summary.average_cadence_rpm = (self.cadence_samples > 0)
+            .then_some((self.cadence_total / f64::from(self.cadence_samples)) as f32);
+    }
 }
 
 /// Lock-free knobs shared between the command handlers and the timeline task.
@@ -142,21 +179,28 @@ pub struct WorkoutRunner {
     standalone: Arc<AtomicBool>,
     manual_adjustment_lock: tokio::sync::Mutex<()>,
     worker: tokio::sync::Mutex<Option<JoinHandle<()>>>,
+    /// Where finalized rides are written as FIT files.
+    ride_files_dir: PathBuf,
 }
 
 impl Default for WorkoutRunner {
     fn default() -> Self {
+        Self::new(std::env::temp_dir().join("blakebike-ride-files"))
+    }
+}
+
+impl WorkoutRunner {
+    pub fn new(ride_files_dir: PathBuf) -> Self {
         Self {
             state: Arc::new(RwLock::new(RunnerState::Idle)),
             controls: Controls::default(),
             standalone: Arc::new(AtomicBool::new(false)),
             manual_adjustment_lock: tokio::sync::Mutex::new(()),
             worker: tokio::sync::Mutex::new(None),
+            ride_files_dir,
         }
     }
-}
 
-impl WorkoutRunner {
     pub async fn state(&self) -> RunnerState {
         self.state.read().await.clone()
     }
@@ -164,7 +208,7 @@ impl WorkoutRunner {
     #[allow(clippy::too_many_arguments)]
     pub async fn start(
         &self,
-        app: AppHandle,
+        app: Option<AppHandle>,
         workout: Workout,
         ftp: u16,
         rider_max: u16,
@@ -195,7 +239,7 @@ impl WorkoutRunner {
 
     pub async fn start_free_ride(
         &self,
-        app: AppHandle,
+        app: Option<AppHandle>,
         rider_max: u16,
         distance_weight_kg: f32,
         devices: Arc<DeviceHub>,
@@ -224,7 +268,7 @@ impl WorkoutRunner {
     #[allow(clippy::too_many_arguments)]
     async fn start_ride(
         &self,
-        app: AppHandle,
+        app: Option<AppHandle>,
         ride_name: String,
         workout_id: Option<Uuid>,
         intervals: Vec<Interval>,
@@ -263,19 +307,26 @@ impl WorkoutRunner {
         self.controls
             .bias_percent
             .store(DEFAULT_BIAS_PERCENT, Ordering::Relaxed);
+        // Nothing has been sent to the trainer for this ride yet, so the first
+        // tick always writes its target (see the unchanged-target skip).
+        self.controls.current_target.store(0, Ordering::Relaxed);
         self.standalone.store(standalone, Ordering::Relaxed);
 
         let state = self.state.clone();
         let controls = self.controls.clone();
-        let worker = tokio::spawn(async move {
-            let result = run_timeline(
-                &app,
+        let ride_files_dir = self.ride_files_dir.clone();
+        let supervisor_app = app.clone();
+        let supervisor_state = state.clone();
+        let supervisor_storage = storage.clone();
+        let ride = tokio::spawn(async move {
+            let (stats, outcome) = run_timeline(
+                app.as_ref(),
                 &ride_name,
                 intervals,
                 total_seconds,
                 standalone,
                 rider_max,
-                session,
+                &session,
                 devices.clone(),
                 storage.clone(),
                 state.clone(),
@@ -284,13 +335,47 @@ impl WorkoutRunner {
             .await;
             controls.manual_active.store(false, Ordering::Relaxed);
             controls.planned_active.store(false, Ordering::Relaxed);
-            if let Err(message) = result {
-                tracing::error!(session_id = %session_id, error = %message, "Workout aborted with error");
-                if let Err(error) = devices.stop().await {
-                    tracing::warn!(error = %error, "Could not stop trainer after workout error");
+            let (completed, error) = match outcome {
+                Ok(completed) => (completed, None),
+                Err(message) => {
+                    tracing::error!(session_id = %session_id, error = %message, "Workout aborted with error");
+                    if let Err(error) = devices.stop().await {
+                        tracing::warn!(error = %error, "Could not stop trainer after workout error");
+                    }
+                    (false, Some(message))
                 }
-                *state.write().await = RunnerState::Error { message };
-                emit_state(&app, &state).await;
+            };
+            // Whatever happened, the ride is closed out and lands in History.
+            finish(&storage, &ride_files_dir, session, &stats, completed);
+            *state.write().await = match error {
+                None => RunnerState::Finished {
+                    session_id,
+                    completed,
+                },
+                Some(message) => RunnerState::Error {
+                    message,
+                    session_id: Some(session_id),
+                },
+            };
+            emit_state(app.as_ref(), &state).await;
+        });
+        // If the ride task itself dies (a panic), the session is still closed
+        // from whatever samples were recorded and the UI is told.
+        let worker = tokio::spawn(async move {
+            if let Err(error) = ride.await
+                && error.is_panic()
+            {
+                tracing::error!(session_id = %session_id, "Ride task panicked; finalizing from recorded samples");
+                if let Err(error) = supervisor_storage.finalize_orphaned_session(session_id) {
+                    tracing::error!(session_id = %session_id, error = %error, "Could not finalize ride after panic");
+                }
+                *supervisor_state.write().await = RunnerState::Error {
+                    message:
+                        "The ride stopped unexpectedly; it was saved from its recorded samples"
+                            .into(),
+                    session_id: Some(session_id),
+                };
+                emit_state(supervisor_app.as_ref(), &supervisor_state).await;
             }
         });
         *self.worker.lock().await = Some(worker);
@@ -302,7 +387,7 @@ impl WorkoutRunner {
     /// until the next one starts.
     pub async fn adjust_manual_power(
         &self,
-        app: &AppHandle,
+        app: Option<&AppHandle>,
         delta: i16,
         rider_max: u16,
         devices: &DeviceHub,
@@ -325,7 +410,7 @@ impl WorkoutRunner {
     /// [`Self::adjust_manual_power`].
     pub async fn set_manual_power(
         &self,
-        app: &AppHandle,
+        app: Option<&AppHandle>,
         watts: u16,
         rider_max: u16,
         devices: &DeviceHub,
@@ -343,7 +428,7 @@ impl WorkoutRunner {
     /// (biased) plan. Returns the target now in force.
     pub async fn clear_target_override(
         &self,
-        app: &AppHandle,
+        app: Option<&AppHandle>,
         rider_max: u16,
         devices: &DeviceHub,
     ) -> Result<Option<u16>, String> {
@@ -362,7 +447,7 @@ impl WorkoutRunner {
     /// unless the current interval is overridden or free ride.
     pub async fn set_bias_percent(
         &self,
-        app: &AppHandle,
+        app: Option<&AppHandle>,
         percent: u16,
         rider_max: u16,
         devices: &DeviceHub,
@@ -409,7 +494,7 @@ impl WorkoutRunner {
 
     async fn apply_target(
         &self,
-        app: &AppHandle,
+        app: Option<&AppHandle>,
         requested: u16,
         rider_max: u16,
         devices: &DeviceHub,
@@ -459,7 +544,7 @@ impl WorkoutRunner {
     /// rather than waiting for the next one-second tick.
     async fn reapply_plan(
         &self,
-        app: &AppHandle,
+        app: Option<&AppHandle>,
         rider_max: u16,
         devices: &DeviceHub,
     ) -> Result<Option<u16>, String> {
@@ -532,25 +617,67 @@ impl WorkoutRunner {
         self.controls.manual_active.store(false, Ordering::Relaxed);
         self.controls.planned_active.store(false, Ordering::Relaxed);
         self.controls.clear_override();
-        devices.stop().await?;
+        // The ride is over as far as the timeline is concerned; a trainer that
+        // cannot be told so (link lost, already stopped) is not an error here.
+        if let Err(error) = devices.stop().await {
+            tracing::warn!(error = %error, "Trainer did not acknowledge stop; ride ends anyway");
+        }
         Ok(())
     }
 }
 
+/// Drive the ride to its end. Returns the running totals together with the
+/// outcome: `Ok(completed)` when the ride ended normally (stopped by the
+/// rider or ran to the end), `Err` when something made it impossible to go
+/// on. The caller finalizes the session in every case.
 #[allow(clippy::too_many_arguments)]
 async fn run_timeline(
-    app: &AppHandle,
+    app: Option<&AppHandle>,
     ride_name: &str,
     intervals: Vec<Interval>,
     total_seconds: Option<u32>,
     standalone: bool,
     rider_max: u16,
-    summary: SessionSummary,
+    summary: &SessionSummary,
     devices: Arc<DeviceHub>,
     storage: Arc<Storage>,
     state: Arc<RwLock<RunnerState>>,
     controls: Controls,
-) -> Result<(), String> {
+) -> (RideStats, Result<bool, String>) {
+    let mut stats = RideStats::default();
+    let outcome = timeline_body(
+        app,
+        ride_name,
+        intervals,
+        total_seconds,
+        standalone,
+        rider_max,
+        summary,
+        devices,
+        storage,
+        state,
+        controls,
+        &mut stats,
+    )
+    .await;
+    (stats, outcome)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn timeline_body(
+    app: Option<&AppHandle>,
+    ride_name: &str,
+    intervals: Vec<Interval>,
+    total_seconds: Option<u32>,
+    standalone: bool,
+    rider_max: u16,
+    summary: &SessionSummary,
+    devices: Arc<DeviceHub>,
+    storage: Arc<Storage>,
+    state: Arc<RwLock<RunnerState>>,
+    controls: Controls,
+    stats: &mut RideStats,
+) -> Result<bool, String> {
     let Controls {
         control,
         manual_target,
@@ -560,12 +687,6 @@ async fn run_timeline(
         ..
     } = controls.clone();
     let mut telemetry_rx = devices.subscribe();
-    let mut elapsed = 0_u32;
-    let mut power_total = 0_u64;
-    let mut cadence_total = 0.0_f64;
-    let mut cadence_samples = 0_u32;
-    let mut samples = 0_u32;
-    let mut max_power = 0_u16;
 
     for (interval_index, interval) in intervals.iter().enumerate() {
         // Overrides belong to one interval only; the bias carries across.
@@ -586,29 +707,14 @@ async fn run_timeline(
             session_id = %summary.id,
             interval_index,
             duration_seconds = interval.duration_seconds,
-            elapsed,
+            elapsed = stats.elapsed,
             "Interval started"
         );
         let mut interval_elapsed = 0_u32;
         while interval_elapsed < interval.duration_seconds {
             match control.load(Ordering::Relaxed) {
-                STOPPED => {
-                    finish(
-                        app,
-                        &storage,
-                        &state,
-                        summary,
-                        elapsed,
-                        power_total,
-                        max_power,
-                        cadence_total,
-                        cadence_samples,
-                        samples,
-                        standalone,
-                    )
-                    .await?;
-                    return Ok(());
-                }
+                // A stopped free ride still counts as completed: it has no end.
+                STOPPED => return Ok(standalone),
                 SKIP => {
                     manual_active.store(false, Ordering::Relaxed);
                     planned_active.store(false, Ordering::Relaxed);
@@ -620,7 +726,7 @@ async fn run_timeline(
                     *state.write().await = RunnerState::Paused {
                         session_id: summary.id,
                         workout_name: ride_name.to_string(),
-                        elapsed_seconds: elapsed,
+                        elapsed_seconds: stats.elapsed,
                         total_seconds,
                         interval_index,
                         interval_elapsed_seconds: interval_elapsed,
@@ -653,8 +759,14 @@ async fn run_timeline(
                 controls.planned_effective(planned)
             };
             if let Some(watts) = target {
-                let clamped = devices.set_target_power(watts, rider_max).await?;
-                current_target.store(clamped, Ordering::Relaxed);
+                // Only talk to the trainer when the target moves: every write
+                // costs a control-point round trip (about a second on some
+                // trainers), and re-sending the same value buys nothing.
+                let clamped = devices.clamp_target(watts, rider_max);
+                if current_target.load(Ordering::Relaxed) != clamped {
+                    devices.set_target_power(clamped, rider_max).await?;
+                    current_target.store(clamped, Ordering::Relaxed);
+                }
                 if interval.free_ride {
                     manual_target.store(clamped, Ordering::Relaxed);
                 }
@@ -663,7 +775,7 @@ async fn run_timeline(
             *state.write().await = RunnerState::Running {
                 session_id: summary.id,
                 workout_name: ride_name.to_string(),
-                elapsed_seconds: elapsed,
+                elapsed_seconds: stats.elapsed,
                 total_seconds,
                 interval_index,
                 interval_elapsed_seconds: interval_elapsed,
@@ -682,39 +794,22 @@ async fn run_timeline(
                     Ok(Ok(mut sample)) => {
                         sample.target_power_watts = target;
                         storage.record_sample(summary.id, &sample)?;
-                        samples += 1;
-                        power_total += u64::from(sample.power_watts);
-                        max_power = max_power.max(sample.power_watts);
-                        if let Some(cadence) = sample.cadence_rpm {
-                            cadence_total += f64::from(cadence);
-                            cadence_samples += 1;
-                        }
+                        stats.record(&sample);
                     }
                     Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
                     _ => break,
                 }
             }
-            elapsed += 1;
+            stats.elapsed += 1;
             interval_elapsed += 1;
         }
         manual_active.store(false, Ordering::Relaxed);
         planned_active.store(false, Ordering::Relaxed);
     }
-    devices.stop().await?;
-    finish(
-        app,
-        &storage,
-        &state,
-        summary,
-        elapsed,
-        power_total,
-        max_power,
-        cadence_total,
-        cadence_samples,
-        samples,
-        true,
-    )
-    .await
+    if let Err(error) = devices.stop().await {
+        tracing::warn!(error = %error, "Trainer did not acknowledge stop at the end of the workout");
+    }
+    Ok(true)
 }
 
 fn adjusted_target(current: u16, delta: i16) -> u16 {
@@ -755,54 +850,49 @@ fn target_at(interval: &Interval, elapsed: u32) -> Option<u16> {
     Some((start as f32 + (end as f32 - start as f32) * fraction).round() as u16)
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn finish(
-    app: &AppHandle,
+/// Close the session out: summary row, distance estimate and FIT file. Never
+/// fails; every problem is logged and the startup reconciliation retries the
+/// FIT file.
+fn finish(
     storage: &Storage,
-    state: &Arc<RwLock<RunnerState>>,
+    ride_files_dir: &Path,
     mut summary: SessionSummary,
-    elapsed: u32,
-    power_total: u64,
-    max_power: u16,
-    cadence_total: f64,
-    cadence_samples: u32,
-    samples: u32,
+    stats: &RideStats,
     completed: bool,
-) -> Result<(), String> {
+) {
     summary.ended_at = Some(Utc::now());
-    summary.elapsed_seconds = elapsed;
-    summary.average_power_watts = if samples == 0 {
-        0
-    } else {
-        (power_total / u64::from(samples)) as u16
-    };
-    summary.max_power_watts = max_power;
-    summary.average_cadence_rpm =
-        (cadence_samples > 0).then_some((cadence_total / f64::from(cadence_samples)) as f32);
-    if let Some(detail) = storage.session(summary.id)? {
-        let estimate = estimate_distance(&detail.samples, summary.distance_weight_kg);
-        summary.estimated_distance_meters = estimate.total_meters;
-        summary.distance_source = estimate.source;
+    stats.apply(&mut summary);
+    match storage.session(summary.id) {
+        Ok(Some(detail)) => {
+            let estimate = estimate_distance(&detail.samples, summary.distance_weight_kg);
+            summary.estimated_distance_meters = estimate.total_meters;
+            summary.distance_source = estimate.source;
+        }
+        Ok(None) => {
+            tracing::warn!(session_id = %summary.id, "Ride disappeared before it could be finalized")
+        }
+        Err(error) => {
+            tracing::warn!(session_id = %summary.id, %error, "Could not reload ride samples for the distance estimate")
+        }
     }
     summary.completed = completed;
     tracing::info!(
         session_id = %summary.id,
         completed,
-        elapsed_seconds = elapsed,
-        samples,
+        elapsed_seconds = stats.elapsed,
+        samples = stats.samples,
         average_power_watts = summary.average_power_watts,
         max_power_watts = summary.max_power_watts,
         estimated_distance_meters = summary.estimated_distance_meters,
         distance_source = ?summary.distance_source,
         "Workout finished"
     );
-    storage.finish_session(&summary).map_err(|error| {
-        tracing::error!(session_id = %summary.id, error = %error, "Could not persist session summary");
-        error
-    })?;
-    let ride_files_dir = app.state::<AppState>().ride_files_dir.clone();
+    if let Err(error) = storage.finish_session(&summary) {
+        tracing::error!(session_id = %summary.id, error = %error, "Could not persist session summary; startup recovery will close it");
+        return;
+    }
     match storage.session(summary.id) {
-        Ok(Some(detail)) => match ensure_ride_file(&ride_files_dir, &detail) {
+        Ok(Some(detail)) => match ensure_ride_file(ride_files_dir, &detail) {
             Ok(path) => {
                 tracing::info!(session_id = %summary.id, file = %path.display(), "Ride FIT file saved")
             }
@@ -817,16 +907,12 @@ async fn finish(
             tracing::warn!(session_id = %summary.id, %error, "Could not reload ride for FIT generation")
         }
     }
-    *state.write().await = RunnerState::Finished {
-        session_id: summary.id,
-        completed,
-    };
-    emit_state(app, state).await;
-    Ok(())
 }
 
-async fn emit_state(app: &AppHandle, state: &RwLock<RunnerState>) {
-    let _ = app.emit("workout://state", state.read().await.clone());
+async fn emit_state(app: Option<&AppHandle>, state: &RwLock<RunnerState>) {
+    if let Some(app) = app {
+        let _ = app.emit("workout://state", state.read().await.clone());
+    }
 }
 
 #[cfg(test)]
@@ -967,5 +1053,104 @@ mod tests {
 
         runner.controls.control.store(PAUSED, Ordering::Relaxed);
         assert!(runner.adjustment_mode().is_err());
+    }
+
+    async fn wait_for(
+        runner: &WorkoutRunner,
+        accept: impl Fn(&RunnerState) -> bool,
+    ) -> RunnerState {
+        for _ in 0..200 {
+            let state = runner.state().await;
+            if accept(&state) {
+                return state;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!(
+            "runner never reached the expected state: {:?}",
+            runner.state().await
+        );
+    }
+
+    #[tokio::test]
+    async fn a_control_failure_still_finalizes_the_session() {
+        let hub = Arc::new(DeviceHub::default());
+        hub.connect(
+            crate::devices::DeviceRole::Trainer,
+            crate::devices::trainer::simulated_devices().remove(0),
+        )
+        .await
+        .unwrap();
+        let storage = Arc::new(Storage::in_memory().unwrap());
+        let ride_files = tempfile::tempdir().unwrap();
+        let runner = WorkoutRunner::new(ride_files.path().to_path_buf());
+
+        let session_id = runner
+            .start_free_ride(None, 800, 84.0, hub.clone(), storage.clone())
+            .await
+            .unwrap();
+        // Every control write from here on fails, like a trainer that stopped
+        // acknowledging. Phase 1 still aborts the ride on that; what must hold
+        // is that the session is closed and the UI knows which ride it was.
+        hub.simulated_faults()
+            .fail_writes
+            .store(u32::MAX, Ordering::Relaxed);
+
+        let state = wait_for(&runner, |state| matches!(state, RunnerState::Error { .. })).await;
+        let RunnerState::Error {
+            session_id: reported,
+            ..
+        } = state
+        else {
+            unreachable!()
+        };
+        assert_eq!(reported, Some(session_id));
+        let stored = storage.session(session_id).unwrap().unwrap().summary;
+        assert!(stored.ended_at.is_some(), "session was finalized");
+        assert!(!stored.completed);
+        hub.disconnect().await;
+    }
+
+    #[tokio::test]
+    async fn a_stopped_free_ride_is_finished_and_saved() {
+        let hub = Arc::new(DeviceHub::default());
+        hub.connect(
+            crate::devices::DeviceRole::Trainer,
+            crate::devices::trainer::simulated_devices().remove(0),
+        )
+        .await
+        .unwrap();
+        let storage = Arc::new(Storage::in_memory().unwrap());
+        let ride_files = tempfile::tempdir().unwrap();
+        let runner = WorkoutRunner::new(ride_files.path().to_path_buf());
+
+        let session_id = runner
+            .start_free_ride(None, 800, 84.0, hub.clone(), storage.clone())
+            .await
+            .unwrap();
+        wait_for(&runner, |state| {
+            matches!(state, RunnerState::Running { .. })
+        })
+        .await;
+        runner.stop(&hub).await.unwrap();
+        let state = wait_for(&runner, |state| {
+            matches!(state, RunnerState::Finished { .. })
+        })
+        .await;
+        assert!(matches!(
+            state,
+            RunnerState::Finished {
+                completed: true,
+                ..
+            }
+        ));
+        let stored = storage.session(session_id).unwrap().unwrap().summary;
+        assert!(stored.ended_at.is_some());
+        assert!(stored.completed);
+        assert!(
+            std::fs::read_dir(ride_files.path()).unwrap().count() == 1,
+            "a FIT file was written"
+        );
+        hub.disconnect().await;
     }
 }

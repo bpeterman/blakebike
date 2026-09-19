@@ -760,6 +760,16 @@ impl DeviceHub {
         self.trainer.calibrate().await
     }
 
+    /// The trainer's clamp for a requested target, without sending anything.
+    pub fn clamp_target(&self, requested: u16, rider_max: u16) -> u16 {
+        self.trainer.clamp_target(requested, rider_max)
+    }
+
+    /// Fault-injection knobs of the simulated trainer.
+    pub fn simulated_faults(&self) -> Arc<trainer::SimFaults> {
+        self.trainer.faults()
+    }
+
     pub async fn begin_control(&self) -> Result<(), String> {
         self.trainer.begin_control().await
     }

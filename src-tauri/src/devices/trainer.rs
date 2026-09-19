@@ -4,7 +4,7 @@
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU16, Ordering},
+        atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering},
     },
     time::Duration,
 };
@@ -16,7 +16,7 @@ use btleplug::{
 use chrono::Utc;
 use futures::StreamExt;
 use serde::Serialize;
-use tokio::sync::{Mutex, RwLock, broadcast};
+use tokio::sync::{Mutex, Notify, RwLock, broadcast};
 
 use super::{
     Capability, DeviceInfo, DeviceRole, DeviceSlot, DeviceState,
@@ -56,6 +56,21 @@ pub fn simulated_devices() -> Vec<DeviceInfo> {
     }]
 }
 
+/// Knobs for making the simulated trainer misbehave on purpose, so link loss
+/// and control failures can be exercised without hardware (unit tests and the
+/// debug fault-injection command).
+#[derive(Default)]
+pub struct SimFaults {
+    /// The next N control writes fail as if the GATT write errored
+    /// (`u32::MAX` means every write).
+    pub fail_writes: AtomicU32,
+    /// Ends the simulator's telemetry loop, which is exactly what a real link
+    /// loss looks like from the inside.
+    pub drop_link: Notify,
+    /// Every control payload the simulator has received, oldest first.
+    pub commands: std::sync::Mutex<Vec<(std::time::Instant, Vec<u8>)>>,
+}
+
 pub struct Trainer {
     slot: Arc<DeviceSlot>,
     ble: Arc<Ble>,
@@ -71,6 +86,10 @@ pub struct Trainer {
     calibration_cancel: broadcast::Sender<()>,
     calibration_supported: AtomicBool,
     calibrating: AtomicBool,
+    /// True while the built-in simulator is the connected trainer. Without it
+    /// "no peripheral" would look like a trainer that accepts every command.
+    simulated: Arc<AtomicBool>,
+    faults: Arc<SimFaults>,
 }
 
 impl Trainer {
@@ -93,11 +112,26 @@ impl Trainer {
             calibration_cancel,
             calibration_supported: AtomicBool::new(false),
             calibrating: AtomicBool::new(false),
+            simulated: Arc::new(AtomicBool::new(false)),
+            faults: Arc::new(SimFaults::default()),
         }
     }
 
     pub fn slot(&self) -> &Arc<DeviceSlot> {
         &self.slot
+    }
+
+    /// Fault-injection knobs; only the simulator honors them.
+    pub fn faults(&self) -> Arc<SimFaults> {
+        self.faults.clone()
+    }
+
+    /// What `set_target_power` would send for `requested`, without sending it.
+    pub fn clamp_target(&self, requested: u16, rider_max: u16) -> u16 {
+        requested.clamp(
+            self.min_power.load(Ordering::Relaxed),
+            self.max_power.load(Ordering::Relaxed).min(rider_max),
+        )
     }
 
     pub async fn connect(&self, device: DeviceInfo) -> Result<(), String> {
@@ -419,18 +453,7 @@ impl Trainer {
                     tracing::trace!(uuid = %notification.uuid, raw = ?notification.value, "Other notification");
                 }
             }
-            tracing::warn!(samples, "Notification stream ended; trainer link lost");
-            slot.record_drop();
-            fuser.forget(DeviceRole::Trainer);
-            slot.note(
-                "error",
-                "Link lost",
-                Some(format!("after {samples} samples")),
-            );
-            slot.set_state(DeviceState::Reconnecting {
-                name: reconnect_name,
-            })
-            .await;
+            link_lost(&slot, &fuser, reconnect_name, samples).await;
         });
         self.slot.set_worker(worker).await;
         tracing::debug!("Requesting FTMS control");
@@ -459,6 +482,7 @@ impl Trainer {
                 firmware: Some(env!("CARGO_PKG_VERSION").into()),
             },
         );
+        self.simulated.store(true, Ordering::Relaxed);
         self.slot
             .set_state(DeviceState::Ready {
                 device: device.clone(),
@@ -467,12 +491,20 @@ impl Trainer {
         let target = self.target_power.clone();
         let slot = self.slot.clone();
         let fuser = self.fuser.clone();
+        let faults = self.faults.clone();
+        let simulated = self.simulated.clone();
+        let name = device.name.clone();
         let worker = tokio::spawn(async move {
             let mut power = 90.0_f32;
             let mut tick = tokio::time::interval(Duration::from_millis(500));
             let mut first = true;
+            let mut samples: u64 = 0;
             loop {
-                tick.tick().await;
+                tokio::select! {
+                    _ = tick.tick() => {}
+                    _ = faults.drop_link.notified() => break,
+                }
+                samples += 1;
                 let requested = target.load(Ordering::Relaxed) as f32;
                 power += (requested - power) * 0.18;
                 let elapsed = Utc::now().timestamp_millis() as f32 / 1_000.0;
@@ -497,6 +529,9 @@ impl Trainer {
                     Utc::now().timestamp_millis(),
                 );
             }
+            // A dropped simulator is as gone as a dropped trainer.
+            simulated.store(false, Ordering::Relaxed);
+            link_lost(&slot, &fuser, name, samples).await;
         });
         self.slot.set_worker(worker).await;
     }
@@ -651,10 +686,7 @@ impl Trainer {
         if self.calibrating.load(Ordering::Relaxed) {
             return Err("Cannot change ERG power during trainer calibration".into());
         }
-        let clamped = requested.clamp(
-            self.min_power.load(Ordering::Relaxed),
-            self.max_power.load(Ordering::Relaxed).min(rider_max),
-        );
+        let clamped = self.clamp_target(requested, rider_max);
         if clamped != requested {
             tracing::debug!(requested, clamped, rider_max, "Target power clamped");
         }
@@ -671,7 +703,15 @@ impl Trainer {
     pub async fn stop(&self) -> Result<(), String> {
         tracing::info!("Stopping trainer");
         self.target_power.store(0, Ordering::Relaxed);
-        self.write_control(&stop_or_pause(false)).await
+        match self.write_control(&stop_or_pause(false)).await {
+            // FTMS trainers answer OperationFailed / ControlNotPermitted to a
+            // Stop when they are already stopped, which is the state we want.
+            Err(error) if error.contains("rejected opcode 0x08") => {
+                tracing::debug!(error = %error, "Trainer was already stopped");
+                Ok(())
+            }
+            other => other,
+        }
     }
 
     async fn write_control(&self, payload: &[u8]) -> Result<(), String> {
@@ -695,6 +735,11 @@ impl Trainer {
 
     /// Write one FTMS command while the caller holds `command_lock`.
     async fn write_control_locked(&self, payload: &[u8]) -> Result<Vec<u8>, String> {
+        // Once the link is known to be gone, fail at once instead of letting a
+        // GATT write to a dead handle run into its timeout.
+        if matches!(self.slot.state().await, DeviceState::Reconnecting { .. }) {
+            return Err("Trainer link lost; waiting to reconnect".into());
+        }
         let peripheral = self.peripheral.read().await.clone();
         let control = self.control_point.read().await.clone();
         if let (Some(peripheral), Some(control)) = (peripheral, control) {
@@ -759,12 +804,36 @@ impl Trainer {
             }
             return acknowledgement;
         }
-        // Simulated trainers need no GATT write.
-        Ok(vec![
-            0x80,
-            payload.first().copied().unwrap_or_default(),
-            0x01,
-        ])
+        // No GATT link: either the simulator answers locally, or there is no
+        // trainer at all and the caller must hear that.
+        if !self.simulated.load(Ordering::Relaxed) {
+            return Err("Trainer is not connected".into());
+        }
+        let opcode = payload.first().copied().unwrap_or_default();
+        self.faults
+            .commands
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push((std::time::Instant::now(), payload.to_vec()));
+        let remaining = self.faults.fail_writes.load(Ordering::Relaxed);
+        if remaining > 0 {
+            if remaining != u32::MAX {
+                self.faults
+                    .fail_writes
+                    .store(remaining - 1, Ordering::Relaxed);
+            }
+            tracing::warn!(
+                opcode = format_args!("0x{opcode:02x}"),
+                "Simulated control write failure"
+            );
+            self.slot.note(
+                "error",
+                "Control write failed",
+                Some(format!("op 0x{opcode:02x} · simulated failure")),
+            );
+            return Err("Trainer rejected control command: simulated write failure".into());
+        }
+        Ok(vec![0x80, opcode, 0x01])
     }
 
     pub async fn disconnect(&self) {
@@ -779,6 +848,7 @@ impl Trainer {
         if self.slot.abort_worker().await {
             tracing::debug!("Trainer worker aborted");
         }
+        self.simulated.store(false, Ordering::Relaxed);
         if let Some(peripheral) = self.peripheral.write().await.take() {
             match peripheral.disconnect().await {
                 Ok(()) => tracing::debug!("GATT disconnected"),
@@ -799,6 +869,20 @@ impl Trainer {
             self.slot.set_state(DeviceState::Idle).await;
         }
     }
+}
+
+/// What every trainer worker does when its stream ends: record the drop,
+/// stop feeding the fuser, and mark the slot as needing a reconnect.
+async fn link_lost(slot: &DeviceSlot, fuser: &TelemetryFuser, name: String, samples: u64) {
+    tracing::warn!(samples, "Notification stream ended; trainer link lost");
+    slot.record_drop();
+    fuser.forget(DeviceRole::Trainer);
+    slot.note(
+        "error",
+        "Link lost",
+        Some(format!("after {samples} samples")),
+    );
+    slot.set_state(DeviceState::Reconnecting { name }).await;
 }
 
 /// One-line summary of an Indoor Bike Data sample for the hub card.
@@ -841,9 +925,61 @@ mod tests {
             Arc::new(Ble::disabled()),
             Arc::new(TelemetryFuser::new(None, telemetry)),
         );
+        // Nothing connected: commands must fail, not silently "succeed".
+        assert_eq!(
+            trainer.set_target_power(100, 800).await.unwrap_err(),
+            "Trainer is not connected"
+        );
+        assert_eq!(trainer.clamp_target(900, 800), 800);
+        trainer
+            .connect(simulated_devices().remove(0))
+            .await
+            .unwrap();
         assert_eq!(trainer.set_target_power(100, 800).await.unwrap(), 100);
         assert_eq!(trainer.set_target_power(900, 800).await.unwrap(), 800);
         assert_eq!(trainer.target_power.load(Ordering::Relaxed), 800);
+        trainer.disconnect().await;
+    }
+
+    #[tokio::test]
+    async fn simulated_faults_fail_writes_and_drop_the_link() {
+        let hub = super::super::DeviceHub::default();
+        hub.connect(DeviceRole::Trainer, simulated_devices().remove(0))
+            .await
+            .unwrap();
+        let faults = hub.simulated_faults();
+        faults.fail_writes.store(2, Ordering::Relaxed);
+        assert!(hub.set_target_power(150, 800).await.is_err());
+        assert!(hub.set_target_power(150, 800).await.is_err());
+        assert_eq!(hub.set_target_power(150, 800).await.unwrap(), 150);
+        assert_eq!(
+            faults
+                .commands
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, payload)| payload.first() == Some(&0x05))
+                .count(),
+            3
+        );
+        faults.drop_link.notify_one();
+        for _ in 0..40 {
+            if matches!(
+                hub.slot(DeviceRole::Trainer).state().await,
+                DeviceState::Reconnecting { .. }
+            ) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(matches!(
+            hub.slot(DeviceRole::Trainer).state().await,
+            DeviceState::Reconnecting { .. }
+        ));
+        assert_eq!(hub.slot(DeviceRole::Trainer).stats().drops, 1);
+        // The link is gone, so control writes fail instead of pretending.
+        assert!(hub.set_target_power(150, 800).await.is_err());
+        hub.disconnect().await;
     }
 
     #[tokio::test]

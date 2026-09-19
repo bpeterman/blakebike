@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, atomic::Ordering},
 };
 
 use chrono::Utc;
@@ -446,7 +446,7 @@ pub async fn start_workout(
     state
         .runner
         .start(
-            app,
+            Some(app),
             workout,
             profile.ftp_watts,
             profile.max_power_watts,
@@ -464,7 +464,7 @@ pub async fn start_free_ride(app: AppHandle, state: State<'_, AppState>) -> Resu
     state
         .runner
         .start_free_ride(
-            app,
+            Some(app),
             profile.max_power_watts,
             profile.rider_weight_kg + profile.bike_weight_kg,
             Arc::clone(&state.devices),
@@ -482,7 +482,7 @@ pub async fn adjust_manual_power(
     let profile = state.storage.profile()?;
     state
         .runner
-        .adjust_manual_power(&app, delta, profile.max_power_watts, &state.devices)
+        .adjust_manual_power(Some(&app), delta, profile.max_power_watts, &state.devices)
         .await
 }
 
@@ -495,7 +495,7 @@ pub async fn set_manual_power(
     let profile = state.storage.profile()?;
     state
         .runner
-        .set_manual_power(&app, watts, profile.max_power_watts, &state.devices)
+        .set_manual_power(Some(&app), watts, profile.max_power_watts, &state.devices)
         .await
 }
 
@@ -508,7 +508,7 @@ pub async fn clear_target_override(
     let profile = state.storage.profile()?;
     state
         .runner
-        .clear_target_override(&app, profile.max_power_watts, &state.devices)
+        .clear_target_override(Some(&app), profile.max_power_watts, &state.devices)
         .await
 }
 
@@ -522,7 +522,7 @@ pub async fn set_bias_percent(
     let profile = state.storage.profile()?;
     state
         .runner
-        .set_bias_percent(&app, percent, profile.max_power_watts, &state.devices)
+        .set_bias_percent(Some(&app), percent, profile.max_power_watts, &state.devices)
         .await
 }
 
@@ -688,6 +688,30 @@ pub fn report_client_error(context: String, message: String) {
 #[tauri::command]
 pub fn report_client_event(context: String, message: String) {
     tracing::info!(context = %context, detail = %message, "Frontend event");
+}
+
+/// Make the simulated trainer fail on purpose (debug builds only), so link
+/// loss and control failures can be rehearsed in the running app:
+/// `failWrites` with a count, or `dropLink`.
+#[tauri::command]
+pub fn debug_inject_trainer_fault(
+    state: State<'_, AppState>,
+    kind: String,
+    count: Option<u32>,
+) -> Result<(), String> {
+    if !cfg!(debug_assertions) {
+        return Err("Fault injection is only available in debug builds".into());
+    }
+    let faults = state.devices.simulated_faults();
+    match kind.as_str() {
+        "failWrites" => faults
+            .fail_writes
+            .store(count.unwrap_or(1), Ordering::Relaxed),
+        "dropLink" => faults.drop_link.notify_one(),
+        other => return Err(format!("Unknown trainer fault: {other}")),
+    }
+    tracing::warn!(kind, count, "Injected simulated trainer fault");
+    Ok(())
 }
 
 #[cfg(test)]
