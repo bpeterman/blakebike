@@ -4,7 +4,7 @@ Goal: turn the single-trainer connection flow into a hub that connects a trainer
 
 ## Decisions (confirmed)
 
-- Persistence: remember known devices, connect manually (no background auto-reconnect), with "Forget" per device and "Forget all".
+- Persistence: remember known devices, connect manually at launch, with "Forget" per device and "Forget all". Revised (reliability work): a device that drops out during the session reconnects automatically (fresh targeted scan, growing backoff) for as long as a ride is active, and for a handful of attempts otherwise; a manual Connect or Disconnect cancels the attempt.
 - Per-device data: everything (live value and rate, battery, signal, uptime/drops, device info, raw packets), with battery, signal strength and uptime always visible on every card, and the rest highlighted per role. Trainer: power and target, plus control status (ERG granted, power range). HR: bpm and sensor-contact state. Power meter: watts, whether crank data is present, pedal balance if reported. Cadence: rpm and coasting/stalled state. Device info and raw hex live in the expanded log view.
 - Metric merging: the user picks the source per metric (power, cadence, heart rate) on the Devices page. Default is dedicated-sensor-wins: HR strap over trainer HR; power meter over trainer power; cadence sensor over power-meter crank cadence over trainer cadence. The selection is stored in settings and shown as a selector on each metric. If the chosen source is stale (~3 s, HR 5 s) or disconnected, the fuser falls back down the default order and the UI marks the metric as "falling back to <device>".
 - Placement: a new Devices page. The header connection pill becomes a summary of all four roles and opens the page.

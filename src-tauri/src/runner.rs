@@ -405,6 +405,7 @@ impl WorkoutRunner {
         })?;
         let session = storage.start_session(workout_id, &ride_name, distance_weight_kg)?;
         let session_id = session.id;
+        devices.set_ride_active(true);
         tracing::info!(
             session_id = %session_id,
             workout_id = ?workout_id,
@@ -475,6 +476,7 @@ impl WorkoutRunner {
             {
                 tracing::warn!("Trainer writer did not wind down in time");
             }
+            ride.devices.set_ride_active(false);
             *ride.state.write().await = RunnerState::Finished {
                 session_id,
                 completed,
@@ -1645,6 +1647,7 @@ mod tests {
 
     async fn rig() -> Rig {
         let hub = Arc::new(DeviceHub::default());
+        DeviceHub::spawn_reconnect_supervisors(&hub);
         hub.connect(DeviceRole::Trainer, simulated_devices().remove(0))
             .await
             .unwrap();
@@ -1871,6 +1874,12 @@ mod tests {
             matches!(state, RunnerState::Running { .. })
         })
         .await;
+        // The first three reconnect attempts (at 1 s, 3 s and 8 s) fail, so the
+        // link stays down long enough to exercise riding without a trainer.
+        rig.hub
+            .simulated_faults()
+            .fail_connects
+            .store(3, Ordering::Relaxed);
         rig.hub.simulated_faults().drop_link.notify_one();
         let lost = wait_for(&rig.runner, |state| {
             control_of(state) == Some(ControlStatus::Lost)
@@ -1900,7 +1909,47 @@ mod tests {
         assert_eq!(applied, 105);
         assert!(before.elapsed() < Duration::from_millis(50));
         assert_eq!(rig.runner.controls.intent.borrow().target, Some(105));
+        // The supervisor brings the simulator back; the writer re-acquires
+        // control and applies the target chosen while the link was down.
+        let restored = wait_for(&rig.runner, |state| {
+            control_of(state) == Some(ControlStatus::Ok)
+        })
+        .await;
+        assert!(
+            matches!(
+                restored,
+                RunnerState::Running {
+                    target_power_watts: Some(105),
+                    ..
+                }
+            ),
+            "{restored:?}"
+        );
+        let opcodes: Vec<Vec<u8>> = rig
+            .hub
+            .simulated_faults()
+            .commands
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, payload)| payload.clone())
+            .collect();
+        let start_index = opcodes
+            .iter()
+            .rposition(|payload| payload == &[0x07])
+            .expect("Start/Resume after reconnect");
+        assert!(
+            opcodes[start_index..]
+                .iter()
+                .any(|payload| payload == &[0x05, 105, 0]),
+            "target re-applied after Start/Resume: {opcodes:?}"
+        );
         // Pausing works without a trainer, and the clock freezes.
+        rig.hub.simulated_faults().drop_link.notify_one();
+        wait_for(&rig.runner, |state| {
+            control_of(state) == Some(ControlStatus::Lost)
+        })
+        .await;
         rig.runner.pause_or_resume().await.unwrap();
         let paused = wait_for(&rig.runner, |state| {
             matches!(state, RunnerState::Paused { .. })

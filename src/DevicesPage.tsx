@@ -121,7 +121,7 @@ export function DevicesPage({
               <span className="label">KNOWN DEVICES</span>
               <h2>Connect again with one click</h2>
             </div>
-            <p>Remembered from earlier sessions. Nothing reconnects on its own.</p>
+            <p>Remembered from earlier sessions. A device that drops out reconnects on its own: for as long as a ride is running, otherwise for about a minute.</p>
           </div>
           <div className="known-list">
             {known.map((device) => {
@@ -279,7 +279,7 @@ function DeviceCard({
   const connected = isConnected(slot.state);
   const name = deviceName(slot.state);
   const { stats } = slot;
-  const status = statusOf(slot.state);
+  const status = statusOf(slot.state, stats.reconnectAttempt ?? 0);
   const lastAge = stats.lastSampleMs ? now - stats.lastSampleMs : null;
   const stale = connected && lastAge !== null && lastAge > 5000;
 
@@ -422,7 +422,7 @@ function slotDeviceId(slot: DeviceSlot | undefined): string | null {
   return state && (state.status === "ready" || state.status === "controlling") ? state.device.id : null;
 }
 
-function statusOf(state: DeviceState): { text: string; tone: "online" | "busy" | "off" | "error" } {
+function statusOf(state: DeviceState, reconnectAttempt: number): { text: string; tone: "online" | "busy" | "off" | "error" } {
   switch (state.status) {
     case "ready":
       return { text: "Connected", tone: "online" };
@@ -431,7 +431,10 @@ function statusOf(state: DeviceState): { text: string; tone: "online" | "busy" |
     case "connecting":
       return { text: "Connecting…", tone: "busy" };
     case "reconnecting":
-      return { text: "Link lost", tone: "error" };
+      return {
+        text: reconnectAttempt > 0 ? `Link lost · reconnecting (attempt ${reconnectAttempt})` : "Link lost",
+        tone: "error",
+      };
     case "scanning":
       return { text: "Scanning…", tone: "busy" };
     case "error":
@@ -457,6 +460,7 @@ function emptySlot(role: DeviceRole): DeviceSlot {
       firmware: null,
       connectedSinceMs: null,
       drops: 0,
+      reconnectAttempt: 0,
       lastRawHex: null,
       lastReading: null,
       calibrationSupported: false,

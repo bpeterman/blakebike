@@ -14,11 +14,12 @@ pub mod sensor;
 pub mod trainer;
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
 
 use chrono::Utc;
@@ -140,6 +141,8 @@ pub struct SlotStats {
     pub connected_since_ms: Option<i64>,
     /// Link losses since the app started.
     pub drops: u32,
+    /// Which automatic reconnect attempt is in progress (0 when none).
+    pub reconnect_attempt: u32,
     pub last_raw_hex: Option<String>,
     /// Human summary of the latest decoded reading, e.g. "215 W · 88 rpm".
     pub last_reading: Option<String>,
@@ -409,6 +412,17 @@ impl DeviceSlot {
         inner.window.clear();
     }
 
+    pub async fn set_reconnect_attempt(&self, attempt: u32) {
+        {
+            let mut inner = self
+                .stats
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            inner.stats.reconnect_attempt = attempt;
+        }
+        self.emit("devices://slot", self.snapshot().await);
+    }
+
     pub fn record_drop(&self) {
         let mut inner = self
             .stats
@@ -465,6 +479,55 @@ fn refresh_rate(inner: &mut StatsInner, now: i64) {
     };
 }
 
+/// Backoff between automatic reconnect attempts; the last entry repeats.
+const RECONNECT_BACKOFF: [Duration; 6] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+    Duration::from_secs(10),
+    Duration::from_secs(20),
+    Duration::from_secs(30),
+];
+/// Attempts made when no ride is active before giving up and leaving the
+/// slot in an error state with a Reconnect button. During a ride the
+/// supervisor never gives up.
+const RECONNECT_IDLE_ATTEMPTS: u32 = 6;
+
+/// What the reconnect supervisor knows about one role: the device to go back
+/// to, and a generation counter that a manual connect or disconnect bumps to
+/// cancel any reconnect episode in progress.
+struct RoleLink {
+    last_device: std::sync::Mutex<Option<DeviceInfo>>,
+    generation: watch::Sender<u64>,
+}
+
+impl RoleLink {
+    fn new() -> Self {
+        Self {
+            last_device: std::sync::Mutex::new(None),
+            generation: watch::Sender::new(0),
+        }
+    }
+
+    fn last_device(&self) -> Option<DeviceInfo> {
+        self.last_device
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn set_last_device(&self, device: Option<DeviceInfo>) {
+        *self
+            .last_device
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = device;
+    }
+
+    fn bump(&self) {
+        self.generation.send_modify(|generation| *generation += 1);
+    }
+}
+
 /// Owns every slot, the Bluetooth adapter and the fused telemetry stream.
 pub struct DeviceHub {
     ble: Arc<ble::Ble>,
@@ -479,6 +542,10 @@ pub struct DeviceHub {
     /// Serializes connects: BlueZ misbehaves when several GATT connections
     /// start at once or while a scan is running.
     connect_lock: Mutex<()>,
+    links: HashMap<DeviceRole, RoleLink>,
+    /// Set by the runner while a ride is in progress; the reconnect
+    /// supervisor never gives up while it is true.
+    ride_active: AtomicBool,
 }
 
 impl Default for DeviceHub {
@@ -531,6 +598,32 @@ impl DeviceHub {
             telemetry,
             fuser,
             connect_lock: Mutex::new(()),
+            links: DeviceRole::ALL
+                .into_iter()
+                .map(|role| (role, RoleLink::new()))
+                .collect(),
+            ride_active: AtomicBool::new(false),
+        }
+    }
+
+    fn link(&self, role: DeviceRole) -> &RoleLink {
+        &self.links[&role]
+    }
+
+    pub fn set_ride_active(&self, active: bool) {
+        self.ride_active.store(active, Ordering::Relaxed);
+    }
+
+    pub fn ride_active(&self) -> bool {
+        self.ride_active.load(Ordering::Relaxed)
+    }
+
+    /// Start one reconnect supervisor per role. They live as long as the
+    /// runtime and re-arm on every successful connect made in this session.
+    pub fn spawn_reconnect_supervisors(hub: &Arc<Self>) {
+        for role in DeviceRole::ALL {
+            let hub = hub.clone();
+            tokio::spawn(async move { reconnect_supervisor(hub, role).await });
         }
     }
 
@@ -650,7 +743,23 @@ impl DeviceHub {
     }
 
     pub async fn connect(&self, role: DeviceRole, device: DeviceInfo) -> Result<(), String> {
+        // A manual connect supersedes any automatic reconnect in progress.
+        self.link(role).bump();
+        self.connect_inner(role, device).await
+    }
+
+    async fn connect_inner(&self, role: DeviceRole, device: DeviceInfo) -> Result<(), String> {
         let _serialized = self.connect_lock.lock().await;
+        if self
+            .slot(role)
+            .state()
+            .await
+            .device()
+            .is_some_and(|connected| connected.id == device.id)
+        {
+            tracing::info!(?role, name = %device.name, "Already connected; nothing to do");
+            return Ok(());
+        }
         if !device.simulated
             && !device.capabilities.is_empty()
             && !device
@@ -725,12 +834,17 @@ impl DeviceHub {
         } else {
             device
         };
-        match role {
-            DeviceRole::Trainer => self.trainer.connect(device).await,
-            DeviceRole::HeartRate => self.heart_rate.connect(device).await,
-            DeviceRole::Power => self.power.connect(device).await,
-            DeviceRole::Cadence => self.cadence.connect(device).await,
+        let result = match role {
+            DeviceRole::Trainer => self.trainer.connect(device.clone()).await,
+            DeviceRole::HeartRate => self.heart_rate.connect(device.clone()).await,
+            DeviceRole::Power => self.power.connect(device.clone()).await,
+            DeviceRole::Cadence => self.cadence.connect(device.clone()).await,
+        };
+        if result.is_ok() {
+            // Remember what to go back to if the link drops.
+            self.link(role).set_last_device(Some(device));
         }
+        result
     }
 
     /// Build the record to remember after a successful connect: the device as
@@ -752,6 +866,12 @@ impl DeviceHub {
     }
 
     pub async fn disconnect_role(&self, role: DeviceRole) {
+        // Cancel any reconnect episode, forget the device, and let an
+        // in-flight attempt finish before tearing the link down (aborting a
+        // connect midway can leave a GATT link nobody owns).
+        self.link(role).bump();
+        self.link(role).set_last_device(None);
+        let _serialized = self.connect_lock.lock().await;
         match role {
             DeviceRole::Trainer => self.trainer.disconnect().await,
             DeviceRole::HeartRate => self.heart_rate.disconnect().await,
@@ -815,9 +935,195 @@ impl DeviceHub {
     }
 }
 
+/// Watches one role for link loss and brings the device back: fresh targeted
+/// scan, growing backoff, forever while a ride is active and for a handful of
+/// attempts otherwise. A manual connect or disconnect cancels it.
+async fn reconnect_supervisor(hub: Arc<DeviceHub>, role: DeviceRole) {
+    let slot = hub.slot(role).clone();
+    let mut state_rx = slot.subscribe_state();
+    loop {
+        if state_rx
+            .wait_for(|state| matches!(state, DeviceState::Reconnecting { .. }))
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let Some(device) = hub.link(role).last_device() else {
+            continue;
+        };
+        let generation = *hub.link(role).generation.borrow();
+        let mut cancel_rx = hub.link(role).generation.subscribe();
+        tracing::info!(?role, name = %device.name, "Link lost; automatic reconnect armed");
+        hub.ble.forget_peripheral(&device.id).await;
+        let mut attempt: u32 = 0;
+        loop {
+            attempt += 1;
+            if !hub.ride_active() && attempt > RECONNECT_IDLE_ATTEMPTS {
+                tracing::warn!(
+                    ?role,
+                    attempts = attempt - 1,
+                    "Giving up on automatic reconnect"
+                );
+                slot.note("warn", "Automatic reconnect gave up", None);
+                slot.set_state(DeviceState::Error {
+                    message: format!("{} link lost", device.name),
+                    guidance: "Wake the device and press Reconnect.".into(),
+                })
+                .await;
+                break;
+            }
+            let delay = RECONNECT_BACKOFF[(attempt as usize - 1).min(RECONNECT_BACKOFF.len() - 1)];
+            slot.set_reconnect_attempt(attempt).await;
+            slot.note(
+                "info",
+                "Reconnect scheduled",
+                Some(format!("attempt #{attempt} in {}s", delay.as_secs())),
+            );
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                _ = cancel_rx.wait_for(|current| *current != generation) => {}
+            }
+            if *hub.link(role).generation.borrow() != generation {
+                tracing::info!(?role, "Automatic reconnect cancelled");
+                break;
+            }
+            slot.note("info", "Reconnect attempt", Some(format!("#{attempt}")));
+            match hub.connect_inner(role, device.clone()).await {
+                Ok(()) => {
+                    tracing::info!(?role, name = %device.name, attempt, "Automatic reconnect succeeded");
+                    break;
+                }
+                Err(error) => {
+                    tracing::warn!(?role, attempt, error = %error, "Automatic reconnect attempt failed");
+                    if *hub.link(role).generation.borrow() != generation {
+                        break;
+                    }
+                    // Keep the card on "Link lost" between attempts.
+                    slot.set_state(DeviceState::Reconnecting {
+                        name: device.name.clone(),
+                    })
+                    .await;
+                }
+            }
+        }
+        slot.set_reconnect_attempt(0).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn wait_until(check: impl AsyncFn() -> bool) {
+        for _ in 0..6_000 {
+            if check().await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("condition never became true");
+    }
+
+    fn reconnect_attempts(hub: &DeviceHub, role: DeviceRole) -> usize {
+        hub.slot(role)
+            .log_lines()
+            .iter()
+            .filter(|line| line.step == "Reconnect attempt")
+            .count()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_simulator_reconnects_on_its_own() {
+        let hub = Arc::new(DeviceHub::default());
+        DeviceHub::spawn_reconnect_supervisors(&hub);
+        hub.connect(DeviceRole::Trainer, trainer::simulated_devices().remove(0))
+            .await
+            .unwrap();
+        hub.simulated_faults().drop_link.notify_one();
+        wait_until(async || {
+            matches!(
+                hub.slot(DeviceRole::Trainer).state().await,
+                DeviceState::Reconnecting { .. }
+            )
+        })
+        .await;
+        wait_until(async || hub.slot(DeviceRole::Trainer).state().await.is_connected()).await;
+        assert_eq!(reconnect_attempts(&hub, DeviceRole::Trainer), 1);
+        assert_eq!(hub.slot(DeviceRole::Trainer).stats().reconnect_attempt, 0);
+        hub.disconnect().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn manual_disconnect_cancels_an_automatic_reconnect() {
+        let hub = Arc::new(DeviceHub::default());
+        DeviceHub::spawn_reconnect_supervisors(&hub);
+        hub.connect(DeviceRole::Trainer, trainer::simulated_devices().remove(0))
+            .await
+            .unwrap();
+        let faults = hub.simulated_faults();
+        faults.fail_connects.store(u32::MAX, Ordering::Relaxed);
+        faults.drop_link.notify_one();
+        wait_until(async || reconnect_attempts(&hub, DeviceRole::Trainer) >= 2).await;
+        hub.disconnect_role(DeviceRole::Trainer).await;
+        assert!(matches!(
+            hub.slot(DeviceRole::Trainer).state().await,
+            DeviceState::Idle
+        ));
+        let attempts = reconnect_attempts(&hub, DeviceRole::Trainer);
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        assert_eq!(reconnect_attempts(&hub, DeviceRole::Trainer), attempts);
+        assert!(matches!(
+            hub.slot(DeviceRole::Trainer).state().await,
+            DeviceState::Idle
+        ));
+        faults.fail_connects.store(0, Ordering::Relaxed);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_gives_up_when_idle_but_not_during_a_ride() {
+        let hub = Arc::new(DeviceHub::default());
+        DeviceHub::spawn_reconnect_supervisors(&hub);
+        hub.connect(DeviceRole::Trainer, trainer::simulated_devices().remove(0))
+            .await
+            .unwrap();
+        let faults = hub.simulated_faults();
+        faults.fail_connects.store(u32::MAX, Ordering::Relaxed);
+        // Idle: a handful of attempts, then an error with a Reconnect button.
+        faults.drop_link.notify_one();
+        wait_until(async || {
+            matches!(
+                hub.slot(DeviceRole::Trainer).state().await,
+                DeviceState::Error { .. }
+            )
+        })
+        .await;
+        assert_eq!(
+            reconnect_attempts(&hub, DeviceRole::Trainer) as u32,
+            RECONNECT_IDLE_ATTEMPTS
+        );
+        // During a ride: keeps trying well past that.
+        faults.fail_connects.store(0, Ordering::Relaxed);
+        hub.connect(DeviceRole::Trainer, trainer::simulated_devices().remove(0))
+            .await
+            .unwrap();
+        hub.set_ride_active(true);
+        faults.fail_connects.store(u32::MAX, Ordering::Relaxed);
+        faults.drop_link.notify_one();
+        wait_until(async || {
+            reconnect_attempts(&hub, DeviceRole::Trainer) as u32 >= RECONNECT_IDLE_ATTEMPTS + 3
+        })
+        .await;
+        assert!(matches!(
+            hub.slot(DeviceRole::Trainer).state().await,
+            DeviceState::Reconnecting { .. }
+        ));
+        // The trainer comes back: the next attempt succeeds.
+        faults.fail_connects.store(0, Ordering::Relaxed);
+        wait_until(async || hub.slot(DeviceRole::Trainer).state().await.is_connected()).await;
+        hub.set_ride_active(false);
+        hub.disconnect().await;
+    }
 
     #[tokio::test]
     async fn starts_idle_everywhere() {

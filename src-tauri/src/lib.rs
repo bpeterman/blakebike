@@ -109,8 +109,16 @@ pub fn run() {
                     tracing::warn!(error = %error, "Could not load telemetry source preferences; using Auto")
                 }
             }
+            let devices = Arc::new(devices);
+            {
+                // Supervisors need a runtime; Tauri's is a tokio runtime.
+                let hub = devices.clone();
+                tauri::async_runtime::spawn(async move {
+                    DeviceHub::spawn_reconnect_supervisors(&hub);
+                });
+            }
             app.manage(AppState {
-                devices: Arc::new(devices),
+                devices,
                 runner: Arc::new(WorkoutRunner::new(ride_files_dir.clone())),
                 storage: Arc::new(storage),
                 log_path,
