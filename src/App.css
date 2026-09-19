@@ -341,17 +341,26 @@ textarea { min-height: 70px; resize: vertical; }
 .add-steps svg { width: 13px; }
 .editor-actions { justify-content: end; margin-top: 18px; }
 .detail-modal { width: min(760px, 95vw); }
+.detail-header { display: grid; grid-template-columns: minmax(140px, 1fr) auto; align-items: end; gap: 24px; padding-right: 34px; }
+.detail-header p { margin-bottom: 0; }
+.detail-action-block { max-width: 445px; }
 .detail-metrics { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin: 20px 0 8px; padding: 14px; border-radius: 9px; background: #222620; }
 .distance-note { margin: 0 0 14px; color: #7f887a; font-size: 11px; }
-.detail-actions { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 15px; }
+.detail-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 9px; }
 .history-charts { display: grid; gap: 4px; }
 .history-charts h3 { margin: 12px 0 0; font-size: 14px; }
 .history-zone-charts { margin: 14px 0 4px; }
 .history-zone-charts .zone-chart h3 { margin-top: 2px; }
-.handoff-note { margin: 10px 0 0; color: #7f887a; font-size: 11px; }
+.handoff-note { margin: 8px 0 0; color: #7f887a; font-size: 11px; text-align: right; }
 
 .toast { position: fixed; z-index: 80; right: 25px; bottom: 25px; display: flex; align-items: center; gap: 14px; max-width: 430px; padding: 12px 14px; border-radius: 9px; box-shadow: 0 15px 40px rgba(0,0,0,.4); font-size: 12px; }
-.toast button { display: grid; place-items: center; padding: 0; border: 0; color: inherit; background: transparent; }
+.toast > button { display: grid; place-items: center; padding: 0; border: 0; color: inherit; background: transparent; }
+.post-ride-prompt { width: min(520px, calc(100vw - 50px)); max-width: 520px; align-items: center; }
+.post-ride-copy { display: grid; flex: 1; gap: 3px; }
+.post-ride-copy span { color: #aeb8a2; }
+.post-ride-actions { display: flex; align-items: center; gap: 8px; }
+.post-ride-actions .primary { white-space: nowrap; }
+.post-ride-actions .icon-button { width: 34px; height: 34px; color: inherit; }
 .error-toast { border: 1px solid #683d38; color: #ffc0b9; background: #2c1e1c; }
 .success-toast { border: 1px solid #4c6125; color: #d9ff70; background: #222b19; }
 .loading { min-height: 100vh; display: grid; place-items: center; color: #9aa394; background: #10120f; }
@@ -370,6 +379,14 @@ textarea { min-height: 70px; resize: vertical; }
   .timeline-heading { align-items: start; }
   .timeline-countdowns { gap: 18px; }
   .zone-chart-grid { grid-template-columns: 1fr; }
+  .detail-header { grid-template-columns: 1fr; align-items: start; gap: 14px; }
+  .detail-actions { justify-content: flex-start; }
+  .handoff-note { text-align: left; }
+}
+
+@media (max-width: 620px) {
+  .post-ride-prompt { align-items: stretch; flex-direction: column; }
+  .post-ride-actions { justify-content: space-between; }
 }
 
 /* Connecting spinner + live technical readout in the trainer picker */

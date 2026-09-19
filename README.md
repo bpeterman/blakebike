@@ -25,7 +25,7 @@ platform.
 On Ubuntu/Pop!_OS:
 
 ```sh
-sudo apt install libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev \
+sudo apt install libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev \
   patchelf libdbus-1-dev pkg-config
 ```
 

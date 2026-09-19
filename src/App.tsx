@@ -93,9 +93,15 @@ import { TrainerCalibrationModal } from "./TrainerCalibrationModal";
 import { isConnected as slotConnected, sourceNote } from "./devices";
 import { SourceSelect } from "./SourceSelect";
 import { defaultSourcePreferences, withSourcePreference } from "./sourcePreferences";
+import { shouldPromptForPostRide } from "./postRide";
 import "./App.css";
 
 type Page = "home" | "workouts" | "devices" | "ride" | "history" | "settings";
+
+type PostRidePromptState = {
+  sessionId: string;
+  errorMessage: string | null;
+};
 
 const LOG_LINES_KEPT = 200;
 
@@ -132,6 +138,8 @@ function App() {
   const [selectedSession, setSelectedSession] = useState<SessionDetail | null>(
     null,
   );
+  const [postRidePrompt, setPostRidePrompt] =
+    useState<PostRidePromptState | null>(null);
   const importRef = useRef<HTMLInputElement>(null);
   const runnerRef = useRef<RunnerState>(runner);
   const liveSessionRef = useRef<string | null>(null);
@@ -228,6 +236,7 @@ function App() {
       }
     }));
     track(api.onRunnerState((state) => {
+      const previousState = runnerRef.current;
       setRunner(state);
       runnerRef.current = state;
       if (
@@ -240,6 +249,12 @@ function App() {
       }
       if (state.status === "finished" || state.status === "error") {
         void api.sessions().then(setSessions);
+      }
+      if (shouldPromptForPostRide(previousState, state)) {
+        setPostRidePrompt({
+          sessionId: state.sessionId,
+          errorMessage: state.status === "error" ? state.message : null,
+        });
       }
     }));
     // Devices hub: whole-slot updates on state/stats changes, plus individual
@@ -313,6 +328,16 @@ function App() {
     setHub((current) => current ? { ...current, sourcePreferences: next } : current);
     void perform(() => api.saveSourcePreferences(next), "save source preferences");
   };
+
+  const openSession = useCallback(async (sessionId: string) => {
+    await perform(async () => {
+      const session = await api.session(sessionId);
+      if (!session) throw new Error("The saved ride could not be found");
+      setSelectedSession(session);
+      setPage("history");
+      setPostRidePrompt(null);
+    }, "open session");
+  }, [perform]);
 
   const openRide = (workoutId: string) => {
     setSelectedWorkout(workoutId);
@@ -497,9 +522,7 @@ function App() {
             profile={profile}
             trainingZones={trainingZones}
             onSelect={(session) =>
-              void perform(async () =>
-                setSelectedSession(await api.session(session.id)),
-              "open session")
+              void openSession(session.id)
             }
             onClose={() => setSelectedSession(null)}
             onExport={(session) =>
@@ -556,6 +579,13 @@ function App() {
           <span>{notice}</span>
           <button onClick={() => setNotice(null)} aria-label="Dismiss notification"><X size={17} /></button>
         </div>
+      )}
+      {postRidePrompt && (
+        <PostRidePrompt
+          errorMessage={postRidePrompt.errorMessage}
+          onView={() => void openSession(postRidePrompt.sessionId)}
+          onDismiss={() => setPostRidePrompt(null)}
+        />
       )}
       {devicePicker && (
         <DevicePicker
@@ -1165,12 +1195,10 @@ export function Ride({
           </div>
         </section>
       )}
-      {runner.status === "finished" && <div className="toast success-toast">Ride saved to history.</div>}
-      {runner.status === "error" && (
+      {runner.status === "error" && runner.sessionId === null && (
         <div className="toast error-toast" role="alert">
           <span>
             Ride ended: {runner.message}.
-            {runner.sessionId ? " Your ride was saved to History." : ""}
           </span>
         </div>
       )}
@@ -1179,28 +1207,6 @@ export function Ride({
 }
 
 function HistoryPage({ sessions, selected, profile, trainingZones, onSelect, onClose, onExport, onExportFit, onGarmin }: { sessions: SessionSummary[]; selected: SessionDetail | null; profile: Profile; trainingZones: TrainingZoneSettings; onSelect: (session: SessionSummary) => void; onClose: () => void; onExport: (session: SessionSummary) => void; onExportFit: (session: SessionSummary) => void; onGarmin: (session: SessionSummary) => void }) {
-  const powerZones = useMemo(
-    () => effectivePowerZones(trainingZones, profile.ftpWatts),
-    [profile.ftpWatts, trainingZones],
-  );
-  const heartRateZones = useMemo(
-    () => effectiveHeartRateZones(trainingZones, profile.maxHeartRateBpm),
-    [profile.maxHeartRateBpm, trainingZones],
-  );
-  // Chart data for the open ride is computed once per selection, not on every
-  // telemetry event that re-renders the app.
-  const detailSamples = useMemo(
-    () => selected ? downsampleTelemetry(withActiveElapsed(selected.samples, selected.summary.elapsedSeconds)) : [],
-    [selected],
-  );
-  const detailPowerSeconds = useMemo(
-    () => selected ? timeInZones(selected.samples, powerZones, "power") : [],
-    [powerZones, selected],
-  );
-  const detailHeartRateSeconds = useMemo(
-    () => selected ? timeInZones(selected.samples, heartRateZones, "heartRate") : [],
-    [heartRateZones, selected],
-  );
   return (
     <>
       <PageHeader eyebrow={`${sessions.length} RECORDED RIDES`} title="Ride history" />
@@ -1210,8 +1216,96 @@ function HistoryPage({ sessions, selected, profile, trainingZones, onSelect, onC
         <div className="history-title"><strong>{session.workoutName}</strong><span>{new Date(session.startedAt).toLocaleString()}</span></div>
         <Metric value={formatDuration(session.elapsedSeconds)} unit="duration" /><Metric value={`${session.averagePowerWatts}`} unit="W avg" /><DistanceMetric meters={session.estimatedDistanceMeters} unit={profile.distanceUnit} /><ChevronRight />
       </button>)}</div>}
-      {selected && <div className="modal-backdrop"><div className="modal detail-modal"><button className="modal-close" onClick={onClose}><X /></button><span className="label">RIDE DETAIL</span><h2>{selected.summary.workoutName}</h2><p>{new Date(selected.summary.startedAt).toLocaleString()}</p><div className="detail-metrics"><Metric value={formatDuration(selected.summary.elapsedSeconds)} unit="duration" /><Metric value={`${selected.summary.averagePowerWatts}`} unit="W average" /><Metric value={`${selected.summary.maxPowerWatts}`} unit="W maximum" /><Metric value={`${Math.round(selected.summary.averageCadenceRpm ?? 0)}`} unit="rpm average" /><DistanceMetric meters={selected.summary.estimatedDistanceMeters} unit={profile.distanceUnit} /></div><p className="distance-note">Estimated distance · {distanceSourceLabel(selected.summary.distanceSource)}</p><div className="history-charts"><h3>Power</h3><SessionAreaChart samples={detailSamples} dataKey="powerWatts" unit="W" color="#c8ff32" name="Power" domain={powerDomain}/><h3>Heart rate</h3><SessionAreaChart samples={detailSamples} dataKey="heartRateBpm" unit="bpm" color="#ff6f7d" name="Heart rate" domain={heartRateDomain}/><div className="zone-chart-grid history-zone-charts"><TimeInZoneChart title="Power zones" zones={powerZones} seconds={detailPowerSeconds}/><TimeInZoneChart title="Heart-rate zones" zones={heartRateZones} seconds={detailHeartRateSeconds}/></div></div><div className="detail-actions"><button className="primary" onClick={() => onGarmin(selected.summary)}><Upload size={16}/> Upload to Garmin</button><button className="secondary" onClick={() => onExportFit(selected.summary)}><Download size={16}/> Export FIT</button><button className="secondary" onClick={() => onExport(selected.summary)}><Download size={16}/> Export CSV</button></div><p className="handoff-note">Garmin Connect and Finder will open. Drag the selected FIT file onto Garmin’s import page, then confirm the upload.</p></div></div>}
+      {selected && (
+        <RideDetailModal
+          session={selected}
+          profile={profile}
+          trainingZones={trainingZones}
+          onClose={onClose}
+          onExport={onExport}
+          onExportFit={onExportFit}
+          onGarmin={onGarmin}
+        />
+      )}
     </>
+  );
+}
+
+export function PostRidePrompt({ errorMessage, onView, onDismiss }: { errorMessage: string | null; onView: () => void; onDismiss: () => void }) {
+  return (
+    <div className={errorMessage ? "toast post-ride-prompt error-toast" : "toast post-ride-prompt success-toast"} role={errorMessage ? "alert" : "status"}>
+      <div className="post-ride-copy">
+        <strong>{errorMessage ? "Ride ended and was saved" : "Ride saved"}</strong>
+        <span>{errorMessage ?? "Your ride metrics are ready to review."}</span>
+      </div>
+      <div className="post-ride-actions">
+        <button className="primary" onClick={onView}>{errorMessage ? "View saved ride" : "View ride metrics"}</button>
+        <button className="icon-button" onClick={onDismiss} aria-label="Dismiss ride summary"><X size={17} /></button>
+      </div>
+    </div>
+  );
+}
+
+export function RideDetailModal({ session, profile, trainingZones, onClose, onExport, onExportFit, onGarmin }: { session: SessionDetail; profile: Profile; trainingZones: TrainingZoneSettings; onClose: () => void; onExport: (session: SessionSummary) => void; onExportFit: (session: SessionSummary) => void; onGarmin: (session: SessionSummary) => void }) {
+  const powerZones = useMemo(
+    () => effectivePowerZones(trainingZones, profile.ftpWatts),
+    [profile.ftpWatts, trainingZones],
+  );
+  const heartRateZones = useMemo(
+    () => effectiveHeartRateZones(trainingZones, profile.maxHeartRateBpm),
+    [profile.maxHeartRateBpm, trainingZones],
+  );
+  const samples = useMemo(
+    () => downsampleTelemetry(withActiveElapsed(session.samples, session.summary.elapsedSeconds)),
+    [session],
+  );
+  const powerSeconds = useMemo(
+    () => timeInZones(session.samples, powerZones, "power"),
+    [powerZones, session],
+  );
+  const heartRateSeconds = useMemo(
+    () => timeInZones(session.samples, heartRateZones, "heartRate"),
+    [heartRateZones, session],
+  );
+  return (
+    <div className="modal-backdrop">
+      <div className="modal detail-modal">
+        <button className="modal-close" onClick={onClose} aria-label="Close ride detail"><X /></button>
+        <div className="detail-header">
+          <div>
+            <span className="label">RIDE DETAIL</span>
+            <h2>{session.summary.workoutName}</h2>
+            <p>{new Date(session.summary.startedAt).toLocaleString()}</p>
+          </div>
+          <div className="detail-action-block">
+            <div className="detail-actions">
+              <button className="primary" onClick={() => onGarmin(session.summary)}><Upload size={16}/> Upload to Garmin</button>
+              <button className="secondary" onClick={() => onExportFit(session.summary)}><Download size={16}/> Export FIT</button>
+              <button className="secondary" onClick={() => onExport(session.summary)}><Download size={16}/> Export CSV</button>
+            </div>
+            <p className="handoff-note">Garmin Connect and Finder will open. Drag the selected FIT file onto Garmin’s import page, then confirm the upload.</p>
+          </div>
+        </div>
+        <div className="detail-metrics">
+          <Metric value={formatDuration(session.summary.elapsedSeconds)} unit="duration" />
+          <Metric value={`${session.summary.averagePowerWatts}`} unit="W average" />
+          <Metric value={`${session.summary.maxPowerWatts}`} unit="W maximum" />
+          <Metric value={`${Math.round(session.summary.averageCadenceRpm ?? 0)}`} unit="rpm average" />
+          <DistanceMetric meters={session.summary.estimatedDistanceMeters} unit={profile.distanceUnit} />
+        </div>
+        <p className="distance-note">Estimated distance · {distanceSourceLabel(session.summary.distanceSource)}</p>
+        <div className="history-charts">
+          <h3>Power</h3>
+          <SessionAreaChart samples={samples} dataKey="powerWatts" unit="W" color="#c8ff32" name="Power" domain={powerDomain}/>
+          <h3>Heart rate</h3>
+          <SessionAreaChart samples={samples} dataKey="heartRateBpm" unit="bpm" color="#ff6f7d" name="Heart rate" domain={heartRateDomain}/>
+          <div className="zone-chart-grid history-zone-charts">
+            <TimeInZoneChart title="Power zones" zones={powerZones} seconds={powerSeconds}/>
+            <TimeInZoneChart title="Heart-rate zones" zones={heartRateZones} seconds={heartRateSeconds}/>
+          </div>
+        </div>
+      </div>
+    </div>
   );
 }
 
