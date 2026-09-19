@@ -110,6 +110,9 @@ import { SourceSelect } from "./SourceSelect";
 import { defaultSourcePreferences, withSourcePreference } from "./sourcePreferences";
 import { shouldPromptForPostRide } from "./postRide";
 import { ConfirmDialog } from "./ConfirmDialog";
+import { EditableNumberInput } from "./EditableNumberInput";
+import { Metric } from "./Metric";
+import { WorkoutEditor } from "./WorkoutEditor";
 import { useDialog } from "./useDialog";
 import { zoneColorAt } from "./zones";
 import "./App.css";
@@ -148,6 +151,10 @@ function App() {
   const [powerSmoothing, setPowerSmoothing] = useState<PowerSmoothing>("instant");
   const [trainingZones, setTrainingZones] = useState<TrainingZoneSettings>(
     defaultTrainingZoneSettings,
+  );
+  const powerZones = useMemo(
+    () => (profile ? effectivePowerZones(trainingZones, profile.ftpWatts) : []),
+    [profile, trainingZones],
   );
   const [rideDisplayPreferences, setRideDisplayPreferences] =
     useState<RideDisplayPreferences>(defaultRideDisplayPreferences);
@@ -738,6 +745,8 @@ function App() {
       {editor && (
         <WorkoutEditor
           initial={editor}
+          ftpWatts={profile.ftpWatts}
+          powerZones={powerZones}
           close={() => setEditor(null)}
           save={(workout) =>
             void perform(async () => {
@@ -2122,85 +2131,6 @@ function ZoneEditor({
   );
 }
 
-function WorkoutEditor({ initial, close, save }: { initial: Workout; close: () => void; save: (workout: Workout) => void }) {
-  const [workout, setWorkout] = useState(structuredClone(initial));
-  const dialogRef = useDialog<HTMLDivElement>(close);
-  const updateStep = (index: number, patch: Partial<WorkoutStep>) => setWorkout({ ...workout, steps: workout.steps.map((step, stepIndex) => stepIndex === index ? { ...step, ...patch } as WorkoutStep : step) });
-  const addStep = (kind: "steady" | "ramp" | "freeRide") => {
-    const step: WorkoutStep = kind === "steady" ? { kind, durationSeconds: 300, target: { unit: "percentFtp", value: 75 } } : kind === "ramp" ? { kind, durationSeconds: 300, start: { unit: "percentFtp", value: 50 }, end: { unit: "percentFtp", value: 90 } } : { kind, durationSeconds: 300 };
-    setWorkout({ ...workout, steps: [...workout.steps, step] });
-  };
-  return <div className="modal-backdrop dialog-enter" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) close(); }}><div ref={dialogRef} className="modal editor-modal" role="dialog" aria-modal="true" aria-labelledby="workout-builder-heading" tabIndex={-1}><button className="modal-close" onClick={close} aria-label="Close workout builder"><X /></button><span className="label">WORKOUT BUILDER</span><h2 id="workout-builder-heading" className="sr-only">Workout builder</h2><div className="editor-title"><label className="sr-only" htmlFor="workout-builder-title">Workout name</label><input id="workout-builder-title" aria-label="Workout name" value={workout.name} onChange={(event) => setWorkout({ ...workout, name: event.target.value })}/><strong>{formatDuration(workoutDuration(workout.steps))}</strong></div><textarea aria-label="Workout description" placeholder="Workout description" value={workout.description} onChange={(event) => setWorkout({ ...workout, description: event.target.value })}/>
-    <div className="step-list">{workout.steps.map((step, index) => <div className="step-editor" key={`${index}-${step.kind}`}><span className={`step-kind ${step.kind}`}>{step.kind === "freeRide" ? "FREE" : step.kind.toUpperCase()}</span><label>Duration (sec)<EditableNumberInput min={1} value={step.kind === "repeat" ? workoutDuration(step.steps) : step.durationSeconds} disabled={step.kind === "repeat"} onValueChange={(durationSeconds) => updateStep(index, { durationSeconds } as Partial<WorkoutStep>)}/></label>{step.kind === "steady" && <TargetInput label="Power (% FTP)" target={step.target} onChange={(target) => updateStep(index, { target })}/>} {step.kind === "ramp" && <><TargetInput label="Start (% FTP)" target={step.start} onChange={(start) => updateStep(index, { start })}/><TargetInput label="End (% FTP)" target={step.end} onChange={(end) => updateStep(index, { end })}/></>} {step.kind === "repeat" && <span className="repeat-summary">{step.repetitions}× repeat group</span>}<button className="icon-button danger" aria-label={`Remove block ${index + 1}`} onClick={() => setWorkout({ ...workout, steps: workout.steps.filter((_, stepIndex) => stepIndex !== index) })}><Trash2 size={16}/></button></div>)}</div>
-    <div className="add-steps"><span>Add block</span><button onClick={() => addStep("steady")}><Plus/>Steady</button><button onClick={() => addStep("ramp")}><Plus/>Ramp</button><button onClick={() => addStep("freeRide")}><Plus/>Free ride</button></div>
-    <div className="editor-actions"><button className="secondary" onClick={close}>Cancel</button><button className="primary" disabled={!workout.name.trim() || workout.steps.length === 0} onClick={() => save(workout)}>Save workout</button></div>
-  </div></div>;
-}
-
-function TargetInput({ label, target, onChange }: { label: string; target: { unit: "watts" | "percentFtp"; value: number }; onChange: (target: { unit: "watts" | "percentFtp"; value: number }) => void }) {
-  return <label>{label}<EditableNumberInput min={1} max={300} value={target.value} onValueChange={(value) => onChange({ unit: "percentFtp", value })}/></label>;
-}
-
-export function EditableNumberInput({
-  value,
-  onValueChange,
-  min,
-  max,
-  step,
-  disabled,
-  "aria-label": ariaLabel,
-}: {
-  value: number;
-  onValueChange: (value: number) => void;
-  min?: number;
-  max?: number;
-  step?: number;
-  disabled?: boolean;
-  "aria-label"?: string;
-}) {
-  const [text, setText] = useState(String(value));
-  const focused = useRef(false);
-
-  useEffect(() => {
-    if (!focused.current) setText(String(value));
-  }, [value]);
-
-  const commit = () => {
-    focused.current = false;
-    const parsed = Number(text);
-    if (text.trim() === "" || !Number.isFinite(parsed)) {
-      setText(String(value));
-      return;
-    }
-    onValueChange(parsed);
-    setText(String(parsed));
-  };
-
-  return (
-    <input
-      type="number"
-      min={min}
-      max={max}
-      step={step}
-      disabled={disabled}
-      aria-label={ariaLabel}
-      value={text}
-      onFocus={() => { focused.current = true; }}
-      onChange={(event) => {
-        const next = event.target.value;
-        setText(next);
-        if (next.trim() === "") return;
-        const parsed = Number(next);
-        if (Number.isFinite(parsed)) onValueChange(parsed);
-      }}
-      onBlur={commit}
-      onKeyDown={(event) => {
-        if (event.key === "Enter") event.currentTarget.blur();
-      }}
-    />
-  );
-}
-
 function WorkoutTimeline({
   intervals,
   workoutName,
@@ -2310,10 +2240,6 @@ function WorkoutBars({ steps }: { steps: WorkoutStep[] }) {
 
 function flattenSteps(steps: WorkoutStep[]): WorkoutStep[] {
   return steps.flatMap((step) => step.kind === "repeat" ? Array.from({ length: step.repetitions }, () => flattenSteps(step.steps)).flat() : [step]);
-}
-
-function Metric({ value, unit }: { value: string; unit: string }) {
-  return <div className="metric"><strong>{value}</strong><span>{unit}</span></div>;
 }
 
 function DistanceMetric({ meters, unit }: { meters: number; unit: Profile["distanceUnit"] }) {
