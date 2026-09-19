@@ -78,6 +78,7 @@ import type {
   Workout,
   WorkoutInterval,
   WorkoutStep,
+  ZoneDefinition,
 } from "./types";
 import {
   BIAS_STEP_PERCENT,
@@ -113,6 +114,7 @@ import { ConfirmDialog } from "./ConfirmDialog";
 import { EditableNumberInput } from "./EditableNumberInput";
 import { Metric } from "./Metric";
 import { WorkoutEditor } from "./WorkoutEditor";
+import { WorkoutProfile } from "./WorkoutProfile";
 import { useDialog } from "./useDialog";
 import { zoneColorAt } from "./zones";
 import "./App.css";
@@ -528,6 +530,7 @@ function App() {
         {page === "home" && (
           <Overview
             profile={profile}
+            powerZones={powerZones}
             workouts={workouts}
             sessions={sessions}
             connected={connected}
@@ -559,6 +562,7 @@ function App() {
           <WorkoutLibrary
             workouts={workouts}
             ftp={profile.ftpWatts}
+            powerZones={powerZones}
             onCreate={() => setEditor(newWorkout())}
             onEdit={setEditor}
             onRide={openRide}
@@ -793,6 +797,7 @@ function PageHeader({
 
 function Overview({
   profile,
+  powerZones,
   workouts,
   sessions,
   connected,
@@ -803,6 +808,7 @@ function Overview({
   onRefreshFtp,
 }: {
   profile: Profile;
+  powerZones: readonly ZoneDefinition[];
   workouts: Workout[];
   sessions: SessionSummary[];
   connected: boolean;
@@ -853,7 +859,7 @@ function Overview({
       <div className="workout-row">
         {workouts.slice(0, 3).map((workout, index) => (
           <article className="card workout-card" key={workout.id}>
-            <div className={`workout-visual tone-${index % 3}`}><WorkoutBars steps={workout.steps} /></div>
+            <div className={`workout-visual tone-${index % 3}`}><WorkoutProfile steps={workout.steps} ftpWatts={profile.ftpWatts} powerZones={powerZones} /></div>
             <span className="label">{formatDuration(workoutDuration(workout.steps))} · {workout.steps.length} BLOCKS</span>
             <h3>{workout.name}</h3><p>{workout.description || "A structured power workout."}</p>
             <button className="secondary" onClick={() => onRide(workout.id)}><Play size={16} fill="currentColor" /> Ride</button>
@@ -876,6 +882,7 @@ function Overview({
 export function WorkoutLibrary({
   workouts,
   ftp,
+  powerZones,
   onCreate,
   onEdit,
   onRide,
@@ -886,6 +893,7 @@ export function WorkoutLibrary({
 }: {
   workouts: Workout[];
   ftp: number;
+  powerZones: readonly ZoneDefinition[];
   onCreate: () => void;
   onEdit: (workout: Workout) => void;
   onRide: (id: string) => void;
@@ -915,7 +923,7 @@ export function WorkoutLibrary({
         {workouts.map((workout, index) => (
           <article className="card library-card" key={workout.id}>
             <button className="workout-visual-button" onClick={() => onEdit(workout)}>
-              <div className={`workout-visual large tone-${index % 3}`}><WorkoutBars steps={workout.steps} /></div>
+              <div className={`workout-visual large tone-${index % 3}`}><WorkoutProfile steps={workout.steps} ftpWatts={ftp} powerZones={powerZones} /></div>
             </button>
             <div className="library-body">
               <span className="label">{workout.source.toUpperCase()} · {Math.round(workoutDuration(workout.steps) / 60)} MIN</span>
@@ -1132,8 +1140,11 @@ export function Ride({
         <LiveMetric icon={HeartPulse} label="HEART RATE" value={telemetry.heartRateBpm ?? "—"} unit="bpm" note={sourceNote(telemetry.sources?.heartRate)} />
       </div>
     ),
-    workoutTimeline: structured && workoutIntervals.length > 0 ? (
+    workoutTimeline: structured && activeWorkout && workoutIntervals.length > 0 ? (
       <WorkoutTimeline
+        steps={activeWorkout.steps}
+        ftpWatts={profile.ftpWatts}
+        powerZones={powerZones}
         intervals={workoutIntervals}
         workoutName={runner.workoutName}
         currentIndex={runner.intervalIndex}
@@ -1336,11 +1347,11 @@ export function Ride({
                   <button className="secondary" onClick={onBrowseWorkouts}>Open workout library</button>
                 </div>
               ) : workouts.map((workout) => <button key={workout.id} className={selectedWorkout === workout.id ? "selected" : ""} aria-pressed={selectedWorkout === workout.id} onClick={() => setSelectedWorkout(workout.id)}>
-                <div><strong>{workout.name}</strong><span>{formatDuration(workoutDuration(workout.steps))}</span></div><WorkoutBars steps={workout.steps} /></button>)}
+                <div><strong>{workout.name}</strong><span>{formatDuration(workoutDuration(workout.steps))}</span></div><WorkoutProfile steps={workout.steps} ftpWatts={profile.ftpWatts} powerZones={powerZones} /></button>)}
             </div>
             <button className="primary start-button" disabled={!connected || !selectedWorkout} onClick={() => selectedWorkout && void perform(() => api.startWorkout(selectedWorkout), "start workout")}><Play fill="currentColor" /> Start workout</button>
           </div>
-          <div className="card ride-preview"><span className="label">WORKOUT PREVIEW</span><h2>{selected?.name ?? "Choose a workout"}</h2><p>{selected?.description}</p>{selected && <><div className="preview-chart"><WorkoutBars steps={selected.steps} /></div><div className="preview-stats"><Metric value={formatDuration(workoutDuration(selected.steps))} unit="duration" /><Metric value={`${selected.steps.length}`} unit="blocks" /></div></>}</div>
+          <div className="card ride-preview"><span className="label">WORKOUT PREVIEW</span><h2>{selected?.name ?? "Choose a workout"}</h2><p>{selected?.description}</p>{selected && <><div className="preview-chart"><WorkoutProfile variant="editor" steps={selected.steps} ftpWatts={profile.ftpWatts} powerZones={powerZones} /></div><div className="preview-stats"><Metric value={formatDuration(workoutDuration(selected.steps))} unit="duration" /><Metric value={`${selected.steps.length}`} unit="blocks" /></div></>}</div>
         </section>
       ) : (
         <section className="live-ride">
@@ -2132,6 +2143,9 @@ function ZoneEditor({
 }
 
 function WorkoutTimeline({
+  steps,
+  ftpWatts,
+  powerZones,
   intervals,
   workoutName,
   currentIndex,
@@ -2141,6 +2155,10 @@ function WorkoutTimeline({
   paused,
   onSkip,
 }: {
+  steps: WorkoutStep[];
+  ftpWatts: number;
+  powerZones: readonly ZoneDefinition[];
+  /** Runner-aligned intervals; index-for-index the same blocks the profile draws. */
   intervals: WorkoutInterval[];
   workoutName: string;
   currentIndex: number;
@@ -2153,10 +2171,15 @@ function WorkoutTimeline({
   const current = intervals[currentIndex];
   if (!current) return null;
 
-  const maximumWatts = Math.max(
-    1,
-    ...intervals.flatMap((interval) => [interval.startWatts ?? 0, interval.endWatts ?? 0]),
-  );
+  const blockState = (_shape: unknown, index: number) => {
+    const state = index < currentIndex ? "completed" : index === currentIndex ? "current" : "upcoming";
+    const progress = state === "completed"
+      ? 1
+      : state === "current"
+        ? Math.min(1, intervalElapsedSeconds / Math.max(1, current.durationSeconds))
+        : 0;
+    return { className: state, state, progress };
+  };
   const currentRemaining = Math.max(0, current.durationSeconds - intervalElapsedSeconds);
   const workoutRemaining = Math.max(0, totalSeconds - elapsedSeconds);
   const currentTarget = current.freeRide
@@ -2192,54 +2215,16 @@ function WorkoutTimeline({
           className="workout-timeline-track"
           style={{ width: `${Math.max(100, intervals.length * 3)}%` }}
         >
-          {intervals.map((interval, index) => {
-            const state = index < currentIndex
-              ? "completed"
-              : index === currentIndex
-                ? "current"
-                : "upcoming";
-            const startHeight = ((interval.startWatts ?? maximumWatts * 0.35) / maximumWatts) * 100;
-            const endHeight = ((interval.endWatts ?? maximumWatts * 0.35) / maximumWatts) * 100;
-            const progress = state === "completed"
-              ? 100
-              : state === "current"
-                ? Math.min(100, (intervalElapsedSeconds / interval.durationSeconds) * 100)
-                : 0;
-            return (
-              <div
-                className={`workout-timeline-block ${state}`}
-                data-state={state}
-                aria-label={`Block ${index + 1} of ${intervals.length}, ${state}`}
-                key={index}
-                style={{ width: `${(interval.durationSeconds / totalSeconds) * 100}%` }}
-              >
-                <i
-                  style={{
-                    clipPath: `polygon(0 ${100 - startHeight}%, 100% ${100 - endHeight}%, 100% 100%, 0 100%)`,
-                    background: `linear-gradient(90deg, var(--timeline-progress) ${progress}%, var(--timeline-rest) ${progress}%)`,
-                  }}
-                />
-              </div>
-            );
-          })}
+          <WorkoutProfile
+            steps={steps}
+            ftpWatts={ftpWatts}
+            powerZones={powerZones}
+            segmentState={blockState}
+          />
         </div>
       </div>
     </section>
   );
-}
-
-function WorkoutBars({ steps }: { steps: WorkoutStep[] }) {
-  const flattened = useMemo(() => flattenSteps(steps), [steps]);
-  const total = workoutDuration(flattened);
-  return <div className="workout-bars">{flattened.map((step, index) => {
-    const target = step.kind === "steady" ? step.target.value : step.kind === "ramp" ? Math.max(step.start.value, step.end.value) : 40;
-    const duration = step.kind === "repeat" ? 0 : step.durationSeconds;
-    return <i key={index} style={{ width: `${Math.max(3, duration / total * 100)}%`, height: `${Math.min(100, Math.max(20, target / 1.4))}%` }} />;
-  })}</div>;
-}
-
-function flattenSteps(steps: WorkoutStep[]): WorkoutStep[] {
-  return steps.flatMap((step) => step.kind === "repeat" ? Array.from({ length: step.repetitions }, () => flattenSteps(step.steps)).flat() : [step]);
 }
 
 function DistanceMetric({ meters, unit }: { meters: number; unit: Profile["distanceUnit"] }) {

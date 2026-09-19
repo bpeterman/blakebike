@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { WorkoutLibrary } from "./App";
-import type { Workout } from "./types";
+import { derivedPowerZones, type Workout } from "./types";
 
 const workout: Workout = {
   id: "11111111-1111-4111-8111-111111111111",
@@ -25,6 +25,7 @@ afterEach(cleanup);
 describe("WorkoutLibrary", () => {
   const props = {
     ftp: 200,
+    powerZones: derivedPowerZones(200),
     onCreate: vi.fn(),
     onEdit: vi.fn(),
     onRide: vi.fn(),

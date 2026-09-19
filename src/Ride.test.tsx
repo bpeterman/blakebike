@@ -149,14 +149,17 @@ describe("Ride charts", () => {
       displayPreferences: defaultRideDisplayPreferences,
       perform: async () => undefined,
     };
-    const { rerender } = render(<Ride {...commonProps} runner={structuredRunner} />);
+    const { container, rerender } = render(<Ride {...commonProps} runner={structuredRunner} />);
 
     expect(screen.queryByRole("heading", { name: structuredWorkout.name })).not.toBeInTheDocument();
     expect(screen.getByText(structuredWorkout.name)).toHaveClass("label");
     expect(screen.getByText("Block 2 of 5")).toBeInTheDocument();
-    expect(screen.getByLabelText("Block 1 of 5, completed")).toHaveAttribute("data-state", "completed");
-    expect(screen.getByLabelText("Block 2 of 5, current")).toHaveAttribute("data-state", "current");
-    expect(screen.getByLabelText("Block 3 of 5, upcoming")).toHaveAttribute("data-state", "upcoming");
+    const timelineBlocks = [...container.querySelectorAll<SVGPolygonElement>(".workout-timeline polygon[data-state]")];
+    expect(timelineBlocks.map((block) => block.dataset.state)).toEqual([
+      "completed", "current", "upcoming", "upcoming", "upcoming",
+    ]);
+    expect(timelineBlocks[1]).toHaveClass("current");
+    expect(container.querySelectorAll(".workout-timeline .workout-profile-progress")).toHaveLength(2);
     expect(screen.getByText("0:20")).toBeInTheDocument();
     expect(screen.getByText("1:20")).toBeInTheDocument();
     const timeline = screen.getByRole("button", { name: "Skip block" }).closest("[data-ride-card]");

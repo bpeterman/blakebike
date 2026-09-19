@@ -19,6 +19,8 @@ export type WorkoutProfileVariant = "editor" | "compact";
 /** Per-block presentation supplied by the host, e.g. ride progress. */
 export type SegmentState = {
   className?: string;
+  /** Free-form state name exposed as `data-state` for styling and tests. */
+  state?: string;
   /** 0–1 fraction of the block completed; drawn as an overlay clipped to the shape. */
   progress?: number;
 };
@@ -170,6 +172,7 @@ export const WorkoutProfile = memo(function WorkoutProfile({
                       className={["workout-profile-block", state?.className].filter(Boolean).join(" ")}
                       data-path={pathKey(shape.path)}
                       data-kind={shape.kind}
+                      data-state={state?.state}
                       data-highlighted={highlighted ? "true" : undefined}
                       data-dimmed={dimmed ? "true" : undefined}
                       points={pointsAttribute(shape.points)}
