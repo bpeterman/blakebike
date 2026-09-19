@@ -160,6 +160,22 @@ pub struct ScanError {
     pub guidance: String,
 }
 
+/// A device the user connected before, kept so it can be reconnected with one
+/// click and without a full scan.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct KnownDevice {
+    pub id: String,
+    pub name: String,
+    pub role: DeviceRole,
+    #[serde(default)]
+    pub capabilities: Vec<Capability>,
+    pub simulated: bool,
+    pub manufacturer: Option<String>,
+    pub model: Option<String>,
+    pub last_connected_at: chrono::DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeviceLogEvent {
@@ -625,12 +641,76 @@ impl DeviceHub {
                 ));
             }
         }
+        // A remembered device was not part of the last scan: look for it now.
+        let device = if !device.simulated && self.ble.peripheral(&device.id).await.is_none() {
+            let slot = self.slot(role);
+            slot.set_state(DeviceState::Connecting {
+                name: device.name.clone(),
+            })
+            .await;
+            slot.progress(
+                "info",
+                "Looking for remembered device",
+                Some(format!(
+                    "{} · up to {}s",
+                    device.name,
+                    ble::FIND_TIMEOUT.as_secs()
+                )),
+            );
+            match self.ble.find(&device.id).await {
+                Ok(seen) => {
+                    slot.progress(
+                        "ok",
+                        "Device found",
+                        seen.rssi.map(|rssi| format!("signal {rssi} dBm")),
+                    );
+                    DeviceInfo {
+                        // Keep the remembered name if the advertisement had none.
+                        name: if seen.name.is_empty() {
+                            device.name
+                        } else {
+                            seen.name
+                        },
+                        ..seen
+                    }
+                }
+                Err(error) => {
+                    slot.progress("error", "Device not found", Some(error.clone()));
+                    slot.set_state(DeviceState::Error {
+                        message: error.clone(),
+                        guidance: "Wake the device (spin the crank, wear the strap, pedal the trainer) and try again.".into(),
+                    })
+                    .await;
+                    return Err(error);
+                }
+            }
+        } else {
+            device
+        };
         match role {
             DeviceRole::Trainer => self.trainer.connect(device).await,
             DeviceRole::HeartRate => self.heart_rate.connect(device).await,
             DeviceRole::Power => self.power.connect(device).await,
             DeviceRole::Cadence => self.cadence.connect(device).await,
         }
+    }
+
+    /// Build the record to remember after a successful connect: the device as
+    /// connected plus whatever Device Information it exposed.
+    pub async fn remember(&self, role: DeviceRole) -> Option<KnownDevice> {
+        let slot = self.slot(role);
+        let device = slot.state().await.device()?.clone();
+        let stats = slot.stats();
+        Some(KnownDevice {
+            id: device.id,
+            name: device.name,
+            role,
+            capabilities: device.capabilities,
+            simulated: device.simulated,
+            manufacturer: stats.manufacturer,
+            model: stats.model,
+            last_connected_at: Utc::now(),
+        })
     }
 
     pub async fn disconnect_role(&self, role: DeviceRole) {
@@ -755,10 +835,38 @@ mod tests {
             rssi: None,
             capabilities: vec![Capability::CyclingPower],
         };
-        // Not in the last scan, so connecting fails, but only after the
-        // capability check passed.
+        // Not in the last scan, so the hub tries a targeted scan for it. That
+        // fails here (no adapter in CI, or the device is not seen), but only
+        // after the capability check passed, and the attempt is logged.
         let missing = hub.connect(DeviceRole::Cadence, meter).await.unwrap_err();
-        assert!(missing.contains("no longer available"), "{missing}");
+        assert!(!missing.contains("does not advertise"), "{missing}");
+        let log = hub.slot(DeviceRole::Cadence).log_lines();
+        assert!(
+            log.iter()
+                .any(|line| line.step == "Looking for remembered device")
+        );
+        assert!(log.iter().any(|line| line.step == "Device not found"));
+        assert!(matches!(
+            hub.slot(DeviceRole::Cadence).state().await,
+            DeviceState::Error { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn remember_captures_connected_device_and_details() {
+        let hub = DeviceHub::default();
+        assert!(hub.remember(DeviceRole::Trainer).await.is_none());
+        hub.connect(DeviceRole::Trainer, trainer::simulated_devices().remove(0))
+            .await
+            .unwrap();
+        let known = hub.remember(DeviceRole::Trainer).await.unwrap();
+        assert_eq!(known.id, trainer::SIMULATED_TRAINER_ID);
+        assert_eq!(known.role, DeviceRole::Trainer);
+        assert!(known.simulated);
+        assert_eq!(known.manufacturer.as_deref(), Some("BlakeBike"));
+        assert_eq!(known.model.as_deref(), Some("Simulator"));
+        assert_eq!(known.capabilities, vec![Capability::Ftms]);
+        hub.disconnect().await;
     }
 
     #[tokio::test]

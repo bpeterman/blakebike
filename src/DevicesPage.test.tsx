@@ -1,10 +1,36 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+
+const knownDevices = [
+  {
+    id: "k",
+    name: "KICKR CORE",
+    role: "trainer" as const,
+    capabilities: ["ftms" as const],
+    simulated: false,
+    manufacturer: "Wahoo",
+    model: "KICKR CORE",
+    lastConnectedAt: new Date().toISOString(),
+  },
+  {
+    id: "strap",
+    name: "HRM-Pro",
+    role: "heartRate" as const,
+    capabilities: ["heartRate" as const],
+    simulated: false,
+    manufacturer: "Garmin",
+    model: null,
+    lastConnectedAt: new Date(Date.now() - 2 * 86_400_000).toISOString(),
+  },
+];
 
 vi.mock("./api", () => ({
   api: {
     saveSourcePreferences: vi.fn(() => Promise.resolve()),
     disconnectDevice: vi.fn(() => Promise.resolve()),
+    connectDevice: vi.fn(() => Promise.resolve()),
+    knownDevices: vi.fn(() => Promise.resolve(knownDevices)),
+    forgetDevice: vi.fn(() => Promise.resolve()),
   },
 }));
 
@@ -87,6 +113,8 @@ describe("DevicesPage", () => {
     expect(screen.getByText("1 of 4 connected")).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "KICKR CORE" })).toBeInTheDocument();
     expect(screen.getByText("ERG control")).toBeInTheDocument();
+    // Manufacturer shows under the connected device's name.
+    expect(screen.getByText("Wahoo · KICKR CORE")).toBeInTheDocument();
     expect(screen.getByText("200 W · 88 rpm · 30.1 km/h · target 200 W")).toBeInTheDocument();
     expect(screen.getByText(/2\.0 Hz/)).toBeInTheDocument();
     expect(screen.getByText("-55 dBm")).toBeInTheDocument();
@@ -99,8 +127,9 @@ describe("DevicesPage", () => {
     fireEvent.click(screen.getByRole("button", { name: /Reconnect/ }));
     expect(onConnect).toHaveBeenCalledWith("heartRate");
 
-    // Idle roles offer Connect.
-    fireEvent.click(screen.getAllByRole("button", { name: /^Connect$/ })[0]);
+    // Idle roles offer Connect (the known-device row, when loaded, comes first).
+    const connects = screen.getAllByRole("button", { name: /^Connect$/ });
+    fireEvent.click(connects[connects.length - 2]);
     expect(onConnect).toHaveBeenCalledWith("power");
 
     // Expanding the trainer log shows device details and every line.
@@ -127,9 +156,27 @@ describe("DevicesPage", () => {
     });
   });
 
+  it("lists known devices with make, offers one-click connect and forget", async () => {
+    render(<DevicesPage hub={snapshot} sources={snapshot.sources} onConnect={vi.fn()} perform={perform} />);
+    await waitFor(() => expect(screen.getByText("Connect again with one click")).toBeInTheDocument());
+    // The trainer is connected right now; the strap was used two days ago.
+    expect(screen.getByText("connected now")).toBeInTheDocument();
+    expect(screen.getByText(/last used 2 days ago/)).toBeInTheDocument();
+    expect(screen.getByText(/Heart rate · Garmin/)).toBeInTheDocument();
+
+    const rows = screen.getAllByRole("button", { name: /^Connect$/ });
+    // Two idle role cards plus the remembered strap row.
+    expect(rows).toHaveLength(3);
+    fireEvent.click(rows[0]);
+    expect(api.connectDevice).toHaveBeenCalledWith("heartRate", expect.objectContaining({ id: "strap", name: "HRM-Pro" }));
+
+    fireEvent.click(screen.getByRole("button", { name: "Forget HRM-Pro" }));
+    await waitFor(() => expect(api.forgetDevice).toHaveBeenCalledWith("strap"));
+  });
+
   it("renders sensibly before the first snapshot arrives", () => {
     render(<DevicesPage hub={null} sources={undefined} onConnect={vi.fn()} perform={perform} />);
     expect(screen.getByText("0 of 4 connected")).toBeInTheDocument();
-    expect(screen.getAllByRole("button", { name: /^Connect$/ })).toHaveLength(4);
+    expect(screen.getAllByRole("button", { name: /^Connect$/ }).length).toBeGreaterThanOrEqual(4);
   });
 });

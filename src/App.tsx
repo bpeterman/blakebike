@@ -371,6 +371,7 @@ function App() {
                 setProfile(next);
               }, "save profile")
             }
+            onForgetDevices={() => perform(() => api.forgetAllDevices(), "forget all devices")}
           />
         )}
       </main>
@@ -707,7 +708,7 @@ function HistoryPage({ sessions, selected, onSelect, onClose, onExport, onExport
   );
 }
 
-function SettingsPage({ profile, onSave }: { profile: Profile; onSave: (profile: Profile) => void }) {
+function SettingsPage({ profile, onSave, onForgetDevices }: { profile: Profile; onSave: (profile: Profile) => void; onForgetDevices: () => Promise<void> }) {
   const [draft, setDraft] = useState(profile);
   const [logPath, setLogPath] = useState("Loading log location…");
   const [rideFilesPath, setRideFilesPath] = useState("Loading ride files location…");
@@ -723,7 +724,7 @@ function SettingsPage({ profile, onSave }: { profile: Profile; onSave: (profile:
         <div className="form-row"><label>FTP (watts)<input type="number" min="50" max="500" value={draft.ftpWatts} onChange={(event) => setDraft({ ...draft, ftpWatts: Number(event.target.value) })}/></label><label>Safety power limit<input type="number" min="100" max="2500" value={draft.maxPowerWatts} onChange={(event) => setDraft({ ...draft, maxPowerWatts: Number(event.target.value) })}/></label></div>
         <button className="primary" type="submit">Save settings</button>
       </form></section>
-      <section className="card settings-card"><div><span className="label">DATA & DIAGNOSTICS</span><h2>Local-first by design</h2><p>Every finalized ride is stored in SQLite and as a persistent Garmin-compatible FIT file. Missing FIT files are regenerated automatically.</p></div><div className="data-locations"><div className="log-location"><span>Ride Files</span><code>{rideFilesPath}</code><button className="secondary" onClick={() => void api.revealRideFiles().catch(() => undefined)}>Show Ride Files</button></div><div className="log-location"><span>Log file</span><code>{logPath}</code><button className="secondary" onClick={() => void navigator.clipboard.writeText(logPath)}>Copy path</button><button className="secondary" onClick={() => void api.revealLogFile().catch(() => undefined)}>Show in folder</button></div></div></section>
+      <section className="card settings-card"><div><span className="label">DATA & DIAGNOSTICS</span><h2>Local-first by design</h2><p>Every finalized ride is stored in SQLite and as a persistent Garmin-compatible FIT file. Missing FIT files are regenerated automatically.</p></div><div className="data-locations"><div className="log-location"><span>Ride Files</span><code>{rideFilesPath}</code><button className="secondary" onClick={() => void api.revealRideFiles().catch(() => undefined)}>Show Ride Files</button></div><div className="log-location"><span>Log file</span><code>{logPath}</code><button className="secondary" onClick={() => void api.revealLogFile().catch(() => undefined)}>Show in folder</button><button className="secondary" onClick={() => void navigator.clipboard.writeText(logPath)}>Copy path</button></div><div className="log-location"><span>Known devices</span><p className="settings-note">Devices you have connected are remembered on this computer so they can be reconnected without scanning. Forgetting them does not disconnect anything.</p><button className="danger-button" onClick={() => void onForgetDevices()}>Forget all devices</button></div></div></section>
     </>
   );
 }

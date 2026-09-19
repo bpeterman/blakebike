@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   Activity,
   BatteryMedium,
@@ -9,6 +9,7 @@ import {
   Gauge,
   HeartPulse,
   Radio,
+  Trash2,
   Zap,
 } from "lucide-react";
 import { api } from "./api";
@@ -16,8 +17,10 @@ import {
   deviceName,
   formatAge,
   formatClock,
+  formatRelativeDate,
   formatUptime,
   isConnected,
+  makeAndModel,
   metricsFedBy,
   readoutMark,
 } from "./devices";
@@ -27,6 +30,7 @@ import type {
   DeviceSlot,
   DeviceState,
   DevicesSnapshot,
+  KnownDevice,
   Metric,
   SourceChoice,
   SourcePreferences,
@@ -72,6 +76,17 @@ export function DevicesPage({
   onConnect: (role: DeviceRole) => void;
   perform: (action: () => Promise<unknown>, label?: string) => Promise<void>;
 }) {
+  const [known, setKnown] = useState<KnownDevice[]>([]);
+  const refreshKnown = useCallback(() => {
+    api.knownDevices().then(setKnown).catch(() => undefined);
+  }, []);
+  // Reload whenever a slot's connection state changes: a fresh connect adds
+  // or refreshes a row.
+  const connectionKey = (hub?.slots ?? []).map((slot) => slot.state.status).join("|");
+  useEffect(() => {
+    refreshKnown();
+  }, [refreshKnown, connectionKey]);
+
   // A one-second clock so uptime and "last sample" ages tick without new events.
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
@@ -108,6 +123,67 @@ export function DevicesPage({
           <strong>{hub.scanError.message}</strong>
           <span>{hub.scanError.guidance}</span>
         </div>
+      )}
+
+      {known.length > 0 && (
+        <section className="card known-devices">
+          <div className="known-head">
+            <div>
+              <span className="label">KNOWN DEVICES</span>
+              <h2>Connect again with one click</h2>
+            </div>
+            <p>Remembered from earlier sessions. Nothing reconnects on its own.</p>
+          </div>
+          <div className="known-list">
+            {known.map((device) => {
+              const slot = slots.find((candidate) => candidate.role === device.role);
+              const connectedHere = slotDeviceId(slot) === device.id;
+              const busy = slot?.state.status === "connecting";
+              const Icon = roleIcon[device.role];
+              return (
+                <div key={device.id} className="known-row">
+                  <span className="device-icon"><Icon size={18} /></span>
+                  <div className="known-title">
+                    <strong>{device.name}</strong>
+                    <span>
+                      {deviceRoleLabel[device.role]}
+                      {makeAndModel(device.manufacturer, device.model) && ` · ${makeAndModel(device.manufacturer, device.model)}`}
+                      {device.simulated && " · simulated"}
+                    </span>
+                  </div>
+                  <span className="known-when">{connectedHere ? "connected now" : `last used ${formatRelativeDate(device.lastConnectedAt, now)}`}</span>
+                  {connectedHere ? (
+                    <button className="secondary" onClick={() => void perform(() => api.disconnectDevice(device.role), `disconnect ${device.role}`)}>
+                      Disconnect
+                    </button>
+                  ) : (
+                    <button
+                      className="primary"
+                      disabled={busy}
+                      onClick={() => void perform(() => api.connectDevice(device.role, {
+                        id: device.id,
+                        name: device.name,
+                        simulated: device.simulated,
+                        rssi: null,
+                        capabilities: device.capabilities,
+                      }), `connect known ${device.role}: ${device.name}`)}
+                    >
+                      {busy ? "Connecting…" : "Connect"}
+                    </button>
+                  )}
+                  <button
+                    className="icon-button danger"
+                    aria-label={`Forget ${device.name}`}
+                    title="Forget this device"
+                    onClick={() => void perform(async () => { await api.forgetDevice(device.id); refreshKnown(); }, "forget device")}
+                  >
+                    <Trash2 size={16} />
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        </section>
       )}
 
       <div className="device-grid">
@@ -234,9 +310,12 @@ function DeviceCard({
         <span className={`card-icon ${connected ? "" : "subtle"}`}>
           <Icon size={22} />
         </span>
-        <div>
+        <div className="device-card-title">
           <span className="label">{deviceRoleLabel[slot.role].toUpperCase()}</span>
           <h3>{name ?? (slot.state.status === "connecting" || slot.state.status === "reconnecting" ? slot.state.name : "Not connected")}</h3>
+          {connected && makeAndModel(stats.manufacturer, stats.model) && (
+            <span className="device-make">{makeAndModel(stats.manufacturer, stats.model)}</span>
+          )}
         </div>
         <span className={`status-chip ${status.tone}`}>{status.text}</span>
       </header>
@@ -331,6 +410,11 @@ function LogReadout({ lines }: { lines: DeviceLogLine[] }) {
       ))}
     </div>
   );
+}
+
+function slotDeviceId(slot: DeviceSlot | undefined): string | null {
+  const state = slot?.state;
+  return state && (state.status === "ready" || state.status === "controlling") ? state.device.id : null;
 }
 
 function statusOf(state: DeviceState): { text: string; tone: "online" | "busy" | "off" | "error" } {

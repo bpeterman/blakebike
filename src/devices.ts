@@ -81,6 +81,26 @@ export function formatAge(ms: number): string {
   return `${Math.floor(ms / 60_000)}m ago`;
 }
 
+/** "Wahoo · KICKR CORE" from whatever Device Information a device exposed. */
+export function makeAndModel(manufacturer: string | null | undefined, model: string | null | undefined): string | null {
+  const parts = [manufacturer, model].filter((part): part is string => !!part && part.trim().length > 0);
+  if (parts.length === 0) return null;
+  // Avoid "Wahoo · Wahoo KICKR" style repetition.
+  if (parts.length === 2 && parts[1].toLowerCase().startsWith(parts[0].toLowerCase())) return parts[1];
+  return parts.join(" · ");
+}
+
+export function formatRelativeDate(iso: string, now = Date.now()): string {
+  const then = Date.parse(iso);
+  if (Number.isNaN(then)) return "unknown";
+  const diff = now - then;
+  if (diff < 60_000) return "just now";
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} min ago`;
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)} h ago`;
+  const days = Math.floor(diff / 86_400_000);
+  return days === 1 ? "yesterday" : `${days} days ago`;
+}
+
 export function formatClock(atMs: number): string {
   const date = new Date(atMs);
   return [date.getHours(), date.getMinutes(), date.getSeconds()]

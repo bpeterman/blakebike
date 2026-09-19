@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Activity, Bluetooth, ChevronRight, Radio, X } from "lucide-react";
 import { api } from "./api";
-import type { DeviceInfo, DeviceLogLine, DeviceRole, DeviceSlot } from "./types";
+import type { DeviceInfo, DeviceLogLine, DeviceRole, DeviceSlot, KnownDevice } from "./types";
 import { deviceRoleLabel } from "./types";
-import { capabilityLabel, deviceFitsRole, readoutMark } from "./devices";
+import { capabilityLabel, deviceFitsRole, makeAndModel, readoutMark } from "./devices";
 
 const roleHint: Record<DeviceRole, string> = {
   trainer: "Make sure your trainer is awake and not paired with another app.",
@@ -28,6 +28,7 @@ export function DevicePicker({
   perform: (action: () => Promise<unknown>, label?: string) => Promise<void>;
 }) {
   const [devices, setDevices] = useState<DeviceInfo[]>([]);
+  const [known, setKnown] = useState<KnownDevice[]>([]);
   const [scanning, setScanning] = useState(false);
   const [connecting, setConnecting] = useState<DeviceInfo | null>(null);
   const [readout, setReadout] = useState<ReadoutLine[]>([]);
@@ -49,6 +50,7 @@ export function DevicePicker({
     if (!scannedOnce.current) {
       scannedOnce.current = true;
       void scan();
+      api.knownDevices().then(setKnown).catch(() => undefined);
     }
   }, [scan]);
 
@@ -152,13 +154,17 @@ export function DevicePicker({
               </div>
             )}
             <div className="device-list">
-              {devices.map((device) => (
+              {devices.map((device) => {
+                const remembered = known.find((candidate) => candidate.id === device.id);
+                const make = remembered ? makeAndModel(remembered.manufacturer, remembered.model) : null;
+                return (
                 <button key={device.id} onClick={() => void connect(device)}>
                   <span className="device-icon">{device.simulated ? <Activity /> : <Radio />}</span>
                   <span>
-                    <strong>{device.name}</strong>
+                    <strong>{device.name}{make && <em className="device-make-inline">{make}</em>}</strong>
                     <small>
                       {device.simulated ? "No hardware required" : `${device.rssi ?? "—"} dBm`}
+                      {remembered && !device.simulated && " · remembered"}
                       {(device.capabilities ?? []).length > 0 && (
                         <span className="capability-chips">
                           {(device.capabilities ?? []).map((capability) => (
@@ -170,7 +176,8 @@ export function DevicePicker({
                   </span>
                   <ChevronRight />
                 </button>
-              ))}
+                );
+              })}
               {!scanning && devices.length === 0 && (
                 <div className="device-list-empty">No {label.toLowerCase()} found. Wake the device and scan again.</div>
               )}

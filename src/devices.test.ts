@@ -3,7 +3,9 @@ import {
   deviceFitsRole,
   deviceName,
   formatAge,
+  formatRelativeDate,
   formatUptime,
+  makeAndModel,
   isConnected,
   metricsFedBy,
   readoutMark,
@@ -72,6 +74,24 @@ describe("formatting", () => {
     expect(formatAge(400)).toBe("now");
     expect(formatAge(7_500)).toBe("7s ago");
     expect(formatAge(130_000)).toBe("2m ago");
+  });
+
+  it("joins make and model without repeating the brand", () => {
+    expect(makeAndModel("Wahoo", "KICKR CORE")).toBe("Wahoo · KICKR CORE");
+    expect(makeAndModel("Wahoo Fitness", "Wahoo Fitness KICKR")).toBe("Wahoo Fitness KICKR");
+    expect(makeAndModel("Garmin", null)).toBe("Garmin");
+    expect(makeAndModel(null, "  ")).toBeNull();
+    expect(makeAndModel(null, null)).toBeNull();
+  });
+
+  it("formats last-used dates relative to now", () => {
+    const now = Date.parse("2026-09-18T12:00:00Z");
+    expect(formatRelativeDate("2026-09-18T11:59:40Z", now)).toBe("just now");
+    expect(formatRelativeDate("2026-09-18T11:35:00Z", now)).toBe("25 min ago");
+    expect(formatRelativeDate("2026-09-18T07:00:00Z", now)).toBe("5 h ago");
+    expect(formatRelativeDate("2026-09-17T09:00:00Z", now)).toBe("yesterday");
+    expect(formatRelativeDate("2026-09-10T09:00:00Z", now)).toBe("8 days ago");
+    expect(formatRelativeDate("garbage", now)).toBe("unknown");
   });
 
   it("marks log levels", () => {

@@ -7,7 +7,8 @@ use uuid::Uuid;
 use crate::{
     AppState,
     devices::{
-        DeviceInfo, DeviceLogLine, DeviceRole, DeviceState, DevicesSnapshot, SourcePreferences,
+        DeviceInfo, DeviceLogLine, DeviceRole, DeviceState, DevicesSnapshot, KnownDevice,
+        SourcePreferences,
     },
     domain::{Profile, SessionDetail, SessionSummary, Workout},
     fit::ensure_ride_file,
@@ -31,7 +32,19 @@ pub async fn scan_trainers(state: State<'_, AppState>) -> Result<Vec<DeviceInfo>
 #[tauri::command]
 pub async fn connect_trainer(state: State<'_, AppState>, device: DeviceInfo) -> Result<(), String> {
     tracing::debug!(device = ?device, "command connect_trainer");
-    state.devices.connect(DeviceRole::Trainer, device).await
+    state.devices.connect(DeviceRole::Trainer, device).await?;
+    remember(&state, DeviceRole::Trainer).await;
+    Ok(())
+}
+
+/// Persist a just-connected device so it shows up under Known devices. Never
+/// fails the connect: a storage hiccup is logged and the ride goes on.
+async fn remember(state: &State<'_, AppState>, role: DeviceRole) {
+    if let Some(device) = state.devices.remember(role).await
+        && let Err(error) = state.storage.remember_device(&device)
+    {
+        tracing::warn!(?role, error = %error, "Could not remember device");
+    }
 }
 
 #[tauri::command]
@@ -61,7 +74,27 @@ pub async fn connect_device(
     device: DeviceInfo,
 ) -> Result<(), String> {
     tracing::debug!(?role, device = ?device, "command connect_device");
-    state.devices.connect(role, device).await
+    state.devices.connect(role, device).await?;
+    remember(&state, role).await;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn known_devices(state: State<'_, AppState>) -> Result<Vec<KnownDevice>, String> {
+    state.storage.known_devices()
+}
+
+#[tauri::command]
+pub fn forget_device(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    tracing::info!(%id, "command forget_device");
+    state.storage.forget_device(&id)
+}
+
+#[tauri::command]
+pub fn forget_all_devices(state: State<'_, AppState>) -> Result<usize, String> {
+    let removed = state.storage.forget_all_devices()?;
+    tracing::info!(removed, "command forget_all_devices");
+    Ok(removed)
 }
 
 #[tauri::command]

@@ -9,6 +9,7 @@ import type {
   DeviceSlot,
   DeviceState,
   DevicesSnapshot,
+  KnownDevice,
   SourcePreferences,
   Profile,
   RunnerState,
@@ -31,6 +32,9 @@ export const api = {
   disconnectDevice: (role: DeviceRole) =>
     invoke<void>("disconnect_device", { role }),
   deviceLog: (role: DeviceRole) => invoke<DeviceLogLine[]>("device_log", { role }),
+  knownDevices: () => invoke<KnownDevice[]>("known_devices"),
+  forgetDevice: (id: string) => invoke<void>("forget_device", { id }),
+  forgetAllDevices: () => invoke<number>("forget_all_devices"),
   sourcePreferences: () => invoke<SourcePreferences>("get_source_preferences"),
   saveSourcePreferences: (preferences: SourcePreferences) =>
     invoke<void>("set_source_preferences", { preferences }),
