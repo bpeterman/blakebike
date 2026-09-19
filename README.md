@@ -12,6 +12,8 @@ FTMS smart trainers. The initial target platforms are macOS and Ubuntu/Pop!_OS
 - ZWO import/export, rider FTP and safety power limit
 - Crash-resistant SQLite ride recording, history charts, and CSV/FIT export
 - Persistent Garmin-compatible Ride Files with a guided Garmin Connect handoff
+- Estimated indoor distance from trainer speed or a flat-road power model
+- Independent kg/lb and km/mi display preferences with metric backend storage
 
 ## Development
 

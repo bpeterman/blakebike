@@ -46,7 +46,9 @@ import type {
 import {
   deviceRoleLabel,
   deviceRoles,
+  formatDistance,
   formatDuration,
+  formatSpeed,
   manualPowerDeltaForKey,
   workoutDuration,
 } from "./types";
@@ -338,6 +340,7 @@ function App() {
             runner={runner}
             telemetry={telemetry}
             telemetryHistory={telemetryHistory}
+            distanceUnit={profile.distanceUnit}
             perform={perform}
           />
         )}
@@ -345,6 +348,7 @@ function App() {
           <HistoryPage
             sessions={sessions}
             selected={selectedSession}
+            distanceUnit={profile.distanceUnit}
             onSelect={(session) =>
               void perform(async () =>
                 setSelectedSession(await api.session(session.id)),
@@ -556,6 +560,7 @@ function Ride({
   runner,
   telemetry,
   telemetryHistory,
+  distanceUnit,
   perform,
 }: {
   workouts: Workout[];
@@ -566,6 +571,7 @@ function Ride({
   runner: RunnerState;
   telemetry: Telemetry;
   telemetryHistory: Telemetry[];
+  distanceUnit: Profile["distanceUnit"];
   perform: (action: () => Promise<unknown>, label?: string) => Promise<void>;
 }) {
   const [targetDraft, setTargetDraft] = useState("100");
@@ -579,6 +585,7 @@ function Ride({
   const targetPower = runner.status === "running" || runner.status === "paused"
     ? runner.targetPowerWatts
     : telemetry.targetPowerWatts;
+  const displayedSpeed = formatSpeed(telemetry.speedKph ?? 0, distanceUnit);
 
   useEffect(() => {
     if (targetPower !== null) setTargetDraft(String(targetPower));
@@ -643,7 +650,7 @@ function Ride({
           <div className="metrics-grid">
             <LiveMetric icon={Zap} label="POWER" value={telemetry.powerWatts} unit="W" accent note={sourceNote(telemetry.sources?.power)} />
             <LiveMetric icon={Gauge} label="CADENCE" value={Math.round(telemetry.cadenceRpm ?? 0)} unit="rpm" note={sourceNote(telemetry.sources?.cadence)} />
-            <LiveMetric icon={Radio} label="SPEED" value={(telemetry.speedKph ?? 0).toFixed(1)} unit="km/h" />
+            <LiveMetric icon={Radio} label="SPEED" value={displayedSpeed.value} unit={displayedSpeed.unit} />
             <LiveMetric icon={HeartPulse} label="HEART RATE" value={telemetry.heartRateBpm ?? "—"} unit="bpm" note={sourceNote(telemetry.sources?.heartRate)} />
           </div>
           <div className="card live-chart">
@@ -693,7 +700,7 @@ function Ride({
   );
 }
 
-function HistoryPage({ sessions, selected, onSelect, onClose, onExport, onExportFit, onGarmin }: { sessions: SessionSummary[]; selected: SessionDetail | null; onSelect: (session: SessionSummary) => void; onClose: () => void; onExport: (session: SessionSummary) => void; onExportFit: (session: SessionSummary) => void; onGarmin: (session: SessionSummary) => void }) {
+function HistoryPage({ sessions, selected, distanceUnit, onSelect, onClose, onExport, onExportFit, onGarmin }: { sessions: SessionSummary[]; selected: SessionDetail | null; distanceUnit: Profile["distanceUnit"]; onSelect: (session: SessionSummary) => void; onClose: () => void; onExport: (session: SessionSummary) => void; onExportFit: (session: SessionSummary) => void; onGarmin: (session: SessionSummary) => void }) {
   return (
     <>
       <PageHeader eyebrow={`${sessions.length} RECORDED RIDES`} title="Ride history" />
@@ -701,11 +708,21 @@ function HistoryPage({ sessions, selected, onSelect, onClose, onExport, onExport
       <div className="history-list">{sessions.map((session) => <button key={session.id} className="history-row" onClick={() => onSelect(session)}>
         <span className={session.completed ? "completion complete" : "completion"}>{session.completed ? "✓" : "–"}</span>
         <div className="history-title"><strong>{session.workoutName}</strong><span>{new Date(session.startedAt).toLocaleString()}</span></div>
-        <Metric value={formatDuration(session.elapsedSeconds)} unit="duration" /><Metric value={`${session.averagePowerWatts}`} unit="W avg" /><Metric value={`${session.maxPowerWatts}`} unit="W max" /><ChevronRight />
+        <Metric value={formatDuration(session.elapsedSeconds)} unit="duration" /><Metric value={`${session.averagePowerWatts}`} unit="W avg" /><DistanceMetric meters={session.estimatedDistanceMeters} unit={distanceUnit} /><ChevronRight />
       </button>)}</div>}
-      {selected && <div className="modal-backdrop"><div className="modal detail-modal"><button className="modal-close" onClick={onClose}><X /></button><span className="label">RIDE DETAIL</span><h2>{selected.summary.workoutName}</h2><p>{new Date(selected.summary.startedAt).toLocaleString()}</p><div className="detail-metrics"><Metric value={formatDuration(selected.summary.elapsedSeconds)} unit="duration" /><Metric value={`${selected.summary.averagePowerWatts}`} unit="W average" /><Metric value={`${selected.summary.maxPowerWatts}`} unit="W maximum" /><Metric value={`${Math.round(selected.summary.averageCadenceRpm ?? 0)}`} unit="rpm average" /></div><ResponsiveContainer width="100%" height={220}><AreaChart data={selected.samples}><CartesianGrid strokeDasharray="4 4" vertical={false}/><XAxis dataKey="timestampMs" hide/><YAxis width={42}/><Tooltip labelFormatter={() => ""}/><Area type="monotone" dataKey="powerWatts" stroke="#c8ff32" fill="#c8ff3233" isAnimationActive={false}/></AreaChart></ResponsiveContainer><div className="detail-actions"><button className="primary" onClick={() => onGarmin(selected.summary)}><Upload size={16}/> Upload to Garmin</button><button className="secondary" onClick={() => onExportFit(selected.summary)}><Download size={16}/> Export FIT</button><button className="secondary" onClick={() => onExport(selected.summary)}><Download size={16}/> Export CSV</button></div><p className="handoff-note">Garmin Connect and Finder will open. Drag the selected FIT file onto Garmin’s import page, then confirm the upload.</p></div></div>}
+      {selected && <div className="modal-backdrop"><div className="modal detail-modal"><button className="modal-close" onClick={onClose}><X /></button><span className="label">RIDE DETAIL</span><h2>{selected.summary.workoutName}</h2><p>{new Date(selected.summary.startedAt).toLocaleString()}</p><div className="detail-metrics"><Metric value={formatDuration(selected.summary.elapsedSeconds)} unit="duration" /><Metric value={`${selected.summary.averagePowerWatts}`} unit="W average" /><Metric value={`${selected.summary.maxPowerWatts}`} unit="W maximum" /><Metric value={`${Math.round(selected.summary.averageCadenceRpm ?? 0)}`} unit="rpm average" /><DistanceMetric meters={selected.summary.estimatedDistanceMeters} unit={distanceUnit} /></div><p className="distance-note">Estimated distance · {distanceSourceLabel(selected.summary.distanceSource)}</p><ResponsiveContainer width="100%" height={220}><AreaChart data={selected.samples}><CartesianGrid strokeDasharray="4 4" vertical={false}/><XAxis dataKey="timestampMs" hide/><YAxis width={42}/><Tooltip labelFormatter={() => ""}/><Area type="monotone" dataKey="powerWatts" stroke="#c8ff32" fill="#c8ff3233" isAnimationActive={false}/></AreaChart></ResponsiveContainer><div className="detail-actions"><button className="primary" onClick={() => onGarmin(selected.summary)}><Upload size={16}/> Upload to Garmin</button><button className="secondary" onClick={() => onExportFit(selected.summary)}><Download size={16}/> Export FIT</button><button className="secondary" onClick={() => onExport(selected.summary)}><Download size={16}/> Export CSV</button></div><p className="handoff-note">Garmin Connect and Finder will open. Drag the selected FIT file onto Garmin’s import page, then confirm the upload.</p></div></div>}
     </>
   );
+}
+
+const KG_PER_LB = 0.45359237;
+
+function displayedWeight(kg: number, unit: Profile["weightUnit"]) {
+  return Number((unit === "lb" ? kg / KG_PER_LB : kg).toFixed(1));
+}
+
+function storedWeight(value: number, unit: Profile["weightUnit"]) {
+  return unit === "lb" ? value * KG_PER_LB : value;
 }
 
 function SettingsPage({ profile, onSave, onForgetDevices }: { profile: Profile; onSave: (profile: Profile) => void; onForgetDevices: () => Promise<void> }) {
@@ -716,12 +733,15 @@ function SettingsPage({ profile, onSave, onForgetDevices }: { profile: Profile; 
     void api.logFilePath().then(setLogPath);
     void api.rideFilesPath().then(setRideFilesPath);
   }, []);
+  useEffect(() => setDraft(profile), [profile]);
   return (
     <>
       <PageHeader eyebrow="LOCAL PROFILE" title="Settings" />
-      <section className="card settings-card"><div><span className="label">RIDER PROFILE</span><h2>Training zones</h2><p>Your FTP converts percentage-based workouts into trainer power targets. The safety limit always caps requested power.</p></div><form onSubmit={(event) => { event.preventDefault(); onSave(draft); }}>
+      <section className="card settings-card"><div><span className="label">RIDER PROFILE</span><h2>Training and distance</h2><p>Your weight and bike weight support flat-road distance estimates when the trainer does not report speed. Values are stored in kilograms regardless of display units.</p></div><form onSubmit={(event) => { event.preventDefault(); onSave(draft); }}>
         <label>Rider name<input value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })}/></label>
         <div className="form-row"><label>FTP (watts)<input type="number" min="50" max="500" value={draft.ftpWatts} onChange={(event) => setDraft({ ...draft, ftpWatts: Number(event.target.value) })}/></label><label>Safety power limit<input type="number" min="100" max="2500" value={draft.maxPowerWatts} onChange={(event) => setDraft({ ...draft, maxPowerWatts: Number(event.target.value) })}/></label></div>
+        <div className="form-row"><label>Weight unit<select value={draft.weightUnit} onChange={(event) => setDraft({ ...draft, weightUnit: event.target.value as Profile["weightUnit"] })}><option value="kg">Kilograms (kg)</option><option value="lb">Pounds (lb)</option></select></label><label>Distance unit<select value={draft.distanceUnit} onChange={(event) => setDraft({ ...draft, distanceUnit: event.target.value as Profile["distanceUnit"] })}><option value="km">Kilometers</option><option value="mi">Miles</option></select></label></div>
+        <div className="form-row"><label>Rider weight ({draft.weightUnit})<input type="number" step="0.1" min={draft.weightUnit === "lb" ? 66 : 30} max={draft.weightUnit === "lb" ? 551 : 250} value={displayedWeight(draft.riderWeightKg, draft.weightUnit)} onChange={(event) => setDraft({ ...draft, riderWeightKg: storedWeight(Number(event.target.value), draft.weightUnit) })}/></label><label>Bike weight ({draft.weightUnit})<input type="number" step="0.1" min={draft.weightUnit === "lb" ? 7 : 3} max={draft.weightUnit === "lb" ? 88 : 40} value={displayedWeight(draft.bikeWeightKg, draft.weightUnit)} onChange={(event) => setDraft({ ...draft, bikeWeightKg: storedWeight(Number(event.target.value), draft.weightUnit) })}/></label></div>
         <button className="primary" type="submit">Save settings</button>
       </form></section>
       <section className="card settings-card"><div><span className="label">DATA & DIAGNOSTICS</span><h2>Local-first by design</h2><p>Every finalized ride is stored in SQLite and as a persistent Garmin-compatible FIT file. Missing FIT files are regenerated automatically.</p></div><div className="data-locations"><div className="log-location"><span>Ride Files</span><code>{rideFilesPath}</code><button className="secondary" onClick={() => void api.revealRideFiles().catch(() => undefined)}>Show Ride Files</button></div><div className="log-location"><span>Log file</span><code>{logPath}</code><button className="secondary" onClick={() => void api.revealLogFile().catch(() => undefined)}>Show in folder</button><button className="secondary" onClick={() => void navigator.clipboard.writeText(logPath)}>Copy path</button></div><div className="log-location"><span>Known devices</span><p className="settings-note">Devices you have connected are remembered on this computer so they can be reconnected without scanning. Forgetting them does not disconnect anything.</p><button className="danger-button" onClick={() => void onForgetDevices()}>Forget all devices</button></div></div></section>
@@ -763,6 +783,18 @@ function flattenSteps(steps: WorkoutStep[]): WorkoutStep[] {
 
 function Metric({ value, unit }: { value: string; unit: string }) {
   return <div className="metric"><strong>{value}</strong><span>{unit}</span></div>;
+}
+
+function DistanceMetric({ meters, unit }: { meters: number; unit: Profile["distanceUnit"] }) {
+  const formatted = formatDistance(meters, unit);
+  return <Metric value={formatted.value} unit={`${formatted.unit} estimated`} />;
+}
+
+function distanceSourceLabel(source: SessionSummary["distanceSource"]) {
+  if (source === "trainer") return "trainer speed";
+  if (source === "mixed") return "trainer speed and power model";
+  if (source === "power") return "flat-road power model";
+  return "no telemetry";
 }
 
 function LiveMetric({ icon: Icon, label, value, unit, accent = false, note }: { icon: typeof Activity; label: string; value: string | number; unit: string; accent?: boolean; note?: string | null }) {

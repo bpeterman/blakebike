@@ -250,7 +250,8 @@ textarea { min-height: 70px; resize: vertical; }
 .add-steps svg { width: 13px; }
 .editor-actions { justify-content: end; margin-top: 18px; }
 .detail-modal { width: min(760px, 95vw); }
-.detail-metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin: 20px 0; padding: 14px; border-radius: 9px; background: #222620; }
+.detail-metrics { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin: 20px 0 8px; padding: 14px; border-radius: 9px; background: #222620; }
+.distance-note { margin: 0 0 14px; color: #7f887a; font-size: 11px; }
 .detail-actions { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 15px; }
 .handoff-note { margin: 10px 0 0; color: #7f887a; font-size: 11px; }
 
