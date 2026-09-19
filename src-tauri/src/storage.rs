@@ -9,9 +9,10 @@ use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
 use crate::{
-    devices::SourcePreferences,
+    devices::{KnownDevice, SourcePreferences},
     domain::{
-        PowerTarget, Profile, SessionDetail, SessionSummary, Telemetry, Workout, WorkoutStep,
+        DistanceSource, DistanceUnit, PowerTarget, Profile, SessionDetail, SessionSummary,
+        Telemetry, WeightUnit, Workout, WorkoutStep,
     },
 };
 
@@ -73,9 +74,51 @@ impl Storage {
                   key TEXT PRIMARY KEY,
                   value_json TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS known_devices (
+                  id TEXT PRIMARY KEY,
+                  payload_json TEXT NOT NULL,
+                  last_connected_at TEXT NOT NULL
+                );
                 ",
             )
             .map_err(|error| error.to_string())?;
+        ensure_column(
+            &connection,
+            "profiles",
+            "rider_weight_kg",
+            "REAL NOT NULL DEFAULT 75.0",
+        )?;
+        ensure_column(
+            &connection,
+            "profiles",
+            "bike_weight_kg",
+            "REAL NOT NULL DEFAULT 9.0",
+        )?;
+        ensure_column(
+            &connection,
+            "profiles",
+            "weight_unit",
+            "TEXT NOT NULL DEFAULT 'kg'",
+        )?;
+        ensure_column(
+            &connection,
+            "profiles",
+            "distance_unit",
+            "TEXT NOT NULL DEFAULT 'km'",
+        )?;
+        ensure_column(
+            &connection,
+            "sessions",
+            "estimated_distance_meters",
+            "REAL NOT NULL DEFAULT 0.0",
+        )?;
+        ensure_column(&connection, "sessions", "distance_source", "TEXT")?;
+        ensure_column(
+            &connection,
+            "sessions",
+            "distance_weight_kg",
+            "REAL NOT NULL DEFAULT 84.0",
+        )?;
         let storage = Self {
             connection: Mutex::new(connection),
         };
@@ -104,12 +147,19 @@ impl Storage {
             let profile = Profile::default();
             connection
                 .execute(
-                    "INSERT INTO profiles(id, name, ftp_watts, max_power_watts) VALUES(?1, ?2, ?3, ?4)",
+                    "INSERT INTO profiles(
+                       id, name, ftp_watts, max_power_watts, rider_weight_kg, bike_weight_kg,
+                       weight_unit, distance_unit
+                     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                     params![
                         profile.id.to_string(),
                         profile.name,
                         profile.ftp_watts,
-                        profile.max_power_watts
+                        profile.max_power_watts,
+                        profile.rider_weight_kg,
+                        profile.bike_weight_kg,
+                        weight_unit_value(profile.weight_unit),
+                        distance_unit_value(profile.distance_unit),
                     ],
                 )
                 .map_err(|error| error.to_string())?;
@@ -127,7 +177,8 @@ impl Storage {
     pub fn profile(&self) -> Result<Profile, String> {
         self.connection()?
             .query_row(
-                "SELECT id, name, ftp_watts, max_power_watts FROM profiles WHERE active = 1 LIMIT 1",
+                "SELECT id, name, ftp_watts, max_power_watts, rider_weight_kg, bike_weight_kg,
+                 weight_unit, distance_unit FROM profiles WHERE active = 1 LIMIT 1",
                 [],
                 |row| {
                     Ok(Profile {
@@ -135,6 +186,10 @@ impl Storage {
                         name: row.get(1)?,
                         ftp_watts: row.get(2)?,
                         max_power_watts: row.get(3)?,
+                        rider_weight_kg: row.get(4)?,
+                        bike_weight_kg: row.get(5)?,
+                        weight_unit: parse_weight_unit(&row.get::<_, String>(6)?),
+                        distance_unit: parse_distance_unit(&row.get::<_, String>(7)?),
                     })
                 },
             )
@@ -145,17 +200,32 @@ impl Storage {
         if profile.name.trim().is_empty() || !(50..=500).contains(&profile.ftp_watts) {
             return Err("Enter a name and an FTP between 50 and 500 watts".into());
         }
+        if !(30.0..=250.0).contains(&profile.rider_weight_kg)
+            || !(3.0..=40.0).contains(&profile.bike_weight_kg)
+        {
+            return Err("Enter a rider weight from 30–250 kg and bike weight from 3–40 kg".into());
+        }
         self.connection()?
             .execute(
-                "INSERT INTO profiles(id, name, ftp_watts, max_power_watts, active)
-                 VALUES(?1, ?2, ?3, ?4, 1)
+                "INSERT INTO profiles(
+                   id, name, ftp_watts, max_power_watts, rider_weight_kg, bike_weight_kg,
+                   weight_unit, distance_unit, active
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1)
                  ON CONFLICT(id) DO UPDATE SET name = excluded.name,
-                   ftp_watts = excluded.ftp_watts, max_power_watts = excluded.max_power_watts",
+                   ftp_watts = excluded.ftp_watts, max_power_watts = excluded.max_power_watts,
+                   rider_weight_kg = excluded.rider_weight_kg,
+                   bike_weight_kg = excluded.bike_weight_kg,
+                   weight_unit = excluded.weight_unit,
+                   distance_unit = excluded.distance_unit",
                 params![
                     profile.id.to_string(),
                     profile.name,
                     profile.ftp_watts,
-                    profile.max_power_watts
+                    profile.max_power_watts,
+                    profile.rider_weight_kg,
+                    profile.bike_weight_kg,
+                    weight_unit_value(profile.weight_unit),
+                    distance_unit_value(profile.distance_unit),
                 ],
             )
             .map_err(|error| error.to_string())?;
@@ -199,6 +269,53 @@ impl Storage {
 
     pub fn save_source_preferences(&self, preferences: &SourcePreferences) -> Result<(), String> {
         self.save_setting(SOURCE_PREFERENCES_KEY, preferences)
+    }
+
+    /// Remember (or refresh) a device after a successful connection.
+    pub fn remember_device(&self, device: &KnownDevice) -> Result<(), String> {
+        let json = serde_json::to_string(device).map_err(|error| error.to_string())?;
+        self.connection()?
+            .execute(
+                "INSERT INTO known_devices(id, payload_json, last_connected_at) VALUES(?1, ?2, ?3)
+                 ON CONFLICT(id) DO UPDATE SET payload_json = excluded.payload_json,
+                                               last_connected_at = excluded.last_connected_at",
+                params![device.id, json, device.last_connected_at.to_rfc3339()],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    /// Remembered devices, most recently connected first.
+    pub fn known_devices(&self) -> Result<Vec<KnownDevice>, String> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare("SELECT payload_json FROM known_devices ORDER BY last_connected_at DESC")
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?;
+        let mut devices = Vec::new();
+        for row in rows {
+            let json = row.map_err(|error| error.to_string())?;
+            match serde_json::from_str::<KnownDevice>(&json) {
+                Ok(device) => devices.push(device),
+                Err(error) => tracing::warn!(error = %error, "Skipping unreadable known device"),
+            }
+        }
+        Ok(devices)
+    }
+
+    pub fn forget_device(&self, id: &str) -> Result<(), String> {
+        self.connection()?
+            .execute("DELETE FROM known_devices WHERE id = ?1", params![id])
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    pub fn forget_all_devices(&self) -> Result<usize, String> {
+        self.connection()?
+            .execute("DELETE FROM known_devices", [])
+            .map_err(|error| error.to_string())
     }
 
     pub fn workouts(&self) -> Result<Vec<Workout>, String> {
@@ -266,6 +383,7 @@ impl Storage {
         &self,
         workout_id: Option<Uuid>,
         workout_name: &str,
+        distance_weight_kg: f32,
     ) -> Result<SessionSummary, String> {
         let summary = SessionSummary {
             id: Uuid::new_v4(),
@@ -277,17 +395,21 @@ impl Storage {
             average_power_watts: 0,
             max_power_watts: 0,
             average_cadence_rpm: None,
+            estimated_distance_meters: 0.0,
+            distance_source: None,
+            distance_weight_kg,
             completed: false,
         };
         self.connection()?
             .execute(
-                "INSERT INTO sessions(id, workout_id, workout_name, started_at)
-                 VALUES(?1, ?2, ?3, ?4)",
+                "INSERT INTO sessions(id, workout_id, workout_name, started_at, distance_weight_kg)
+                 VALUES(?1, ?2, ?3, ?4, ?5)",
                 params![
                     summary.id.to_string(),
                     summary.workout_id.map(|id| id.to_string()),
                     summary.workout_name,
-                    summary.started_at.to_rfc3339()
+                    summary.started_at.to_rfc3339(),
+                    summary.distance_weight_kg,
                 ],
             )
             .map_err(|error| error.to_string())?;
@@ -311,7 +433,9 @@ impl Storage {
             .execute(
                 "UPDATE sessions SET ended_at = ?2, elapsed_seconds = ?3,
                   average_power_watts = ?4, max_power_watts = ?5,
-                  average_cadence_rpm = ?6, completed = ?7 WHERE id = ?1",
+                  average_cadence_rpm = ?6, completed = ?7,
+                  estimated_distance_meters = ?8, distance_source = ?9,
+                  distance_weight_kg = ?10 WHERE id = ?1",
                 params![
                     summary.id.to_string(),
                     summary.ended_at.map(|date| date.to_rfc3339()),
@@ -320,6 +444,9 @@ impl Storage {
                     summary.max_power_watts,
                     summary.average_cadence_rpm,
                     summary.completed,
+                    summary.estimated_distance_meters,
+                    summary.distance_source.map(distance_source_value),
+                    summary.distance_weight_kg,
                 ],
             )
             .map_err(|error| error.to_string())?;
@@ -331,7 +458,8 @@ impl Storage {
         let mut statement = connection
             .prepare(
                 "SELECT id, workout_id, workout_name, started_at, ended_at, elapsed_seconds,
-                 average_power_watts, max_power_watts, average_cadence_rpm, completed
+                 average_power_watts, max_power_watts, average_cadence_rpm, completed,
+                 estimated_distance_meters, distance_source, distance_weight_kg
                  FROM sessions ORDER BY started_at DESC",
             )
             .map_err(|error| error.to_string())?;
@@ -347,7 +475,8 @@ impl Storage {
         let summary = connection
             .query_row(
                 "SELECT id, workout_id, workout_name, started_at, ended_at, elapsed_seconds,
-                 average_power_watts, max_power_watts, average_cadence_rpm, completed
+                 average_power_watts, max_power_watts, average_cadence_rpm, completed,
+                 estimated_distance_meters, distance_source, distance_weight_kg
                  FROM sessions WHERE id = ?1",
                 [id.to_string()],
                 row_to_session,
@@ -479,6 +608,56 @@ mod tests {
         let updated = SourcePreferences::default();
         storage.save_source_preferences(&updated).unwrap();
         assert_eq!(storage.source_preferences().unwrap(), updated);
+    }
+
+    #[test]
+    fn remembers_and_forgets_devices() {
+        use crate::devices::{Capability, DeviceRole};
+        let storage = Storage::in_memory().unwrap();
+        assert!(storage.known_devices().unwrap().is_empty());
+        let strap = KnownDevice {
+            id: "strap".into(),
+            name: "HRM-Pro".into(),
+            role: DeviceRole::HeartRate,
+            capabilities: vec![Capability::HeartRate],
+            simulated: false,
+            manufacturer: Some("Garmin".into()),
+            model: None,
+            last_connected_at: Utc::now() - chrono::Duration::minutes(5),
+        };
+        let trainer = KnownDevice {
+            id: "kickr".into(),
+            name: "KICKR CORE".into(),
+            role: DeviceRole::Trainer,
+            capabilities: vec![Capability::Ftms, Capability::CyclingPower],
+            simulated: false,
+            manufacturer: Some("Wahoo".into()),
+            model: Some("KICKR CORE".into()),
+            last_connected_at: Utc::now(),
+        };
+        storage.remember_device(&strap).unwrap();
+        storage.remember_device(&trainer).unwrap();
+        let known = storage.known_devices().unwrap();
+        assert_eq!(known.len(), 2);
+        assert_eq!(known[0].id, "kickr", "most recent first");
+        assert_eq!(known[1].manufacturer.as_deref(), Some("Garmin"));
+
+        // Reconnecting refreshes the row instead of duplicating it.
+        let refreshed = KnownDevice {
+            last_connected_at: Utc::now() + chrono::Duration::minutes(1),
+            model: Some("HRM-Pro Plus".into()),
+            ..strap.clone()
+        };
+        storage.remember_device(&refreshed).unwrap();
+        let known = storage.known_devices().unwrap();
+        assert_eq!(known.len(), 2);
+        assert_eq!(known[0].id, "strap");
+        assert_eq!(known[0].model.as_deref(), Some("HRM-Pro Plus"));
+
+        storage.forget_device("strap").unwrap();
+        assert_eq!(storage.known_devices().unwrap().len(), 1);
+        assert_eq!(storage.forget_all_devices().unwrap(), 1);
+        assert!(storage.known_devices().unwrap().is_empty());
     }
 
     #[test]

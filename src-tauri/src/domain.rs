@@ -9,6 +9,24 @@ pub struct Profile {
     pub name: String,
     pub ftp_watts: u16,
     pub max_power_watts: u16,
+    pub rider_weight_kg: f32,
+    pub bike_weight_kg: f32,
+    pub weight_unit: WeightUnit,
+    pub distance_unit: DistanceUnit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WeightUnit {
+    Kg,
+    Lb,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DistanceUnit {
+    Km,
+    Mi,
 }
 
 impl Default for Profile {
@@ -18,6 +36,10 @@ impl Default for Profile {
             name: "Rider".into(),
             ftp_watts: 200,
             max_power_watts: 800,
+            rider_weight_kg: 75.0,
+            bike_weight_kg: 9.0,
+            weight_unit: WeightUnit::Kg,
+            distance_unit: DistanceUnit::Km,
         }
     }
 }
@@ -263,7 +285,18 @@ pub struct SessionSummary {
     pub average_power_watts: u16,
     pub max_power_watts: u16,
     pub average_cadence_rpm: Option<f32>,
+    pub estimated_distance_meters: f64,
+    pub distance_source: Option<DistanceSource>,
+    pub distance_weight_kg: f32,
     pub completed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DistanceSource {
+    Trainer,
+    Power,
+    Mixed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1,5 +1,6 @@
 mod commands;
 mod devices;
+mod distance;
 mod domain;
 mod fit;
 mod formats;
@@ -128,6 +129,9 @@ pub fn run() {
             commands::device_log,
             commands::get_source_preferences,
             commands::set_source_preferences,
+            commands::known_devices,
+            commands::forget_device,
+            commands::forget_all_devices,
             commands::get_profile,
             commands::save_profile,
             commands::list_workouts,

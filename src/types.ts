@@ -84,6 +84,18 @@ export type DeviceSlot = {
   log: DeviceLogLine[];
 };
 
+export type KnownDevice = {
+  id: string;
+  name: string;
+  role: DeviceRole;
+  capabilities: Capability[];
+  simulated: boolean;
+  manufacturer: string | null;
+  model: string | null;
+  /** RFC 3339 timestamp of the last successful connection. */
+  lastConnectedAt: string;
+};
+
 export type SourceChoice = { mode: "auto" } | { mode: "role"; role: DeviceRole };
 
 export type Metric = "power" | "cadence" | "heartRate";

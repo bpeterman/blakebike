@@ -346,3 +346,20 @@ textarea { min-height: 70px; resize: vertical; }
   .device-grid { grid-template-columns: 1fr; }
   .sources-card { grid-template-columns: 1fr; gap: 18px; }
 }
+
+/* Known devices */
+.known-devices { display: grid; gap: 14px; margin-bottom: 16px; padding: 20px; }
+.known-head { display: flex; justify-content: space-between; align-items: end; gap: 20px; }
+.known-head h2 { margin: 2px 0 0; font-size: 18px; }
+.known-head p { margin: 0; font-size: 12px; }
+.known-list { display: grid; gap: 7px; }
+.known-row { display: grid; grid-template-columns: auto 1fr auto auto auto; align-items: center; gap: 12px; padding: 10px 12px; border: 1px solid #2a2f28; border-radius: 9px; background: #151814; }
+.known-title { display: grid; min-width: 0; }
+.known-title strong { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.known-title span { color: #7e8778; font-size: 11px; }
+.known-when { color: #687063; font-size: 11px; white-space: nowrap; }
+.known-row .primary, .known-row .secondary { min-height: 34px; padding: 0 12px; }
+.device-card-title { min-width: 0; display: grid; }
+.device-make { color: #7e8778; font-size: 11px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.device-make-inline { margin-left: 8px; color: #7e8778; font-size: 11px; font-style: normal; font-weight: 500; }
+.settings-note { margin: 0; font-size: 12px; }

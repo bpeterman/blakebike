@@ -24,6 +24,8 @@ pub const FIRMWARE_REVISION: u16 = 0x2A26;
 pub const GATT_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 pub const GATT_STEP_TIMEOUT: Duration = Duration::from_secs(10);
 const SCAN_WINDOW: Duration = Duration::from_secs(3);
+/// How long a targeted scan waits for one specific device to show up.
+pub const FIND_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A GATT service a discovered device advertises that we know how to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -141,6 +143,69 @@ impl Ble {
 
     pub async fn peripheral(&self, id: &str) -> Option<Peripheral> {
         self.discovered.lock().await.get(id).cloned()
+    }
+
+    /// Scan until the peripheral with `id` is seen (or `FIND_TIMEOUT` passes),
+    /// remembering it so a following connect can use it. Returns the device as
+    /// currently advertised.
+    pub async fn find(&self, id: &str) -> Result<DeviceInfo, String> {
+        let adapter = self.adapter().await?;
+        adapter
+            .start_scan(ScanFilter::default())
+            .await
+            .map_err(|error| format!("Could not start Bluetooth scan: {error}"))?;
+        let deadline = tokio::time::Instant::now() + FIND_TIMEOUT;
+        let mut found = None;
+        while tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            let peripherals = adapter
+                .peripherals()
+                .await
+                .map_err(|error| format!("Could not read Bluetooth devices: {error}"))?;
+            if let Some(peripheral) = peripherals
+                .into_iter()
+                .find(|peripheral| peripheral.id().to_string() == id)
+            {
+                found = Some(peripheral);
+                break;
+            }
+        }
+        if let Err(error) = adapter.stop_scan().await {
+            tracing::debug!(error = %error, "Could not stop scan (ignored)");
+        }
+        let peripheral = found.ok_or_else(|| {
+            format!(
+                "Device was not seen within {}s; make sure it is awake and nearby",
+                FIND_TIMEOUT.as_secs()
+            )
+        })?;
+        let properties = peripheral
+            .properties()
+            .await
+            .map_err(|error| format!("Could not read device properties: {error}"))?
+            .ok_or_else(|| "Device has not advertised its properties yet".to_string())?;
+        let capabilities: Vec<Capability> = Capability::ALL
+            .into_iter()
+            .filter(|capability| {
+                properties
+                    .services
+                    .iter()
+                    .any(|uuid| *uuid == bluetooth_uuid(capability.service()))
+            })
+            .collect();
+        self.discovered
+            .lock()
+            .await
+            .insert(id.to_string(), peripheral);
+        Ok(DeviceInfo {
+            id: id.to_string(),
+            name: properties
+                .local_name
+                .unwrap_or_else(|| default_name(&capabilities).into()),
+            simulated: false,
+            rssi: properties.rssi,
+            capabilities,
+        })
     }
 
     /// One scan window; returns every peripheral advertising at least one
