@@ -378,6 +378,36 @@ impl DeviceSlot {
         inner.stats.last_reading = Some(summary);
     }
 
+    /// Update battery information delivered after connection (for example,
+    /// the optional ANT+ HRM page 7) and immediately refresh the device card.
+    /// Returns true when the displayed value changed.
+    pub fn record_battery_percent(&self, battery_percent: u8) -> bool {
+        let changed = {
+            let mut inner = self
+                .stats
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if inner.stats.battery_percent == Some(battery_percent) {
+                false
+            } else {
+                inner.stats.battery_percent = Some(battery_percent);
+                true
+            }
+        };
+        if changed {
+            self.emit(
+                "devices://slot",
+                SlotSnapshot {
+                    role: self.role,
+                    state: self.state.borrow().clone(),
+                    stats: self.stats(),
+                    log: self.log.tail(log::TAIL),
+                },
+            );
+        }
+        changed
+    }
+
     pub async fn set_calibration(&self, supported: Option<bool>, calibrating: Option<bool>) {
         {
             let mut inner = self
@@ -1337,6 +1367,9 @@ mod tests {
         assert_eq!(stats.samples, 2);
         assert_eq!(stats.last_raw_hex.as_deref(), Some("10 5a"));
         assert!(stats.rate_hz > 0.0);
+        assert!(slot.record_battery_percent(82));
+        assert!(!slot.record_battery_percent(82));
+        assert_eq!(slot.stats().battery_percent, Some(82));
         slot.record_drop();
         assert_eq!(slot.stats().drops, 1);
         assert_eq!(slot.stats().rate_hz, 0.0);

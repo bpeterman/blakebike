@@ -157,6 +157,15 @@ fn record(
     first: bool,
 ) {
     slot.record_sample(Some(raw));
+    if let Some(battery_percent) = measurement.battery_percent
+        && slot.record_battery_percent(battery_percent)
+    {
+        slot.note(
+            "ok",
+            "ANT battery received",
+            Some(format!("{battery_percent}%")),
+        );
+    }
     let Some(bpm) = measurement.bpm else {
         return;
     };
