@@ -132,6 +132,17 @@ pub fn forget_all_devices(state: State<'_, AppState>) -> Result<usize, String> {
 }
 
 #[tauri::command]
+pub fn restore_known_devices(
+    state: State<'_, AppState>,
+    devices: Vec<KnownDevice>,
+) -> Result<(), String> {
+    for device in devices {
+        state.storage.remember_device(&device)?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn disconnect_device(state: State<'_, AppState>, role: DeviceRole) -> Result<(), String> {
     tracing::debug!(?role, "command disconnect_device");
     state.devices.disconnect_role(role).await;

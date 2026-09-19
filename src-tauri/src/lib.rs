@@ -184,6 +184,7 @@ pub fn run() {
             commands::known_devices,
             commands::forget_device,
             commands::forget_all_devices,
+            commands::restore_known_devices,
             commands::get_profile,
             commands::save_profile,
             commands::intervals_api_key_configured,

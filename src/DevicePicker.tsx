@@ -4,6 +4,7 @@ import { api } from "./api";
 import type { AntAdapterStatus, DeviceInfo, DeviceLogLine, DeviceRole, DeviceSlot, KnownDevice } from "./types";
 import { deviceRoleLabel } from "./types";
 import { capabilityLabel, deviceFitsRole, makeAndModel, readoutMark, transportLabel } from "./devices";
+import { useDialog } from "./useDialog";
 
 const roleHint: Record<DeviceRole, string> = {
   trainer: "Make sure your trainer is awake and not paired with another app.",
@@ -98,6 +99,7 @@ export function DevicePicker({
   const state = slot?.state;
   const connected = state?.status === "ready" || state?.status === "controlling";
   const busy = connecting !== null && outcome === null;
+  const dialogRef = useDialog(close, !busy);
   const error =
     state?.status === "error" ? { message: state.message, guidance: state.guidance } : scanError;
   const antError = role === "heartRate" && antAdapter && ["permissionDenied", "busy", "error"].includes(antAdapter.status)
@@ -105,8 +107,10 @@ export function DevicePicker({
     : null;
 
   return (
-    <div className="modal-backdrop">
-      <div className="modal device-modal">
+    <div className="modal-backdrop dialog-enter" role="presentation" onMouseDown={(event) => {
+      if (event.target === event.currentTarget && !busy) close();
+    }}>
+      <section ref={dialogRef} className="modal device-modal" role="dialog" aria-modal="true" aria-labelledby="device-picker-title" tabIndex={-1}>
         <button className="modal-close" disabled={busy} onClick={close} aria-label="Close">
           <X />
         </button>
@@ -116,7 +120,7 @@ export function DevicePicker({
         <span className="label">
           {supportsAnt ? "BLUETOOTH + ANT+" : "BLUETOOTH"} · {label.toUpperCase()}
         </span>
-        <h2>
+        <h2 id="device-picker-title">
           {connecting
             ? outcome === "connected"
               ? `${label} connected`
@@ -241,7 +245,7 @@ export function DevicePicker({
             </button>
           )}
         </div>
-      </div>
+      </section>
     </div>
   );
 }

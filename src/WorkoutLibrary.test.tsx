@@ -53,5 +53,8 @@ describe("WorkoutLibrary", () => {
     expect(
       screen.getByRole("button", { name: "Export all ZWO" }),
     ).toBeDisabled();
+    expect(screen.getByRole("heading", { name: "Your next ride starts here" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Create a workout" }));
+    expect(props.onCreate).toHaveBeenCalled();
   });
 });
