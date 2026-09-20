@@ -868,8 +868,8 @@ function Overview({
         <article className="card ftp-card">
           <button
             className="icon-button ftp-refresh"
-            title="Sync FTP and zones from Intervals.icu"
-            aria-label="Sync FTP and zones from Intervals.icu"
+            title="Sync from Intervals.icu"
+            aria-label="Sync from Intervals.icu"
             disabled={syncingTraining}
             onClick={() => void syncTraining()}
           >

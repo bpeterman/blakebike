@@ -22,7 +22,7 @@ use crate::{
     runner::RunnerState,
     storage::{
         PowerSmoothing, RideDisplayPreferences, Storage, TrainingZoneSettings, ZoneDefinition,
-        ZoneMode,
+        ZoneMode, validate_zones,
     },
 };
 
@@ -352,8 +352,9 @@ pub async fn sync_training_settings(
     let profile = state.storage.profile()?;
     let zones = state.storage.training_zones()?;
     let result = apply_cycling_settings(profile, zones, settings)?;
-    state.storage.save_training_zones(&result.zones)?;
-    state.storage.save_profile(&result.profile)?;
+    state
+        .storage
+        .save_training_settings(&result.profile, &result.zones)?;
     tracing::info!(
         ftp = result.ftp.watts,
         ftp_source = ?result.ftp.source,
@@ -400,6 +401,7 @@ fn apply_cycling_settings(
             }
             zone_definitions(&boundaries, &set.names)
         },
+        |definitions| validate_zones("heart-rate", ZoneMode::Intervals, definitions, 30, 250),
         &mut zones.heart_rate_mode,
         &mut zones.heart_rate_zones,
     );
@@ -412,6 +414,7 @@ fn apply_cycling_settings(
                 &set.names,
             )
         },
+        |definitions| validate_zones("power", ZoneMode::Intervals, definitions, 1, 3_000),
         &mut zones.power_mode,
         &mut zones.power_zones,
     );
@@ -425,10 +428,14 @@ fn apply_cycling_settings(
     })
 }
 
+/// `validate` is the same check storage applies on save, run here so an
+/// unusable import is reported as that set's outcome instead of failing the
+/// whole sync after the other items were already decided.
 fn import_zone_set(
     enabled: bool,
     fetched: Result<ZoneBoundaries, String>,
     definitions: impl FnOnce(ZoneBoundaries) -> Vec<ZoneDefinition>,
+    validate: impl FnOnce(&[ZoneDefinition]) -> Result<(), String>,
     mode: &mut ZoneMode,
     current: &mut Vec<ZoneDefinition>,
 ) -> ZoneSetOutcome {
@@ -443,9 +450,9 @@ fn import_zone_set(
         return ZoneSetOutcome::NotConfigured;
     }
     let imported = definitions(set);
-    if imported.len() < 2 {
+    if let Err(reason) = validate(&imported) {
         return ZoneSetOutcome::Invalid {
-            reason: "Intervals.icu zones leave fewer than two zones".into(),
+            reason: format!("Intervals.icu zones are unusable: {reason}"),
         };
     }
     if *mode == ZoneMode::Intervals && *current == imported {
@@ -638,6 +645,72 @@ mod training_sync_tests {
             ZoneSetOutcome::Invalid { .. }
         ));
         assert_eq!(result.power_zones, ZoneSetOutcome::Imported);
+
+        // Power percentages that collapse to the same watt at a low FTP fail
+        // storage's validation; that is this set's outcome, not a command error.
+        let mut collapsing = settings();
+        collapsing.ftp = Some(CyclingFtp {
+            watts: 50,
+            source: FtpSource::Ftp,
+        });
+        collapsing.power_zones = Ok(ZoneBoundaries {
+            boundaries: vec![55, 56, 57, 90],
+            names: Vec::new(),
+        });
+        let result = apply_cycling_settings(Profile::default(), both_on(), collapsing).unwrap();
+        assert!(matches!(result.power_zones, ZoneSetOutcome::Invalid { .. }));
+        assert_eq!(result.heart_rate_zones, ZoneSetOutcome::Imported);
+        assert_eq!(result.profile.ftp_watts, 50);
+        result.zones.validate().unwrap();
+    }
+
+    #[test]
+    fn drops_a_top_hr_boundary_above_max_hr_too() {
+        let mut fetched = settings();
+        fetched.heart_rate_zones = Ok(ZoneBoundaries {
+            boundaries: vec![120, 145, 166, 182, 200],
+            names: Vec::new(),
+        });
+        let result = apply_cycling_settings(Profile::default(), both_on(), fetched).unwrap();
+        assert_eq!(
+            bounds(&result.zones.heart_rate_zones),
+            vec![Some(120), Some(145), Some(166), Some(182), None]
+        );
+    }
+
+    #[test]
+    fn serializes_the_shape_the_frontend_types_mirror() {
+        let mut fetched = settings();
+        fetched.heart_rate_zones = Err("bad".into());
+        fetched.max_heart_rate_bpm = None;
+        let result = apply_cycling_settings(Profile::default(), both_on(), fetched).unwrap();
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["ftp"]["source"], "indoorFtp");
+        assert_eq!(json["ftp"]["previousWatts"], 200);
+        assert_eq!(json["maxHeartRate"], serde_json::Value::Null);
+        assert_eq!(
+            json["powerZones"],
+            serde_json::json!({ "status": "imported" })
+        );
+        assert_eq!(
+            json["heartRateZones"],
+            serde_json::json!({ "status": "invalid", "reason": "bad" })
+        );
+        assert_eq!(json["zones"]["powerMode"], "intervals");
+        assert_eq!(json["zones"]["syncHeartRateZonesFromIntervals"], true);
+
+        let off = apply_cycling_settings(
+            Profile::default(),
+            TrainingZoneSettings::default(),
+            settings(),
+        )
+        .unwrap();
+        let json = serde_json::to_value(&off).unwrap();
+        assert_eq!(
+            json["powerZones"],
+            serde_json::json!({ "status": "syncOff" })
+        );
+        assert_eq!(json["maxHeartRate"]["previousBpm"], 190);
     }
 
     #[test]
