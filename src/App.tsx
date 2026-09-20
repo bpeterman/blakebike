@@ -11,13 +11,14 @@ import {
   Activity,
   Bike,
   Bluetooth,
+  Route,
   ChevronDown,
   ChevronRight,
-  ChevronUp,
   CircleStop,
   Download,
   ExternalLink,
   Gauge,
+  Flame,
   HeartPulse,
   History,
   Info,
@@ -25,9 +26,12 @@ import {
   Pause,
   Play,
   Plus,
+  Scale,
   RefreshCw,
   Settings,
   SkipForward,
+  Target,
+  Timer,
   Trash2,
   Upload,
   X,
@@ -66,8 +70,7 @@ import type {
   Metric as SourceMetric,
   PowerSmoothing,
   Profile,
-  RideCardId,
-  RideDisplayPreferences,
+
   RunnerState,
   SessionDetail,
   SessionSummary,
@@ -85,15 +88,12 @@ import {
   BIAS_STEP_PERCENT,
   clampBias,
   compileWorkoutIntervals,
-  defaultRideDisplayPreferences,
   defaultTrainingZoneSettings,
   deviceRoleLabel,
   deviceRoles,
   formatDistance,
   formatDuration,
   formatIntervalTarget,
-  formatSpeed,
-  normalizeRideDisplayPreferences,
   downsampleTelemetry,
   effectiveHeartRateZones,
   effectivePowerZones,
@@ -105,6 +105,21 @@ import {
   withSmoothedPower,
   workoutDuration,
 } from "./types";
+import {
+  resolveRideField,
+  rideFieldKey,
+  type RideField,
+  type RideFieldContext,
+  type RideMetric,
+  type RidePanelId,
+} from "./rideFields";
+import {
+  defaultRideDisplayPreferences,
+  migrateRideDisplayPreferences,
+  normalizeRideDisplayPreferences,
+  type RideDisplayPreferences,
+} from "./rideScreens";
+import { RideScreensEditor } from "./RideScreensEditor";
 import { DevicePicker } from "./DevicePicker";
 import { DevicesPage } from "./DevicesPage";
 import { CalibrationModal } from "./CalibrationModal";
@@ -230,7 +245,7 @@ function App() {
       setPowerSmoothing(nextSmoothing);
       setTrainingZones(nextZones);
       setRideDisplayPreferences(
-        normalizeRideDisplayPreferences(nextRideDisplayPreferences),
+        migrateRideDisplayPreferences(nextRideDisplayPreferences),
       );
       setDevMode(nextDevMode);
       if (nextRunner.status === "running" || nextRunner.status === "paused") {
@@ -1012,6 +1027,7 @@ export function Ride({
   perform: (action: () => Promise<unknown>, label?: string) => Promise<void>;
 }) {
   const [targetDraft, setTargetDraft] = useState("100");
+  const [screenIndex, setScreenIndex] = useState(0);
   const [powerChartExpanded, setPowerChartExpanded] = useState(true);
   const [heartRateChartExpanded, setHeartRateChartExpanded] = useState(true);
   const active = runner.status === "running" || runner.status === "paused";
@@ -1026,6 +1042,7 @@ export function Ride({
   const riding = runner.status === "running" || runner.status === "paused";
   const manualErg = riding && runner.manualErg;
   const openEnded = riding && runner.totalSeconds === null;
+  const distanceMeters = riding ? runner.distanceMeters : 0;
   const targetPower = riding ? runner.targetPowerWatts : telemetry.targetPowerWatts;
   // Structured workouts get the same target controls as free ride: ± 5 W,
   // typed watts and ↑/↓ override the current interval; a bias scales the plan.
@@ -1034,7 +1051,13 @@ export function Ride({
   const biasPercent = riding ? runner.biasPercent : 100;
   const structured = riding && !openEnded;
   const adjustable = manualErg || openEnded || (structured && targetPower !== null);
-  const displayedSpeed = formatSpeed(telemetry.speedKph ?? 0, profile.distanceUnit);
+  const screens = displayPreferences.screens;
+  const screen = screens[Math.min(screenIndex, screens.length - 1)];
+  const sessionId = riding ? runner.sessionId : null;
+  // A new ride, or a layout with fewer screens, starts at the first screen.
+  useEffect(() => {
+    setScreenIndex(0);
+  }, [sessionId, screens]);
   const smoothedHistory = useMemo(
     () => withSmoothedPower(telemetryHistory, powerSmoothing),
     [telemetryHistory, powerSmoothing],
@@ -1103,12 +1126,22 @@ export function Ride({
     }, "clear target override");
 
   useEffect(() => {
-    if (runner.status !== "running" || !adjustable) return;
+    if (!active) return;
     const onKeyDown = (event: KeyboardEvent) => {
       // Leave typing in the watts box alone.
       if (event.target instanceof HTMLInputElement) return;
       const action = rideKeyAction(event.key, event.shiftKey, event.repeat);
       if (action === null) return;
+      if (action.kind === "screen") {
+        if (screens.length < 2) return;
+        event.preventDefault();
+        setScreenIndex((index) =>
+          Math.min(screens.length - 1, Math.max(0, index + action.delta)),
+        );
+        return;
+      }
+      // Targets only move while a ride is actually running and adjustable.
+      if (runner.status !== "running" || !adjustable) return;
       if (action.kind === "bias" && !structured) return;
       event.preventDefault();
       if (action.kind === "power") {
@@ -1119,59 +1152,78 @@ export function Ride({
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [adjustable, biasPercent, perform, runner.status, structured]);
+  }, [active, adjustable, biasPercent, perform, runner.status, screens.length, structured]);
 
-  const cardContent = {
-    power: (
-      <div className="ride-card-compact">
-        <LiveMetric icon={Zap} label="POWER" value={displayedPower} unit="W" accent note={sourceNote(telemetry.sources?.power)}
-          control={
-            <span className="metric-control-group">
-              <SourceSelect
-                metric="power"
-                choice={sourcePreferences.power}
-                onChange={(choice) => onSourcePreference("power", choice)}
-              />
-              <label className="smoothing-select">
-                <span className="sr-only">Power smoothing</span>
-                <select value={powerSmoothing} onChange={(event) => onPowerSmoothing(event.target.value as PowerSmoothing)}>
-                  {powerSmoothingOptions.map((option) => (
-                    <option key={option} value={option}>{powerSmoothingLabel[option]}</option>
-                  ))}
-                </select>
-              </label>
-            </span>
-          } />
-      </div>
-    ),
-    cadence: (
-      <div className="ride-card-compact">
-        <LiveMetric
-          icon={RefreshCw}
-          label="CADENCE"
-          value={Math.round(telemetry.cadenceRpm ?? 0)}
-          unit="rpm"
-          note={sourceNote(telemetry.sources?.cadence)}
-          control={
-            <SourceSelect
-              metric="cadence"
-              choice={sourcePreferences.cadence}
-              onChange={(choice) => onSourcePreference("cadence", choice)}
-            />
-          }
+  const intervalHistory = useMemo(() => {
+    if (!riding || runner.intervalElapsedSeconds >= elapsed) return telemetryHistory;
+    const last = telemetryHistory[telemetryHistory.length - 1];
+    if (last === undefined) return telemetryHistory;
+    const startMs = last.timestampMs - runner.intervalElapsedSeconds * 1000;
+    return telemetryHistory.filter((sample) => sample.timestampMs >= startMs);
+  }, [elapsed, riding, runner, telemetryHistory]);
+  const intervalTotalSeconds = riding && !manualErg
+    ? workoutIntervals[runner.intervalIndex]?.durationSeconds ?? null
+    : null;
+  const fieldContext: RideFieldContext = {
+    telemetry,
+    history: telemetryHistory,
+    intervalHistory,
+    displayPowerWatts: displayedPower,
+    elapsedSeconds: elapsed,
+    totalSeconds: openEnded ? null : total === 0 ? null : total,
+    intervalElapsedSeconds: riding ? runner.intervalElapsedSeconds : 0,
+    intervalTotalSeconds,
+    targetPowerWatts: targetPower,
+    distanceMeters,
+    profile,
+  };
+
+  /** The live source picker (and smoothing) belongs on the live readings only. */
+  const fieldControl = (field: RideField) => {
+    if (field.aggregate !== "current") return undefined;
+    if (field.metric === "power") {
+      return (
+        <span className="metric-control-group">
+          <SourceSelect
+            metric="power"
+            choice={sourcePreferences.power}
+            onChange={(choice) => onSourcePreference("power", choice)}
+          />
+          <label className="smoothing-select">
+            <span className="sr-only">Power smoothing</span>
+            <select value={powerSmoothing} onChange={(event) => onPowerSmoothing(event.target.value as PowerSmoothing)}>
+              {powerSmoothingOptions.map((option) => (
+                <option key={option} value={option}>{powerSmoothingLabel[option]}</option>
+              ))}
+            </select>
+          </label>
+        </span>
+      );
+    }
+    if (field.metric === "cadence" || field.metric === "heartRate") {
+      return (
+        <SourceSelect
+          metric={field.metric}
+          choice={sourcePreferences[field.metric]}
+          onChange={(choice) => onSourcePreference(field.metric as SourceMetric, choice)}
         />
-      </div>
-    ),
-    speed: (
-      <div className="ride-card-compact">
-        <LiveMetric icon={Gauge} label="SPEED" value={displayedSpeed.value} unit={displayedSpeed.unit} />
-      </div>
-    ),
-    heartRate: (
-      <div className="ride-card-compact">
-        <LiveMetric icon={HeartPulse} label="HEART RATE" value={telemetry.heartRateBpm ?? "—"} unit="bpm" note={sourceNote(telemetry.sources?.heartRate)} />
-      </div>
-    ),
+      );
+    }
+    return undefined;
+  };
+
+  const fieldNote = (field: RideField): string | null => {
+    if (field.metric === "wattsPerKilogram") {
+      return `${displayedWeight(profile.riderWeightKg, profile.weightUnit)} ${profile.weightUnit} rider`;
+    }
+    if (field.aggregate !== "current") return null;
+    if (field.metric === "power" || field.metric === "cadence" || field.metric === "heartRate") {
+      return sourceNote(telemetry.sources?.[field.metric]);
+    }
+    return null;
+  };
+
+  const panelContent = {
     workoutTimeline: structured && activeWorkout && workoutIntervals.length > 0 ? (
       <WorkoutTimeline
         steps={activeWorkout.steps}
@@ -1319,16 +1371,6 @@ export function Ride({
         )}
       </div>
     ),
-    deviceStats: (
-      <DeviceStatsCard
-        hub={hub}
-        telemetry={telemetry}
-        displayPowerWatts={displayedPower}
-        powerSmoothing={powerSmoothing}
-        historySampleCount={telemetryHistory.length}
-        control={riding ? runner.control : undefined}
-      />
-    ),
     timeInZone: (
       <div className="zone-chart-grid">
         <TimeInZoneChart
@@ -1343,7 +1385,17 @@ export function Ride({
         />
       </div>
     ),
-  } satisfies Record<RideCardId, ReactNode>;
+    deviceStats: (
+      <DeviceStatsCard
+        hub={hub}
+        telemetry={telemetry}
+        displayPowerWatts={displayedPower}
+        powerSmoothing={powerSmoothing}
+        historySampleCount={telemetryHistory.length}
+        control={riding ? runner.control : undefined}
+      />
+    ),
+  } satisfies Record<RidePanelId, ReactNode>;
 
   return (
     <>
@@ -1408,18 +1460,53 @@ export function Ride({
         </section>
       ) : (
         <section className="live-ride">
-          <div className="live-ride-grid">
-            {displayPreferences.cards.map((card) =>
-              card.visible ? (
-                <div
-                  className={card.id === "power" || card.id === "cadence" || card.id === "speed" || card.id === "heartRate" ? "ride-card-cell compact" : "ride-card-cell wide"}
-                  data-ride-card={card.id}
-                  key={card.id}
+          {screens.length > 1 && (
+            <div className="ride-screen-tabs" role="tablist" aria-label="Ride screens">
+              {screens.map((screen, index) => (
+                <button
+                  key={screen.id}
+                  type="button"
+                  role="tab"
+                  aria-selected={index === screenIndex}
+                  className={index === screenIndex ? "selected" : ""}
+                  onClick={() => setScreenIndex(index)}
                 >
-                  {cardContent[card.id]}
+                  {screen.name}
+                </button>
+              ))}
+            </div>
+          )}
+          <div className="live-ride-grid">
+            {screen.items.map((item) => {
+              if (item.kind === "panel") {
+                const content = panelContent[item.panel];
+                return content === null ? null : (
+                  <div className="ride-slot" data-span={4} data-ride-panel={item.panel} key={item.panel}>
+                    {content}
+                  </div>
+                );
+              }
+              const resolved = resolveRideField(item.field, fieldContext);
+              // A field with nothing to say on this ride (time left on a free
+              // ride) leaves no hole behind.
+              if (resolved === null) return null;
+              const key = rideFieldKey(item.field);
+              return (
+                <div className="ride-slot" data-span={item.span} data-ride-field={key} key={key}>
+                  <div className="ride-card-compact">
+                    <LiveMetric
+                      icon={rideFieldIcons[item.field.metric]}
+                      label={resolved.label}
+                      value={resolved.value}
+                      unit={resolved.unit}
+                      accent={item.field.metric === "power" && item.field.aggregate === "current"}
+                      note={fieldNote(item.field)}
+                      control={fieldControl(item.field)}
+                    />
+                  </div>
                 </div>
-              ) : null,
-            )}
+              );
+            })}
           </div>
         </section>
       )}
@@ -1557,17 +1644,17 @@ export function RideDetailModal({ session, profile, trainingZones, onClose, onEx
 
 const KG_PER_LB = 0.45359237;
 
-const rideCardLabels: Record<RideCardId, string> = {
-  power: "Power",
-  cadence: "Cadence",
-  speed: "Speed",
-  heartRate: "Heart rate",
-  workoutTimeline: "Workout timeline",
-  targetAndBias: "Target & bias",
-  powerChart: "Power chart",
-  heartRateChart: "Heart-rate chart",
-  timeInZone: "Time in zone",
-  deviceStats: "Stats for nerds",
+const rideFieldIcons: Record<RideMetric, typeof Activity> = {
+  power: Zap,
+  cadence: RefreshCw,
+  heartRate: HeartPulse,
+  speed: Gauge,
+  wattsPerKilogram: Scale,
+  distance: Route,
+  energy: Flame,
+  calories: Flame,
+  time: Timer,
+  targetPower: Target,
 };
 
 function displayedWeight(kg: number, unit: Profile["weightUnit"]) {
@@ -1607,9 +1694,6 @@ export function SettingsPage({
 }) {
   const [draft, setDraft] = useState(profile);
   const [zoneDraft, setZoneDraft] = useState(trainingZones);
-  const [rideDisplayDraft, setRideDisplayDraft] = useState(
-    rideDisplayPreferences,
-  );
   const [logPath, setLogPath] = useState("Loading log location…");
   const [rideFilesPath, setRideFilesPath] = useState("Loading ride files location…");
   const [apiKey, setApiKey] = useState("");
@@ -1625,18 +1709,6 @@ export function SettingsPage({
   }, [perform]);
   useEffect(() => setDraft(profile), [profile]);
   useEffect(() => setZoneDraft(trainingZones), [trainingZones]);
-  useEffect(
-    () => setRideDisplayDraft(rideDisplayPreferences),
-    [rideDisplayPreferences],
-  );
-
-  const moveRideCard = (index: number, direction: -1 | 1) => {
-    const nextIndex = index + direction;
-    if (nextIndex < 0 || nextIndex >= rideDisplayDraft.cards.length) return;
-    const cards = [...rideDisplayDraft.cards];
-    [cards[index], cards[nextIndex]] = [cards[nextIndex], cards[index]];
-    setRideDisplayDraft({ version: 2, cards });
-  };
 
   const saveIntervalsKey = async () => {
     setIntervalsBusy("save");
@@ -1687,79 +1759,10 @@ export function SettingsPage({
         <div className="form-row"><label>Rider weight ({draft.weightUnit})<EditableNumberInput step={0.1} min={draft.weightUnit === "lb" ? 66 : 30} max={draft.weightUnit === "lb" ? 551 : 250} value={displayedWeight(draft.riderWeightKg, draft.weightUnit)} onValueChange={(value) => setDraft({ ...draft, riderWeightKg: storedWeight(value, draft.weightUnit) })}/></label><label>Bike weight ({draft.weightUnit})<EditableNumberInput step={0.1} min={draft.weightUnit === "lb" ? 7 : 3} max={draft.weightUnit === "lb" ? 88 : 40} value={displayedWeight(draft.bikeWeightKg, draft.weightUnit)} onValueChange={(value) => setDraft({ ...draft, bikeWeightKg: storedWeight(value, draft.weightUnit) })}/></label></div>
         <button className="primary" type="submit">Save settings</button>
       </form></section>
-      <section className="card settings-card">
-        <div>
-          <span className="label">RIDE LAYOUT</span>
-          <h2>Live ride cards</h2>
-          <p>Choose which cards appear during a ride and arrange them in the order you want. Stats for nerds is off by default; turn it on to see what every connected device is reporting while you ride.</p>
-        </div>
-        <div className="ride-layout-settings">
-          <div className="ride-card-list">
-            {rideDisplayDraft.cards.map((card, index) => (
-              <div className="ride-card-setting" key={card.id}>
-                <label>
-                  <input
-                    type="checkbox"
-                    checked={card.visible}
-                    onChange={(event) => {
-                      const cards = rideDisplayDraft.cards.map((current) =>
-                        current.id === card.id
-                          ? { ...current, visible: event.target.checked }
-                          : current,
-                      );
-                      setRideDisplayDraft({ version: 2, cards });
-                    }}
-                  />
-                  <span>{rideCardLabels[card.id]}</span>
-                </label>
-                <div className="ride-card-order">
-                  <button
-                    type="button"
-                    className="icon-button"
-                    aria-label={`Move ${rideCardLabels[card.id]} up`}
-                    disabled={index === 0}
-                    onClick={() => moveRideCard(index, -1)}
-                  >
-                    <ChevronUp size={17} />
-                  </button>
-                  <button
-                    type="button"
-                    className="icon-button"
-                    aria-label={`Move ${rideCardLabels[card.id]} down`}
-                    disabled={index === rideDisplayDraft.cards.length - 1}
-                    onClick={() => moveRideCard(index, 1)}
-                  >
-                    <ChevronDown size={17} />
-                  </button>
-                </div>
-              </div>
-            ))}
-          </div>
-          <div className="settings-actions">
-            <button
-              type="button"
-              className="secondary"
-              onClick={() =>
-                setRideDisplayDraft({
-                  version: 2,
-                  cards: defaultRideDisplayPreferences.cards.map((card) => ({
-                    ...card,
-                  })),
-                })
-              }
-            >
-              Reset to default
-            </button>
-            <button
-              type="button"
-              className="primary"
-              onClick={() => onSaveRideDisplayPreferences(rideDisplayDraft)}
-            >
-              Save ride layout
-            </button>
-          </div>
-        </div>
-      </section>
+      <RideScreensEditor
+        preferences={rideDisplayPreferences}
+        onSave={onSaveRideDisplayPreferences}
+      />
       <section className="card settings-card">
         <div>
           <span className="label">TRAINING ZONES</span>
@@ -2293,8 +2296,8 @@ function distanceSourceLabel(source: SessionSummary["distanceSource"]) {
   return "no telemetry";
 }
 
-function LiveMetric({ icon: Icon, label, value, unit, accent = false, note, control }: { icon: typeof Activity; label: string; value: string | number; unit: string; accent?: boolean; note?: string | null; control?: React.ReactNode }) {
-  return <div className={accent ? "live-metric accent" : "live-metric"}><span><Icon size={17}/>{label}{control && <span className="metric-control">{control}</span>}</span><strong>{value}<small>{unit}</small></strong>{note && <em className="metric-source">{note}</em>}</div>;
+function LiveMetric({ icon: Icon, label, value, unit, accent = false, note, control }: { icon: typeof Activity; label: string; value: string | number; unit?: string; accent?: boolean; note?: string | null; control?: React.ReactNode }) {
+  return <div className={accent ? "live-metric accent" : "live-metric"}><span><Icon size={17}/>{label}{control && <span className="metric-control">{control}</span>}</span><strong>{value}{unit && <small>{unit}</small>}</strong>{note && <em className="metric-source">{note}</em>}</div>;
 }
 
 function newWorkout(): Workout {

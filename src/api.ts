@@ -1,5 +1,6 @@
 import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
+import type { RideDisplayPreferences } from "./rideScreens";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -18,7 +19,6 @@ import type {
   PowerSmoothing,
   SourcePreferences,
   Profile,
-  RideDisplayPreferences,
   RunnerState,
   SessionDetail,
   SessionSummary,
