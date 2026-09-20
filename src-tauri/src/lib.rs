@@ -7,6 +7,7 @@ mod fit;
 mod formats;
 mod ftms;
 mod intervals;
+mod intervals_sync;
 mod runner;
 mod storage;
 
@@ -190,9 +191,12 @@ pub fn run() {
             commands::restore_known_devices,
             commands::get_profile,
             commands::save_profile,
-            commands::intervals_api_key_configured,
+            commands::intervals_status,
             commands::save_intervals_api_key,
             commands::clear_intervals_api_key,
+            commands::set_intervals_sync_settings,
+            commands::sync_intervals,
+            commands::planned_workouts,
             commands::sync_training_settings,
             commands::list_workouts,
             commands::get_workout,

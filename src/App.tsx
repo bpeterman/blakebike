@@ -82,6 +82,10 @@ import type {
   Workout,
   WorkoutInterval,
   WorkoutStep,
+  IntervalsStatus,
+  IntervalsSyncReport,
+  IntervalsSyncSettings,
+  PlannedWorkout,
   ZoneDefinition,
   ZoneMode,
 } from "./types";
@@ -107,6 +111,13 @@ import {
   withSmoothedPower,
   workoutDuration,
   zoneModeLabel,
+  describeIntervalsSync,
+  describeLastSynced,
+  disconnectedIntervalsStatus,
+  isMirrored,
+  localCopyOf,
+  localDateString,
+  plannedOn,
 } from "./types";
 import {
   resolveRideField,
@@ -195,6 +206,8 @@ function App() {
   const [rideDisplayPreferences, setRideDisplayPreferences] =
     useState<RideDisplayPreferences>(defaultRideDisplayPreferences);
   const [devMode, setDevMode] = useState(false);
+  const [plannedWorkouts, setPlannedWorkouts] = useState<PlannedWorkout[]>([]);
+  const [intervalsStatus, setIntervalsStatus] = useState<IntervalsStatus>(disconnectedIntervalsStatus);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [devicePicker, setDevicePicker] = useState<DeviceRole | null>(null);
@@ -215,6 +228,29 @@ function App() {
   const liveSessionRef = useRef<string | null>(null);
   const lastHistorySampleMsRef = useRef(0);
 
+  // Re-read everything the Intervals.icu mirrors feed: the calendar cache,
+  // the status line, and (when the library half ran) the workouts table.
+  const refreshIntervalsMirrors = useCallback(async (libraryChanged: boolean) => {
+    const [nextPlanned, nextStatus] = await Promise.all([api.plannedWorkouts(), api.intervalsStatus()]);
+    setPlannedWorkouts(nextPlanned);
+    setIntervalsStatus(nextStatus);
+    if (libraryChanged) setWorkouts(await api.workouts());
+  }, []);
+
+  // One sync for launch, "Sync now" and the home card. Throws on failure so a
+  // manual sync can toast; the backend has already stored the error, and the
+  // status re-read here puts it on the cards for the silent launch case.
+  const syncIntervals = useCallback(async (): Promise<IntervalsSyncReport> => {
+    try {
+      const report = await api.syncIntervals();
+      await refreshIntervalsMirrors(report.library.status === "done");
+      return report;
+    } catch (cause) {
+      await refreshIntervalsMirrors(false).catch(() => undefined);
+      throw cause;
+    }
+  }, [refreshIntervalsMirrors]);
+
   const load = useCallback(async () => {
     try {
       const [
@@ -227,6 +263,8 @@ function App() {
         nextZones,
         nextRideDisplayPreferences,
         nextDevMode,
+        nextPlanned,
+        nextIntervalsStatus,
       ] =
         await Promise.all([
           api.profile(),
@@ -238,6 +276,8 @@ function App() {
           api.trainingZones(),
           api.rideDisplayPreferences(),
           api.devMode(),
+          api.plannedWorkouts(),
+          api.intervalsStatus(),
         ]);
       setProfile(nextProfile);
       setWorkouts(nextWorkouts);
@@ -251,6 +291,11 @@ function App() {
         migrateRideDisplayPreferences(nextRideDisplayPreferences),
       );
       setDevMode(nextDevMode);
+      setPlannedWorkouts(nextPlanned);
+      setIntervalsStatus(nextIntervalsStatus);
+      // The cached plan and library are already on screen; refresh them in
+      // the background. Offline, the cards keep the cache and show the error.
+      if (nextIntervalsStatus.configured) void syncIntervals().catch(() => undefined);
       if (nextRunner.status === "running" || nextRunner.status === "paused") {
         liveSessionRef.current = nextRunner.sessionId;
         const session = await api.session(nextRunner.sessionId);
@@ -264,7 +309,7 @@ function App() {
       setError(message);
       void api.reportError("initialization", message).catch(() => undefined);
     }
-  }, []);
+  }, [syncIntervals]);
 
   useEffect(() => {
     // Anything that escapes React (render errors, forgotten awaits) still
@@ -464,6 +509,19 @@ function App() {
     setPage("ride");
   };
 
+  // "Start" on the home screen: with a trainer connected the ride begins at
+  // once; otherwise the Ride page opens with the plan selected so the rider
+  // can connect first.
+  const startPlanned = (workoutId: string) => {
+    openRide(workoutId);
+    if (connected) void perform(() => api.startWorkout(workoutId), "start workout");
+  };
+
+  const startFreeRideFromHome = () => {
+    setPage("ride");
+    if (connected) void perform(() => api.startFreeRide(), "start free ride");
+  };
+
   const importZwo = async (file: File) => {
     await perform(async () => {
       await api.importZwo(await file.text());
@@ -569,8 +627,13 @@ function App() {
             sessions={sessions}
             connected={connected}
             devMode={devMode}
+            plannedToday={plannedOn(plannedWorkouts, localDateString())}
+            intervalsStatus={intervalsStatus}
             onConnect={() => setDevicePicker("trainer")}
             onRide={openRide}
+            onStartPlanned={startPlanned}
+            onStartFreeRide={startFreeRideFromHome}
+            onSyncIntervals={() => perform(() => syncIntervals(), "sync Intervals.icu")}
             onNavigate={setPage}
             onSyncTrainingSettings={() =>
               perform(async () => {
@@ -629,6 +692,7 @@ function App() {
         {page === "ride" && (
           <Ride
             workouts={workouts}
+            plannedToday={plannedOn(plannedWorkouts, localDateString())}
             selectedWorkout={selectedWorkout}
             setSelectedWorkout={setSelectedWorkout}
             connected={connected}
@@ -714,6 +778,22 @@ function App() {
                 setDevMode(enabled);
               }, "save developer mode")
             }
+            intervalsStatus={intervalsStatus}
+            onSaveIntervalsKey={async (apiKey) => {
+              setIntervalsStatus(await api.saveIntervalsApiKey(apiKey));
+              // First sync right away so the plan and library appear; a
+              // failure lands in the status line, not on top of "saved".
+              await syncIntervals().catch(() => undefined);
+            }}
+            onClearIntervalsKey={async () => {
+              setIntervalsStatus(await api.clearIntervalsApiKey());
+              setPlannedWorkouts([]);
+              setWorkouts(await api.workouts());
+            }}
+            onIntervalsSyncSettings={async (settings) => {
+              setIntervalsStatus(await api.saveIntervalsSyncSettings(settings));
+            }}
+            onSyncIntervals={syncIntervals}
           />
         )}
         {page !== "ride" && riding && runner.recordingWarning && <RecordingWarning message={runner.recordingWarning} />}
@@ -838,15 +918,20 @@ function PageHeader({
   );
 }
 
-function Overview({
+export function Overview({
   profile,
   powerZones,
   workouts,
   sessions,
   connected,
   devMode,
+  plannedToday = [],
+  intervalsStatus = disconnectedIntervalsStatus,
   onConnect,
   onRide,
+  onStartPlanned = () => undefined,
+  onStartFreeRide = () => undefined,
+  onSyncIntervals = () => Promise.resolve(),
   onNavigate,
   onSyncTrainingSettings,
 }: {
@@ -856,8 +941,14 @@ function Overview({
   sessions: SessionSummary[];
   connected: boolean;
   devMode: boolean;
+  /** Today's planned workouts from the Intervals.icu calendar cache. */
+  plannedToday?: PlannedWorkout[];
+  intervalsStatus?: IntervalsStatus;
   onConnect: () => void;
   onRide: (id: string) => void;
+  onStartPlanned?: (workoutId: string) => void;
+  onStartFreeRide?: () => void;
+  onSyncIntervals?: () => Promise<void>;
   onNavigate: (page: Page) => void;
   onSyncTrainingSettings: () => Promise<void>;
 }) {
@@ -874,6 +965,18 @@ function Overview({
   return (
     <>
       <PageHeader eyebrow="GOOD EVENING" title={`Ready to ride, ${profile.name}?`} />
+      {intervalsStatus.configured && intervalsStatus.settings.calendar && (
+        <TodayPlanCard
+          planned={plannedToday}
+          status={intervalsStatus}
+          connected={connected}
+          ftpWatts={profile.ftpWatts}
+          powerZones={powerZones}
+          onStart={onStartPlanned}
+          onStartFreeRide={onStartFreeRide}
+          onRefresh={onSyncIntervals}
+        />
+      )}
       <section className="hero-grid">
         <article className="card connection-card">
           <div className="card-icon"><Bluetooth /></div>
@@ -922,6 +1025,93 @@ function Overview({
   );
 }
 
+/**
+ * Today's plan from Intervals.icu: name, structure, duration and planned load,
+ * with Start. Shows the cached plan when offline and says how old it is.
+ */
+export function TodayPlanCard({
+  planned,
+  status,
+  connected,
+  ftpWatts,
+  powerZones,
+  onStart,
+  onStartFreeRide,
+  onRefresh,
+}: {
+  planned: PlannedWorkout[];
+  status: IntervalsStatus;
+  connected: boolean;
+  ftpWatts: number;
+  powerZones: readonly ZoneDefinition[];
+  onStart: (workoutId: string) => void;
+  onStartFreeRide: () => void;
+  onRefresh: () => Promise<void>;
+}) {
+  const [refreshing, setRefreshing] = useState(false);
+  const refresh = async () => {
+    setRefreshing(true);
+    try {
+      await onRefresh();
+    } finally {
+      setRefreshing(false);
+    }
+  };
+  const syncLine = status.lastError
+    ? `${describeLastSynced(status.lastSyncedAt)} · Intervals.icu unreachable`
+    : describeLastSynced(status.lastSyncedAt);
+  return (
+    <section className="card today-card" aria-label="Today's plan">
+      <div className="today-head">
+        <div>
+          <span className="label">TODAY ON INTERVALS.ICU</span>
+          <h2>{planned.length === 0 ? "Nothing planned today" : planned.length === 1 ? planned[0].name : `${planned.length} workouts planned`}</h2>
+        </div>
+        <button
+          className="icon-button"
+          title="Refresh plan"
+          aria-label="Refresh plan"
+          disabled={refreshing}
+          onClick={() => void refresh()}
+        >
+          <RefreshCw size={16} className={refreshing ? "spinning" : ""} />
+        </button>
+      </div>
+      {planned.length === 0 && <p>Your Intervals.icu calendar has no ride planned for today. Pick a workout below or ride free.</p>}
+      {planned.map((entry) => (
+        <div className="today-entry" key={entry.eventId}>
+          {planned.length > 1 && <h3>{entry.name}</h3>}
+          {entry.workout ? (
+            <div className="today-visual"><WorkoutProfile steps={entry.workout.steps} ftpWatts={ftpWatts} powerZones={powerZones} /></div>
+          ) : (
+            <p className="settings-note">
+              {entry.parseError
+                ? `blake.bike could not read this workout's structure (${entry.parseError}). Ride it free and follow the plan on Intervals.icu.`
+                : "This workout has no structured steps on Intervals.icu. Ride it free and follow the plan there."}
+            </p>
+          )}
+          <div className="today-stats">
+            {entry.durationSeconds !== null && <Metric value={formatDuration(entry.durationSeconds)} unit="duration" />}
+            {entry.plannedLoad !== null && <Metric value={`${entry.plannedLoad}`} unit="planned load" />}
+            {entry.workout && <Metric value={`${entry.workout.steps.length}`} unit="blocks" />}
+          </div>
+          {entry.description && <p className="today-description">{entry.description}</p>}
+          {entry.workout ? (
+            <button className="primary" onClick={() => onStart(entry.workout!.id)}>
+              <Play size={16} fill="currentColor" /> {connected ? "Start" : "Set up ride"}
+            </button>
+          ) : (
+            <button className="secondary" onClick={onStartFreeRide}>
+              <Play size={16} fill="currentColor" /> {connected ? "Start free ride" : "Set up free ride"}
+            </button>
+          )}
+        </div>
+      ))}
+      <p className={status.lastError ? "settings-note today-sync warn" : "settings-note today-sync"}>{syncLine}</p>
+    </section>
+  );
+}
+
 export function WorkoutLibrary({
   workouts,
   ftp,
@@ -965,18 +1155,35 @@ export function WorkoutLibrary({
       ) : <div className="library-grid">
         {workouts.map((workout, index) => (
           <article className="card library-card" key={workout.id}>
-            <button className="workout-visual-button" onClick={() => onEdit(workout)}>
+            <button
+              className="workout-visual-button"
+              aria-label={isMirrored(workout) ? `Edit a copy of ${workout.name}` : `Edit ${workout.name}`}
+              onClick={() => onEdit(isMirrored(workout) ? localCopyOf(workout) : workout)}
+            >
               <div className={`workout-visual large tone-${index % 3}`}><WorkoutProfile steps={workout.steps} ftpWatts={ftp} powerZones={powerZones} /></div>
             </button>
             <div className="library-body">
-              <span className="label">{workout.source.toUpperCase()} · {Math.round(workoutDuration(workout.steps) / 60)} MIN</span>
+              <span className="label">
+                {isMirrored(workout)
+                  ? `INTERVALS.ICU${workout.origin?.folder ? ` · ${workout.origin.folder.toUpperCase()}` : ""}`
+                  : workout.source.toUpperCase()}
+                {" · "}{Math.round(workoutDuration(workout.steps) / 60)} MIN
+              </span>
               <h3>{workout.name}</h3>
               <p>{workout.description || "Structured workout"}</p>
-              <div className="chips"><span>{workout.steps.length} blocks</span><span>{ftp} W FTP</span></div>
+              <div className="chips">
+                <span>{workout.steps.length} blocks</span>
+                <span>{ftp} W FTP</span>
+                {workout.origin?.plannedLoad != null && <span>{workout.origin.plannedLoad} load</span>}
+              </div>
               <div className="card-actions">
                 <button className="primary" onClick={() => onRide(workout.id)}><Play size={15} fill="currentColor" /> Ride</button>
                 <button className="icon-button" onClick={() => onExport(workout)} title="Export ZWO" aria-label={`Export ${workout.name} as ZWO`}><Download size={17} /></button>
-                <button className="icon-button danger" onClick={() => onDelete(workout)} title="Delete" aria-label={`Delete ${workout.name}`}><Trash2 size={17} /></button>
+                {isMirrored(workout) ? (
+                  <button className="text-button" onClick={() => onEdit(localCopyOf(workout))} title="Mirrored from Intervals.icu; edits go into a local copy">Edit a copy</button>
+                ) : (
+                  <button className="icon-button danger" onClick={() => onDelete(workout)} title="Delete" aria-label={`Delete ${workout.name}`}><Trash2 size={17} /></button>
+                )}
               </div>
             </div>
           </article>
@@ -988,6 +1195,7 @@ export function WorkoutLibrary({
 
 export function Ride({
   workouts,
+  plannedToday = [],
   selectedWorkout,
   setSelectedWorkout,
   connected,
@@ -1011,6 +1219,8 @@ export function Ride({
   perform,
 }: {
   workouts: Workout[];
+  /** Today's structured plans from Intervals.icu; listed first in the picker. */
+  plannedToday?: PlannedWorkout[];
   selectedWorkout: string | null;
   setSelectedWorkout: (id: string) => void;
   connected: boolean;
@@ -1042,10 +1252,17 @@ export function Ride({
   const [powerChartExpanded, setPowerChartExpanded] = useState(true);
   const [heartRateChartExpanded, setHeartRateChartExpanded] = useState(true);
   const active = runner.status === "running" || runner.status === "paused";
-  const selected = workouts.find((workout) => workout.id === selectedWorkout);
+  // Today's plan first, then the library; one list for selection, preview and
+  // the live timeline lookup by name.
+  const plannedRides = useMemo(
+    () => plannedToday.flatMap((entry) => (entry.workout ? [entry.workout] : [])),
+    [plannedToday],
+  );
+  const rideable = useMemo(() => [...plannedRides, ...workouts], [plannedRides, workouts]);
+  const selected = rideable.find((workout) => workout.id === selectedWorkout);
   const activeWorkout = selected
     ?? ("workoutName" in runner
-      ? workouts.find((workout) => workout.name === runner.workoutName)
+      ? rideable.find((workout) => workout.name === runner.workoutName)
       : undefined);
   const elapsed = runner.status === "running" || runner.status === "paused" ? runner.elapsedSeconds : 0;
   const total = runner.status === "running" || runner.status === "paused" ? runner.totalSeconds : selected ? workoutDuration(selected.steps) : 0;
@@ -1475,14 +1692,14 @@ export function Ride({
             <div className="setup-divider"><span>OR CHOOSE A WORKOUT</span></div>
             <span className="label">SELECT WORKOUT</span>
             <div className="select-list">
-              {workouts.length === 0 ? (
+              {rideable.length === 0 ? (
                 <div className="ride-empty-workouts">
                   <strong>No workouts saved yet</strong>
                   <span>Create one or import a ZWO file, then come back when you’re ready.</span>
                   <button className="secondary" onClick={onBrowseWorkouts}>Open workout library</button>
                 </div>
-              ) : workouts.map((workout) => <button key={workout.id} className={selectedWorkout === workout.id ? "selected" : ""} aria-pressed={selectedWorkout === workout.id} onClick={() => setSelectedWorkout(workout.id)}>
-                <div><strong>{workout.name}</strong><span>{formatDuration(workoutDuration(workout.steps))}</span></div><WorkoutProfile steps={workout.steps} ftpWatts={profile.ftpWatts} powerZones={powerZones} /></button>)}
+              ) : rideable.map((workout, index) => <button key={workout.id} className={selectedWorkout === workout.id ? "selected" : ""} aria-pressed={selectedWorkout === workout.id} onClick={() => setSelectedWorkout(workout.id)}>
+                <div><strong>{index < plannedRides.length && <em className="today-chip">Today</em>}{workout.name}</strong><span>{formatDuration(workoutDuration(workout.steps))}</span></div><WorkoutProfile steps={workout.steps} ftpWatts={profile.ftpWatts} powerZones={powerZones} /></button>)}
             </div>
             <button className="primary start-button" disabled={!connected || !selectedWorkout} onClick={() => selectedWorkout && void perform(() => api.startWorkout(selectedWorkout), "start workout")}><Play fill="currentColor" /> Start workout</button>
           </div>
@@ -1708,6 +1925,11 @@ export function SettingsPage({
   onSaveRideDisplayPreferences,
   onForgetDevices,
   onDevMode,
+  intervalsStatus = disconnectedIntervalsStatus,
+  onSaveIntervalsKey = async () => undefined,
+  onClearIntervalsKey = async () => undefined,
+  onIntervalsSyncSettings = async () => undefined,
+  onSyncIntervals = () => Promise.reject(new Error("Intervals.icu sync is not available")),
 }: {
   profile: Profile;
   trainingZones: TrainingZoneSettings;
@@ -1721,31 +1943,34 @@ export function SettingsPage({
   onSaveRideDisplayPreferences: (preferences: RideDisplayPreferences) => void;
   onForgetDevices: () => Promise<void>;
   onDevMode: (enabled: boolean) => void;
+  /** Owned by `App` so the home screen and this card never disagree. */
+  intervalsStatus?: IntervalsStatus;
+  onSaveIntervalsKey?: (apiKey: string) => Promise<void>;
+  onClearIntervalsKey?: () => Promise<void>;
+  onIntervalsSyncSettings?: (settings: IntervalsSyncSettings) => Promise<void>;
+  onSyncIntervals?: () => Promise<IntervalsSyncReport>;
 }) {
   const [draft, setDraft] = useState(profile);
   const [zoneDraft, setZoneDraft] = useState(trainingZones);
   const [logPath, setLogPath] = useState("Loading log location…");
   const [rideFilesPath, setRideFilesPath] = useState("Loading ride files location…");
   const [apiKey, setApiKey] = useState("");
-  const [intervalsConfigured, setIntervalsConfigured] = useState(false);
-  const [intervalsBusy, setIntervalsBusy] = useState<"save" | "clear" | "sync" | null>(null);
-  const [intervalsSyncStatus, setIntervalsSyncStatus] = useState<string | null>(null);
+  const intervalsConfigured = intervalsStatus.configured;
+  const [intervalsBusy, setIntervalsBusy] = useState<"save" | "clear" | "sync" | "mirrors" | null>(null);
+  const [trainingSyncStatus, setTrainingSyncStatus] = useState<string | null>(null);
+  const [mirrorSyncStatus, setMirrorSyncStatus] = useState<string | null>(null);
   const [zoneSyncConfirm, setZoneSyncConfirm] = useState<"power" | "heartRate" | null>(null);
   useEffect(() => {
     void api.logFilePath().then(setLogPath);
     void api.rideFilesPath().then(setRideFilesPath);
-    void perform(async () => {
-      setIntervalsConfigured(await api.intervalsApiKeyConfigured());
-    }, "load Intervals.icu settings");
-  }, [perform]);
+  }, []);
   useEffect(() => setDraft(profile), [profile]);
   useEffect(() => setZoneDraft(trainingZones), [trainingZones]);
 
   const saveIntervalsKey = async () => {
     setIntervalsBusy("save");
     await perform(async () => {
-      await api.saveIntervalsApiKey(apiKey);
-      setIntervalsConfigured(true);
+      await onSaveIntervalsKey(apiKey);
       setApiKey("");
     }, "save Intervals.icu API key");
     setIntervalsBusy(null);
@@ -1754,9 +1979,10 @@ export function SettingsPage({
   const clearIntervalsKey = async () => {
     setIntervalsBusy("clear");
     await perform(async () => {
-      await api.clearIntervalsApiKey();
-      setIntervalsConfigured(false);
+      await onClearIntervalsKey();
       setApiKey("");
+      setMirrorSyncStatus(null);
+      setTrainingSyncStatus(null);
     }, "clear Intervals.icu API key");
     setIntervalsBusy(null);
   };
@@ -1767,10 +1993,24 @@ export function SettingsPage({
       const result = await api.syncTrainingSettings();
       onProfileUpdate(result.profile);
       onTrainingZonesUpdate(result.zones);
-      setIntervalsSyncStatus(describeTrainingSync(result));
+      setTrainingSyncStatus(describeTrainingSync(result));
     }, "sync training settings");
     setIntervalsBusy(null);
   };
+
+  const syncMirrors = async () => {
+    setIntervalsBusy("mirrors");
+    await perform(async () => {
+      setMirrorSyncStatus(describeIntervalsSync(await onSyncIntervals()));
+    }, "sync Intervals.icu");
+    setIntervalsBusy(null);
+  };
+
+  const setMirrorSetting = (patch: Partial<IntervalsSyncSettings>) =>
+    void perform(
+      () => onIntervalsSyncSettings({ ...intervalsStatus.settings, ...patch }),
+      "save Intervals.icu sync settings",
+    );
 
   // A sync result replaces both drafts, so unsaved edits would be lost: the
   // button waits until they are saved (or discarded) rather than saving them
@@ -1861,9 +2101,13 @@ export function SettingsPage({
         <div>
           <span className="label">INTERVALS.ICU</span>
           <h2>Intervals.icu</h2>
-          <p>Sync pulls your FTP and maximum heart rate from your Intervals.icu cycling settings. Power and heart-rate zones are imported only when you turn them on in Training zones above.</p>
+          <p>Your planned workouts and workout library are mirrored here, read-only, and refreshed when blake.bike starts and whenever you press Sync now. Syncing training settings pulls your FTP and maximum heart rate from your cycling settings; power and heart-rate zones are imported only when you turn them on in Training zones above.</p>
           <span className={`integration-status ${intervalsConfigured ? "configured" : ""}`}>
-            {intervalsConfigured ? "API key saved" : "API key not configured"}
+            {!intervalsConfigured
+              ? "API key not configured"
+              : intervalsStatus.athleteName
+                ? `Connected as ${intervalsStatus.athleteName}`
+                : "API key saved"}
           </span>
         </div>
         <div className="integration-controls">
@@ -1896,6 +2140,7 @@ export function SettingsPage({
               </button>
             )}
           </div>
+          <span className="label">TRAINING SETTINGS</span>
           <button
             className="primary"
             disabled={!intervalsConfigured || intervalsBusy !== null || unsavedHint !== null}
@@ -1904,7 +2149,42 @@ export function SettingsPage({
             {intervalsBusy === "sync" ? "Syncing…" : "Sync from Intervals.icu"}
           </button>
           {intervalsConfigured && unsavedHint && <p className="settings-note">{unsavedHint}</p>}
-          {intervalsSyncStatus && <p className="integration-result">{intervalsSyncStatus}</p>}
+          {trainingSyncStatus && <p className="integration-result">{trainingSyncStatus}</p>}
+          <span className="label">CALENDAR AND LIBRARY</span>
+          <label className="settings-toggle">
+            <input
+              type="checkbox"
+              disabled={!intervalsConfigured || intervalsBusy !== null}
+              checked={intervalsStatus.settings.calendar}
+              onChange={(event) => setMirrorSetting({ calendar: event.target.checked })}
+            />
+            <span>
+              Show today's planned workout
+              <small>Pulls the next seven days of planned rides from your Intervals.icu calendar onto the home screen and the ride picker.</small>
+            </span>
+          </label>
+          <label className="settings-toggle">
+            <input
+              type="checkbox"
+              disabled={!intervalsConfigured || intervalsBusy !== null}
+              checked={intervalsStatus.settings.library}
+              onChange={(event) => setMirrorSetting({ library: event.target.checked })}
+            />
+            <span>
+              Mirror the workout library
+              <small>Cycling workouts from your Intervals.icu library appear in Workouts, read-only, labelled with their folder. Turning this off removes them.</small>
+            </span>
+          </label>
+          <p className="settings-note">Synced when blake.bike starts and when you press Sync now. {describeLastSynced(intervalsStatus.lastSyncedAt)}.</p>
+          {intervalsStatus.lastError && <p className="settings-note warn">Last sync failed: {intervalsStatus.lastError}</p>}
+          <button
+            className="secondary"
+            disabled={!intervalsConfigured || intervalsBusy !== null || (!intervalsStatus.settings.calendar && !intervalsStatus.settings.library)}
+            onClick={() => void syncMirrors()}
+          >
+            {intervalsBusy === "mirrors" ? "Syncing…" : "Sync now"}
+          </button>
+          {mirrorSyncStatus && <p className="integration-result">{mirrorSyncStatus}</p>}
         </div>
       </section>
       <section className="card settings-card"><div><span className="label">DATA & DIAGNOSTICS</span><h2>Local-first by design</h2><p>Every finalized ride is stored in SQLite and as a persistent Garmin-compatible FIT file. Missing FIT files are regenerated automatically.</p></div><div className="data-locations"><div className="log-location"><span>Ride Files</span><code>{rideFilesPath}</code><button className="secondary" onClick={() => void api.revealRideFiles().catch(() => undefined)}>Show Ride Files</button></div><div className="log-location"><span>Log file</span><code>{logPath}</code><button className="secondary" onClick={() => void api.revealLogFile().catch(() => undefined)}>Show in folder</button><button className="secondary" onClick={() => void navigator.clipboard.writeText(logPath)}>Copy path</button></div><div className="log-location"><span>Known devices</span><p className="settings-note">Devices you have connected are remembered on this computer so they can be reconnected without scanning. Forgetting them does not disconnect anything.</p><button className="danger-button" onClick={() => void onForgetDevices()}>Forget all devices</button></div></div></section>

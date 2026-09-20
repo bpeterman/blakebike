@@ -8,9 +8,6 @@ vi.mock("./api", () => ({
     openWebsite: vi.fn(() => Promise.resolve()),
     logFilePath: vi.fn(() => Promise.resolve("/tmp/blakebike.log")),
     rideFilesPath: vi.fn(() => Promise.resolve("/tmp/Ride Files")),
-    intervalsApiKeyConfigured: vi.fn(() => Promise.resolve(false)),
-    saveIntervalsApiKey: vi.fn(() => Promise.resolve()),
-    clearIntervalsApiKey: vi.fn(() => Promise.resolve()),
     syncTrainingSettings: vi.fn(),
     saveTrainingZones: vi.fn(() => Promise.resolve()),
     revealRideFiles: vi.fn(() => Promise.resolve()),
@@ -25,6 +22,8 @@ import { latestRelease } from "./releaseNotes";
 import {
   defaultTrainingZoneSettings,
   derivedPowerZones,
+  disconnectedIntervalsStatus,
+  type IntervalsStatus,
   type Profile,
   type TrainingSyncResult,
   type TrainingZoneSettings,
@@ -46,26 +45,36 @@ const perform = async (action: () => Promise<unknown>) => {
   await action();
 };
 
+const connectedStatus: IntervalsStatus = {
+  ...disconnectedIntervalsStatus,
+  configured: true,
+  athleteId: "i1",
+  athleteName: "Blake P",
+};
+
+const settingsElement = (
+  overrides: Partial<ComponentProps<typeof SettingsPage>> = {},
+) => (
+  <SettingsPage
+    profile={profile}
+    trainingZones={defaultTrainingZoneSettings}
+    rideDisplayPreferences={defaultRideDisplayPreferences}
+    perform={perform}
+    onProfileUpdate={vi.fn()}
+    onTrainingZonesUpdate={vi.fn()}
+    onSave={vi.fn()}
+    onSaveTrainingZones={vi.fn()}
+    onSaveRideDisplayPreferences={vi.fn()}
+    devMode={false}
+    onDevMode={vi.fn()}
+    onForgetDevices={() => Promise.resolve()}
+    {...overrides}
+  />
+);
+
 const renderSettings = (
   overrides: Partial<ComponentProps<typeof SettingsPage>> = {},
-) =>
-  render(
-    <SettingsPage
-      profile={profile}
-      trainingZones={defaultTrainingZoneSettings}
-      rideDisplayPreferences={defaultRideDisplayPreferences}
-      perform={perform}
-      onProfileUpdate={vi.fn()}
-      onTrainingZonesUpdate={vi.fn()}
-      onSave={vi.fn()}
-      onSaveTrainingZones={vi.fn()}
-      onSaveRideDisplayPreferences={vi.fn()}
-      devMode={false}
-      onDevMode={vi.fn()}
-      onForgetDevices={() => Promise.resolve()}
-      {...overrides}
-    />,
-  );
+) => render(settingsElement(overrides));
 
 const powerToggle = () =>
   screen.getByRole("checkbox", { name: /Import power zones from Intervals\.icu/ });
@@ -173,27 +182,66 @@ describe("training zone settings", () => {
 });
 
 describe("Intervals.icu settings", () => {
-  it("saves and clears the API key without reading it back", async () => {
-    renderSettings();
+  it("hands the API key to App and never reads it back", async () => {
+    const onSaveIntervalsKey = vi.fn(() => Promise.resolve());
+    const onClearIntervalsKey = vi.fn(() => Promise.resolve());
+    const { rerender } = renderSettings({ onSaveIntervalsKey, onClearIntervalsKey });
 
-    await screen.findByText("API key not configured");
+    expect(screen.getByText("API key not configured")).toBeInTheDocument();
+    expect(syncButton()).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Sync now" })).toBeDisabled();
     fireEvent.change(screen.getByLabelText("API key"), {
       target: { value: "secret-key" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Save API key" }));
+    await waitFor(() => expect(onSaveIntervalsKey).toHaveBeenCalledWith("secret-key"));
+    await waitFor(() => expect(screen.getByLabelText("API key")).toHaveValue(""));
 
-    await screen.findByText("API key saved");
-    expect(api.saveIntervalsApiKey).toHaveBeenCalledWith("secret-key");
-    expect(screen.getByLabelText("API key")).toHaveValue("");
+    // App owns the status; once it reports the athlete the card follows.
+    rerender(settingsElement({ onSaveIntervalsKey, onClearIntervalsKey, intervalsStatus: connectedStatus }));
+    expect(screen.getByText("Connected as Blake P")).toBeInTheDocument();
+    expect(syncButton()).toBeEnabled();
 
     fireEvent.click(screen.getByRole("button", { name: "Clear key" }));
-    await screen.findByText("API key not configured");
-    expect(api.clearIntervalsApiKey).toHaveBeenCalledOnce();
-    expect(syncButton()).toBeDisabled();
+    await waitFor(() => expect(onClearIntervalsKey).toHaveBeenCalledOnce());
+  });
+
+  it("saves the mirror toggles at once and shows the last sync", () => {
+    const onIntervalsSyncSettings = vi.fn(() => Promise.resolve());
+    renderSettings({
+      intervalsStatus: {
+        ...connectedStatus,
+        lastSyncedAt: new Date(Date.now() - 2 * 3_600_000).toISOString(),
+        lastError: "Could not reach Intervals.icu",
+      },
+      onIntervalsSyncSettings,
+    });
+    expect(screen.getByText(/Synced 2 hours ago\./)).toBeInTheDocument();
+    expect(screen.getByText("Last sync failed: Could not reach Intervals.icu")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("checkbox", { name: /Mirror the workout library/ }));
+    expect(onIntervalsSyncSettings).toHaveBeenCalledWith({ calendar: true, library: false });
+    fireEvent.click(screen.getByRole("checkbox", { name: /Show today's planned workout/ }));
+    expect(onIntervalsSyncSettings).toHaveBeenLastCalledWith({ calendar: false, library: true });
+  });
+
+  it("runs Sync now through App and reports what changed", async () => {
+    const onSyncIntervals = vi.fn(() =>
+      Promise.resolve({
+        syncedAt: "2026-09-21T06:00:00Z",
+        calendar: { status: "done" as const, report: { fetched: 2, unstructured: 0, failed: 0, skipped: 0 } },
+        library: { status: "done" as const, report: { added: 1, updated: 0, removed: 0, unchanged: 5, skipped: 0, failed: [] } },
+      }),
+    );
+    renderSettings({ intervalsStatus: connectedStatus, onSyncIntervals });
+    fireEvent.click(screen.getByRole("button", { name: "Sync now" }));
+    expect(onSyncIntervals).toHaveBeenCalledOnce();
+    expect(
+      await screen.findByText("2 planned rides in the next 7 days · Library: 1 added"),
+    ).toBeInTheDocument();
   });
 
   it("syncs without saving drafts and reports every item", async () => {
-    vi.mocked(api.intervalsApiKeyConfigured).mockResolvedValue(true);
     let resolveSync!: (result: TrainingSyncResult) => void;
     vi.mocked(api.syncTrainingSettings).mockReturnValue(
       new Promise((resolve) => {
@@ -202,7 +250,7 @@ describe("Intervals.icu settings", () => {
     );
     const onProfileUpdate = vi.fn();
     const onTrainingZonesUpdate = vi.fn();
-    renderSettings({ onProfileUpdate, onTrainingZonesUpdate });
+    renderSettings({ onProfileUpdate, onTrainingZonesUpdate, intervalsStatus: connectedStatus });
 
     const sync = await screen.findByRole("button", { name: "Sync from Intervals.icu" });
     await waitFor(() => expect(sync).toBeEnabled());
@@ -236,8 +284,7 @@ describe("Intervals.icu settings", () => {
   });
 
   it("waits for unsaved profile or zone edits instead of saving them itself", async () => {
-    vi.mocked(api.intervalsApiKeyConfigured).mockResolvedValue(true);
-    renderSettings();
+    renderSettings({ intervalsStatus: connectedStatus });
     const sync = await screen.findByRole("button", { name: "Sync from Intervals.icu" });
     await waitFor(() => expect(sync).toBeEnabled());
 

@@ -27,15 +27,185 @@ export type WorkoutStep =
   | { kind: "freeRide"; durationSeconds: number }
   | { kind: "repeat"; repetitions: number; steps: WorkoutStep[] };
 
+/**
+ * Where a mirrored workout came from. Present only on workouts synced from
+ * the Intervals.icu library; `source` stays the one-word label the card shows.
+ * Mirrors `WorkoutOrigin` in domain.rs.
+ */
+export type WorkoutOrigin = {
+  externalId: number;
+  folderId: number | null;
+  folder: string | null;
+  updated: string;
+  plannedLoad: number | null;
+};
+
 export type Workout = {
   id: string;
   name: string;
   description: string;
+  /** `local`, `zwo` (file import) or `intervals` (mirrored from Intervals.icu). */
   source: string;
   version: number;
   steps: WorkoutStep[];
   createdAt: string;
   updatedAt: string;
+  /** Set on mirrored workouts; absent or null otherwise. */
+  origin?: WorkoutOrigin | null;
+};
+
+/** Mirrored from Intervals.icu: read-only locally, refreshed by sync. */
+export const isMirrored = (workout: Workout): boolean => workout.origin != null;
+
+/** A fresh local copy of a workout, for "Edit a copy" on a mirrored one. */
+export const localCopyOf = (workout: Workout, now = new Date()): Workout => ({
+  ...workout,
+  id: crypto.randomUUID(),
+  name: `${workout.name} (copy)`,
+  source: "local",
+  origin: null,
+  createdAt: now.toISOString(),
+  updatedAt: now.toISOString(),
+});
+
+/** One planned workout from the Intervals.icu calendar. Mirrors `PlannedWorkout` in domain.rs. */
+export type PlannedWorkout = {
+  eventId: number;
+  /** Stable per event; what `startWorkout` takes. */
+  workoutId: string;
+  /** Local date, `YYYY-MM-DD`. */
+  date: string;
+  name: string;
+  description: string;
+  activityType: string;
+  plannedLoad: number | null;
+  durationSeconds: number | null;
+  /** Structure, when Intervals.icu supplied a readable ZWO. */
+  workout: Workout | null;
+  parseError: string | null;
+  updated: string | null;
+  fetchedAt: string;
+};
+
+/** Today as `YYYY-MM-DD` in the machine's local time zone, matching `PlannedWorkout.date`. */
+export const localDateString = (date = new Date()): string => {
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+};
+
+export const plannedOn = (planned: PlannedWorkout[], date: string): PlannedWorkout[] =>
+  planned.filter((entry) => entry.date === date);
+
+/** Mirrors `IntervalsSyncSettings` in storage.rs. */
+export type IntervalsSyncSettings = {
+  calendar: boolean;
+  library: boolean;
+};
+
+/** Mirrors `IntervalsStatus` in intervals_sync.rs. */
+export type IntervalsStatus = {
+  configured: boolean;
+  athleteId: string | null;
+  athleteName: string | null;
+  settings: IntervalsSyncSettings;
+  lastSyncedAt: string | null;
+  lastError: string | null;
+};
+
+export const disconnectedIntervalsStatus: IntervalsStatus = {
+  configured: false,
+  athleteId: null,
+  athleteName: null,
+  settings: { calendar: true, library: true },
+  lastSyncedAt: null,
+  lastError: null,
+};
+
+export type CalendarSyncReport = {
+  fetched: number;
+  unstructured: number;
+  failed: number;
+  skipped: number;
+};
+
+export type LibrarySyncReport = {
+  added: number;
+  updated: number;
+  removed: number;
+  unchanged: number;
+  skipped: number;
+  failed: string[];
+};
+
+export type SyncOutcome<T> =
+  | { status: "off" }
+  | { status: "done"; report: T }
+  | { status: "failed"; error: string };
+
+/** Mirrors `IntervalsSyncReport` in intervals_sync.rs. */
+export type IntervalsSyncReport = {
+  syncedAt: string;
+  calendar: SyncOutcome<CalendarSyncReport>;
+  library: SyncOutcome<LibrarySyncReport>;
+};
+
+const plural = (count: number, noun: string) => `${count} ${noun}${count === 1 ? "" : "s"}`;
+
+/** One line per half of a mirror sync, for the Settings card. */
+export const describeIntervalsSync = (report: IntervalsSyncReport): string => {
+  const clauses: string[] = [];
+  switch (report.calendar.status) {
+    case "off":
+      clauses.push("Calendar sync is off");
+      break;
+    case "failed":
+      clauses.push(`Calendar: ${report.calendar.error}`);
+      break;
+    case "done": {
+      const { fetched, unstructured, failed } = report.calendar.report;
+      const details = [
+        unstructured > 0 ? `${unstructured} without structure` : null,
+        failed > 0 ? `${failed} unreadable` : null,
+      ].filter((detail) => detail !== null);
+      clauses.push(
+        `${plural(fetched, "planned ride")} in the next 7 days${details.length ? ` (${details.join(", ")})` : ""}`,
+      );
+      break;
+    }
+  }
+  switch (report.library.status) {
+    case "off":
+      clauses.push("Library sync is off");
+      break;
+    case "failed":
+      clauses.push(`Library: ${report.library.error}`);
+      break;
+    case "done": {
+      const { added, updated, removed, failed } = report.library.report;
+      const changes = [
+        added > 0 ? `${added} added` : null,
+        updated > 0 ? `${updated} updated` : null,
+        removed > 0 ? `${removed} removed` : null,
+      ].filter((change) => change !== null);
+      let line = changes.length ? `Library: ${changes.join(", ")}` : "Library up to date";
+      if (failed.length > 0) line += ` (${plural(failed.length, "workout")} could not be read)`;
+      clauses.push(line);
+      break;
+    }
+  }
+  return clauses.join(" · ");
+};
+
+/** "Synced just now" / "Synced 2 h ago" / "Never synced", for status lines. */
+export const describeLastSynced = (lastSyncedAt: string | null, now = new Date()): string => {
+  if (!lastSyncedAt) return "Never synced";
+  const ageMs = Math.max(0, now.getTime() - new Date(lastSyncedAt).getTime());
+  const minutes = Math.round(ageMs / 60_000);
+  if (minutes < 1) return "Synced just now";
+  if (minutes < 60) return `Synced ${plural(minutes, "minute")} ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 48) return `Synced ${plural(hours, "hour")} ago`;
+  return `Synced ${plural(Math.round(hours / 24), "day")} ago`;
 };
 
 export type WorkoutInterval = {

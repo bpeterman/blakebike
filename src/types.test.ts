@@ -9,7 +9,13 @@ import {
   derivedHeartRateZones,
   derivedPowerZones,
   defaultTrainingZoneSettings,
+  describeIntervalsSync,
+  describeLastSynced,
   describeTrainingSync,
+  isMirrored,
+  localCopyOf,
+  localDateString,
+  plannedOn,
   downsampleTelemetry,
   effectiveHeartRateZones,
   effectivePowerZones,
@@ -25,7 +31,9 @@ import {
   workKilojoules,
   averagePowerWatts,
   kilojoulesToKilocalories,
+  type PlannedWorkout,
   type TrainingSyncResult,
+  type Workout,
   type WorkoutStep,
 } from "./types";
 
@@ -371,5 +379,87 @@ describe("zone provenance and sync reporting", () => {
     expect(describeTrainingSync({ ...base, powerZones: { status: "syncOff" } })).toContain(
       "Power zones not imported (import is off)",
     );
+  });
+});
+
+describe("Intervals.icu mirrors", () => {
+  const workout: Workout = {
+    id: "11111111-1111-4111-8111-111111111111",
+    name: "Threshold 2x20",
+    description: "",
+    source: "intervals",
+    version: 1,
+    createdAt: "2026-09-01T00:00:00Z",
+    updatedAt: "2026-09-01T00:00:00Z",
+    steps: [{ kind: "steady", durationSeconds: 1200, target: { unit: "percentFtp", value: 98 } }],
+    origin: { externalId: 7, folderId: 3, folder: "Base", updated: "2026-09-01T08:00:00", plannedLoad: 92 },
+  };
+
+  it("tells mirrored workouts apart and copies them into local ones", () => {
+    expect(isMirrored(workout)).toBe(true);
+    expect(isMirrored({ ...workout, origin: null })).toBe(false);
+    expect(isMirrored({ ...workout, origin: undefined })).toBe(false);
+    const copy = localCopyOf(workout, new Date("2026-09-21T10:00:00Z"));
+    expect(copy.id).not.toBe(workout.id);
+    expect(copy.name).toBe("Threshold 2x20 (copy)");
+    expect(copy.source).toBe("local");
+    expect(copy.origin).toBeNull();
+    expect(copy.steps).toEqual(workout.steps);
+    expect(copy.createdAt).toBe("2026-09-21T10:00:00.000Z");
+  });
+
+  it("picks today's plan by the machine's local date", () => {
+    expect(localDateString(new Date(2026, 8, 21, 23, 30))).toBe("2026-09-21");
+    expect(localDateString(new Date(2026, 0, 5, 0, 10))).toBe("2026-01-05");
+    const entry = (date: string, eventId: number): PlannedWorkout => ({
+      eventId,
+      workoutId: `id-${eventId}`,
+      date,
+      name: "Ride",
+      description: "",
+      activityType: "Ride",
+      plannedLoad: null,
+      durationSeconds: null,
+      workout: null,
+      parseError: null,
+      updated: null,
+      fetchedAt: "2026-09-21T00:00:00Z",
+    });
+    const planned = [entry("2026-09-20", 1), entry("2026-09-21", 2), entry("2026-09-21", 3)];
+    expect(plannedOn(planned, "2026-09-21").map((item) => item.eventId)).toEqual([2, 3]);
+    expect(plannedOn(planned, "2026-09-22")).toEqual([]);
+  });
+
+  it("describes a mirror sync and how old the cache is", () => {
+    expect(
+      describeIntervalsSync({
+        syncedAt: "2026-09-21T06:00:00Z",
+        calendar: { status: "done", report: { fetched: 3, unstructured: 1, failed: 1, skipped: 2 } },
+        library: { status: "done", report: { added: 2, updated: 0, removed: 1, unchanged: 40, skipped: 3, failed: ["Openers: HTTP 500"] } },
+      }),
+    ).toBe(
+      "3 planned rides in the next 7 days (1 without structure, 1 unreadable) · Library: 2 added, 1 removed (1 workout could not be read)",
+    );
+    expect(
+      describeIntervalsSync({
+        syncedAt: "2026-09-21T06:00:00Z",
+        calendar: { status: "done", report: { fetched: 1, unstructured: 0, failed: 0, skipped: 0 } },
+        library: { status: "done", report: { added: 0, updated: 0, removed: 0, unchanged: 12, skipped: 0, failed: [] } },
+      }),
+    ).toBe("1 planned ride in the next 7 days · Library up to date");
+    expect(
+      describeIntervalsSync({
+        syncedAt: "2026-09-21T06:00:00Z",
+        calendar: { status: "off" },
+        library: { status: "failed", error: "Could not reach Intervals.icu" },
+      }),
+    ).toBe("Calendar sync is off · Library: Could not reach Intervals.icu");
+
+    const now = new Date("2026-09-21T12:00:00Z");
+    expect(describeLastSynced(null, now)).toBe("Never synced");
+    expect(describeLastSynced("2026-09-21T11:59:40Z", now)).toBe("Synced just now");
+    expect(describeLastSynced("2026-09-21T11:45:00Z", now)).toBe("Synced 15 minutes ago");
+    expect(describeLastSynced("2026-09-21T09:00:00Z", now)).toBe("Synced 3 hours ago");
+    expect(describeLastSynced("2026-09-18T12:00:00Z", now)).toBe("Synced 3 days ago");
   });
 });

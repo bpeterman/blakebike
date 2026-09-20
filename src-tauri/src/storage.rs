@@ -4,7 +4,7 @@ use std::{
     sync::{Mutex, MutexGuard},
 };
 
-use chrono::{DateTime, Duration, TimeZone, Utc};
+use chrono::{DateTime, Duration, NaiveDate, TimeZone, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
@@ -13,9 +13,10 @@ use crate::{
     devices::{CalibrationRecord, KnownDevice, SourcePreferences},
     distance::estimate_distance,
     domain::{
-        DistanceSource, DistanceUnit, Profile, SessionDetail, SessionSummary, Telemetry,
-        WeightUnit, Workout,
+        DistanceSource, DistanceUnit, PlannedWorkout, Profile, SessionDetail, SessionSummary,
+        Telemetry, WeightUnit, Workout, WorkoutOrigin,
     },
+    intervals::IntervalsAthlete,
 };
 
 const SOURCE_PREFERENCES_KEY: &str = "source_preferences";
@@ -25,6 +26,8 @@ const TRAINING_ZONES_KEY: &str = "training_zones";
 const RIDE_DISPLAY_PREFERENCES_KEY: &str = "ride_display_preferences";
 const DEV_MODE_KEY: &str = "dev_mode";
 const DEFAULT_WORKOUTS_KEY: &str = "default_workouts_version";
+const INTERVALS_ATHLETE_KEY: &str = "intervals_athlete";
+const INTERVALS_SYNC_KEY: &str = "intervals_sync";
 
 /// How the live power readout is averaged on the ride screens. Stored so the
 /// rider's last choice comes back on the next launch.
@@ -445,6 +448,34 @@ impl RideDisplayPreferences {
     }
 }
 
+/// Which Intervals.icu mirrors run on launch and on "Sync now". Both on by
+/// default once a key is saved; the Settings card shows and edits them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct IntervalsSyncSettings {
+    pub calendar: bool,
+    pub library: bool,
+}
+
+impl Default for IntervalsSyncSettings {
+    fn default() -> Self {
+        Self {
+            calendar: true,
+            library: true,
+        }
+    }
+}
+
+/// The sync settings plus what the last sync did, so the UI can say "last
+/// synced 2 h ago" and show the last error without another request.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct IntervalsSyncState {
+    pub settings: IntervalsSyncSettings,
+    pub last_synced_at: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+}
+
 /// Sample gaps longer than this are pauses (or a dead app) and do not count
 /// as riding time. Mirrors `withActiveElapsed` in the ride charts.
 const MAX_ACTIVE_GAP_MS: i64 = 5_000;
@@ -541,6 +572,22 @@ impl Storage {
                   payload_json TEXT NOT NULL,
                   last_connected_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS planned_workouts (
+                  event_id INTEGER PRIMARY KEY,
+                  workout_uuid TEXT NOT NULL,
+                  date TEXT NOT NULL,
+                  name TEXT NOT NULL,
+                  description TEXT NOT NULL,
+                  activity_type TEXT NOT NULL,
+                  planned_load INTEGER,
+                  duration_seconds INTEGER,
+                  workout_json TEXT,
+                  parse_error TEXT,
+                  intervals_updated TEXT,
+                  fetched_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS planned_workouts_date_idx
+                  ON planned_workouts(date);
                 ",
             )
             .map_err(|error| error.to_string())?;
@@ -595,6 +642,15 @@ impl Storage {
             "last_calibration_json",
             "TEXT",
         )?;
+        // Mirrored workouts are found again by their Intervals.icu id; local
+        // workouts leave it NULL, which a unique index permits any number of.
+        ensure_column(&connection, "workouts", "external_id", "TEXT")?;
+        connection
+            .execute_batch(
+                "CREATE UNIQUE INDEX IF NOT EXISTS workouts_external_id_idx
+                   ON workouts(external_id);",
+            )
+            .map_err(|error| error.to_string())?;
         let reader = Connection::open(path).map_err(|error| error.to_string())?;
         let storage = Self {
             connection: Mutex::new(connection),
@@ -775,14 +831,168 @@ impl Storage {
         self.save_setting(INTERVALS_API_KEY, &api_key)
     }
 
-    pub fn clear_intervals_api_key(&self) -> Result<(), String> {
+    /// Forget everything Intervals.icu: the key, the athlete, the sync state,
+    /// the calendar cache and the mirrored library (none of it can be kept
+    /// current without the key). Returns how many mirrored workouts went.
+    pub fn clear_intervals(&self) -> Result<usize, String> {
+        self.delete_setting(INTERVALS_API_KEY)?;
+        self.delete_setting(INTERVALS_ATHLETE_KEY)?;
+        self.delete_setting(INTERVALS_SYNC_KEY)?;
+        self.clear_planned_workouts()?;
+        self.delete_mirrored_workouts_not_in(&[])
+    }
+
+    fn delete_setting(&self, key: &str) -> Result<(), String> {
         self.connection()?
-            .execute(
-                "DELETE FROM settings WHERE key = ?1",
-                params![INTERVALS_API_KEY],
-            )
+            .execute("DELETE FROM settings WHERE key = ?1", params![key])
             .map_err(|error| error.to_string())?;
         Ok(())
+    }
+
+    pub fn intervals_athlete(&self) -> Result<Option<IntervalsAthlete>, String> {
+        self.setting(INTERVALS_ATHLETE_KEY)
+    }
+
+    pub fn save_intervals_athlete(&self, athlete: &IntervalsAthlete) -> Result<(), String> {
+        self.save_setting(INTERVALS_ATHLETE_KEY, athlete)
+    }
+
+    pub fn intervals_sync_state(&self) -> Result<IntervalsSyncState, String> {
+        Ok(self.setting(INTERVALS_SYNC_KEY)?.unwrap_or_default())
+    }
+
+    pub fn save_intervals_sync_state(&self, state: &IntervalsSyncState) -> Result<(), String> {
+        self.save_setting(INTERVALS_SYNC_KEY, state)
+    }
+
+    /// Replace the whole calendar cache with a fresh fetch, atomically, so a
+    /// reader never sees half of two syncs.
+    pub fn replace_planned_workouts(&self, planned: &[PlannedWorkout]) -> Result<(), String> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute("DELETE FROM planned_workouts", [])
+            .map_err(|error| error.to_string())?;
+        for row in planned {
+            let workout_json = row
+                .workout
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|error| error.to_string())?;
+            transaction
+                .execute(
+                    "INSERT INTO planned_workouts(
+                       event_id, workout_uuid, date, name, description, activity_type,
+                       planned_load, duration_seconds, workout_json, parse_error,
+                       intervals_updated, fetched_at
+                     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    params![
+                        row.event_id,
+                        row.workout_id.to_string(),
+                        row.date.to_string(),
+                        row.name,
+                        row.description,
+                        row.activity_type,
+                        row.planned_load,
+                        row.duration_seconds,
+                        workout_json,
+                        row.parse_error,
+                        row.updated,
+                        row.fetched_at.to_rfc3339(),
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        transaction.commit().map_err(|error| error.to_string())
+    }
+
+    /// The cached calendar, oldest first. The UI picks today by local date.
+    pub fn planned_workouts(&self) -> Result<Vec<PlannedWorkout>, String> {
+        let connection = self.reader()?;
+        let mut statement = connection
+            .prepare(&format!(
+                "SELECT {PLANNED_WORKOUT_COLUMNS} FROM planned_workouts ORDER BY date, event_id"
+            ))
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], planned_workout_from_row)
+            .map_err(|error| error.to_string())?;
+        rows.map(|row| row.map_err(|error| error.to_string()))
+            .collect()
+    }
+
+    /// A planned workout by the stable id the UI and the runner use.
+    pub fn planned_workout(&self, workout_id: Uuid) -> Result<Option<PlannedWorkout>, String> {
+        self.reader()?
+            .query_row(
+                &format!(
+                    "SELECT {PLANNED_WORKOUT_COLUMNS} FROM planned_workouts WHERE workout_uuid = ?1"
+                ),
+                [workout_id.to_string()],
+                planned_workout_from_row,
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn clear_planned_workouts(&self) -> Result<(), String> {
+        self.connection()?
+            .execute("DELETE FROM planned_workouts", [])
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    /// The mirrored workout for an Intervals.icu id (`WorkoutOrigin::external_key`).
+    pub fn workout_by_external_key(&self, key: &str) -> Result<Option<Workout>, String> {
+        let payload = self
+            .reader()?
+            .query_row(
+                "SELECT payload_json FROM workouts WHERE external_id = ?1",
+                [key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        payload
+            .map(|json| serde_json::from_str(&json).map_err(|error| error.to_string()))
+            .transpose()
+    }
+
+    /// Every workout mirrored from Intervals.icu.
+    pub fn mirrored_workouts(&self) -> Result<Vec<Workout>, String> {
+        let connection = self.reader()?;
+        let mut statement = connection
+            .prepare("SELECT payload_json FROM workouts WHERE external_id IS NOT NULL")
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?;
+        rows.map(|row| {
+            serde_json::from_str(&row.map_err(|error| error.to_string())?)
+                .map_err(|error| error.to_string())
+        })
+        .collect()
+    }
+
+    /// Drop mirrored workouts that are no longer in the Intervals.icu library.
+    /// Local workouts are never touched. Returns how many were removed.
+    pub fn delete_mirrored_workouts_not_in(&self, keep: &[String]) -> Result<usize, String> {
+        let mut removed = 0;
+        for workout in self.mirrored_workouts()? {
+            let key = workout
+                .origin
+                .as_ref()
+                .map(WorkoutOrigin::external_key)
+                .unwrap_or_default();
+            if !keep.contains(&key) {
+                self.delete_workout(workout.id)?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
     }
 
     /// Which device feeds each telemetry metric; `Auto` everywhere by default.
@@ -954,11 +1164,11 @@ impl Storage {
         let payload = serde_json::to_string(workout).map_err(|error| error.to_string())?;
         self.reader()?
             .execute(
-                "INSERT INTO workouts(id, name, source, version, payload_json, created_at, updated_at)
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                "INSERT INTO workouts(id, name, source, version, payload_json, created_at, updated_at, external_id)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT(id) DO UPDATE SET name = excluded.name, source = excluded.source,
                    version = excluded.version, payload_json = excluded.payload_json,
-                   updated_at = excluded.updated_at",
+                   updated_at = excluded.updated_at, external_id = excluded.external_id",
                 params![
                     workout.id.to_string(),
                     workout.name,
@@ -967,6 +1177,7 @@ impl Storage {
                     payload,
                     workout.created_at.to_rfc3339(),
                     workout.updated_at.to_rfc3339(),
+                    workout.origin.as_ref().map(WorkoutOrigin::external_key),
                 ],
             )
             .map_err(|error| error.to_string())?;
@@ -1430,6 +1641,54 @@ fn write_setting<T: serde::Serialize>(
     Ok(())
 }
 
+const PLANNED_WORKOUT_COLUMNS: &str = "event_id, workout_uuid, date, name, description, activity_type, planned_load, \
+     duration_seconds, workout_json, parse_error, intervals_updated, fetched_at";
+
+fn planned_workout_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PlannedWorkout> {
+    let workout_json: Option<String> = row.get(8)?;
+    let workout = workout_json
+        .map(|json| {
+            serde_json::from_str::<Workout>(&json).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    8,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })
+        })
+        .transpose()?;
+    let date: String = row.get(2)?;
+    let date = NaiveDate::parse_from_str(&date, "%Y-%m-%d").map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    Ok(PlannedWorkout {
+        event_id: row.get(0)?,
+        workout_id: parse_uuid(row.get::<_, String>(1)?)?,
+        date,
+        name: row.get(3)?,
+        description: row.get(4)?,
+        activity_type: row.get(5)?,
+        planned_load: row.get(6)?,
+        duration_seconds: row.get(7)?,
+        workout,
+        parse_error: row.get(9)?,
+        updated: row.get(10)?,
+        fetched_at: parse_timestamp(row.get::<_, String>(11)?)?,
+    })
+}
+
+fn parse_timestamp(value: String) -> rusqlite::Result<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(&value)
+        .map(|stamp| stamp.with_timezone(&Utc))
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                value.len(),
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })
+}
+
 fn parse_uuid(value: String) -> rusqlite::Result<Uuid> {
     Uuid::parse_str(&value).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(
@@ -1456,7 +1715,7 @@ fn parse_date(value: String) -> rusqlite::Result<DateTime<Utc>> {
 mod tests {
     use super::*;
     use crate::default_workouts::legacy_sample_steps;
-    use crate::domain::WorkoutStep;
+    use crate::domain::{PowerTarget, WorkoutStep};
 
     fn free_ride(duration_seconds: u32) -> WorkoutStep {
         WorkoutStep::FreeRide { duration_seconds }
@@ -1879,9 +2138,133 @@ mod tests {
             Some("secret-api-key")
         );
 
-        storage.clear_intervals_api_key().unwrap();
+        assert_eq!(storage.clear_intervals().unwrap(), 0);
         assert_eq!(storage.intervals_api_key().unwrap(), None);
         assert!(storage.save_intervals_api_key("  ").is_err());
+    }
+
+    #[test]
+    fn planned_workouts_round_trip_and_replace_atomically() {
+        let storage = Storage::in_memory().unwrap();
+        assert_eq!(storage.planned_workouts().unwrap(), vec![]);
+        let structured = Workout::new(
+            "Sweet Spot",
+            vec![WorkoutStep::Steady {
+                duration_seconds: 600,
+                target: PowerTarget::PercentFtp(88),
+            }],
+        );
+        let date = NaiveDate::from_ymd_opt(2026, 9, 21).unwrap();
+        let fetched_at = Utc.with_ymd_and_hms(2026, 9, 20, 12, 0, 0).unwrap();
+        let rows = vec![
+            PlannedWorkout {
+                event_id: 501,
+                workout_id: structured.id,
+                date,
+                name: "Sweet Spot".into(),
+                description: "3x12".into(),
+                activity_type: "Ride".into(),
+                planned_load: Some(68),
+                duration_seconds: Some(600),
+                workout: Some(structured.clone()),
+                parse_error: None,
+                updated: Some("2026-09-20T10:00:00".into()),
+                fetched_at,
+            },
+            PlannedWorkout {
+                event_id: 502,
+                workout_id: Uuid::new_v4(),
+                date: date.succ_opt().unwrap(),
+                name: "Easy".into(),
+                description: String::new(),
+                activity_type: "VirtualRide".into(),
+                planned_load: None,
+                duration_seconds: None,
+                workout: None,
+                parse_error: Some("Unsupported workout element <Sprint>".into()),
+                updated: None,
+                fetched_at,
+            },
+        ];
+        storage.replace_planned_workouts(&rows).unwrap();
+        assert_eq!(storage.planned_workouts().unwrap(), rows);
+        assert_eq!(
+            storage.planned_workout(structured.id).unwrap(),
+            Some(rows[0].clone())
+        );
+        assert_eq!(storage.planned_workout(Uuid::new_v4()).unwrap(), None);
+
+        // A replace drops what is no longer planned.
+        storage.replace_planned_workouts(&rows[1..]).unwrap();
+        assert_eq!(storage.planned_workouts().unwrap(), rows[1..].to_vec());
+        storage.clear_planned_workouts().unwrap();
+        assert_eq!(storage.planned_workouts().unwrap(), vec![]);
+    }
+
+    #[test]
+    fn mirrored_workouts_are_found_by_external_id_and_local_ones_are_left_alone() {
+        let storage = Storage::in_memory().unwrap();
+        let local_count = storage.workouts().unwrap().len();
+        let mut mirrored = Workout::new(
+            "Threshold 2x20",
+            vec![WorkoutStep::Steady {
+                duration_seconds: 1200,
+                target: PowerTarget::PercentFtp(98),
+            }],
+        );
+        mirrored.source = "intervals".into();
+        mirrored.origin = Some(WorkoutOrigin {
+            external_id: 7,
+            folder_id: Some(3),
+            folder: Some("Base".into()),
+            updated: "2026-09-01T08:00:00".into(),
+            planned_load: Some(92),
+        });
+        storage.save_workout(&mirrored).unwrap();
+        assert_eq!(
+            storage.workout_by_external_key("intervals:7").unwrap(),
+            Some(mirrored.clone())
+        );
+        assert_eq!(
+            storage.workout_by_external_key("intervals:8").unwrap(),
+            None
+        );
+        assert_eq!(storage.mirrored_workouts().unwrap(), vec![mirrored.clone()]);
+
+        // Re-saving under the same external id keeps the local uuid.
+        let mut refreshed = mirrored.clone();
+        refreshed.name = "Threshold 2×20".into();
+        storage.save_workout(&refreshed).unwrap();
+        assert_eq!(
+            storage
+                .workout_by_external_key("intervals:7")
+                .unwrap()
+                .unwrap()
+                .id,
+            mirrored.id
+        );
+
+        // Two mirrors cannot share an external id.
+        let mut duplicate = mirrored.clone();
+        duplicate.id = Uuid::new_v4();
+        assert!(storage.save_workout(&duplicate).is_err());
+
+        assert_eq!(
+            storage
+                .delete_mirrored_workouts_not_in(&["intervals:7".into()])
+                .unwrap(),
+            0
+        );
+        assert_eq!(storage.delete_mirrored_workouts_not_in(&[]).unwrap(), 1);
+        assert_eq!(storage.workouts().unwrap().len(), local_count);
+        // Payloads saved before `origin` existed still load.
+        assert!(
+            storage
+                .workouts()
+                .unwrap()
+                .iter()
+                .all(|workout| !workout.is_mirrored())
+        );
     }
 
     #[test]

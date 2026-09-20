@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -46,17 +46,73 @@ impl Default for Profile {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Workout {
     pub id: Uuid,
     pub name: String,
     pub description: String,
+    /// One-word provenance shown on the card: `local`, `zwo` (file import)
+    /// or `intervals` (mirrored from the Intervals.icu library).
     pub source: String,
     pub version: u32,
     pub steps: Vec<WorkoutStep>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Set only on mirrored workouts; payloads saved before it existed load
+    /// as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<WorkoutOrigin>,
+}
+
+/// Where a mirrored workout came from and what the sync needs to keep it
+/// current. `source` stays the discriminator; this carries only what is new.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkoutOrigin {
+    /// Intervals.icu workout id.
+    pub external_id: i64,
+    pub folder_id: Option<i64>,
+    /// Folder or plan name at the last sync, for the library badge.
+    pub folder: Option<String>,
+    /// Intervals.icu `updated` stamp; a sync re-fetches only when it changes.
+    pub updated: String,
+    /// Intervals.icu's estimated training load, kept for ride-to-target-load.
+    pub planned_load: Option<u16>,
+}
+
+impl WorkoutOrigin {
+    /// The `workouts.external_id` column value: provider-qualified so a
+    /// second provider can share the column later.
+    pub fn external_key(&self) -> String {
+        format!("intervals:{}", self.external_id)
+    }
+}
+
+/// One planned workout from the Intervals.icu calendar, cached locally so
+/// the home screen works offline. A dated instance, not a library item.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlannedWorkout {
+    /// Intervals.icu event id.
+    pub event_id: i64,
+    /// Stable per event (UUID v5 of the event id), so the id the UI holds
+    /// survives a re-sync and ride history keeps pointing at the same plan.
+    pub workout_id: Uuid,
+    /// The athlete's local date the workout is planned for.
+    pub date: NaiveDate,
+    pub name: String,
+    pub description: String,
+    pub activity_type: String,
+    /// Intervals.icu's estimated training load, kept for ride-to-target-load.
+    pub planned_load: Option<u16>,
+    pub duration_seconds: Option<u32>,
+    /// The structure, when Intervals.icu supplied a ZWO we could read.
+    pub workout: Option<Workout>,
+    /// Why the structure is missing although Intervals.icu sent one.
+    pub parse_error: Option<String>,
+    pub updated: Option<String>,
+    pub fetched_at: DateTime<Utc>,
 }
 
 impl Workout {
@@ -71,7 +127,13 @@ impl Workout {
             steps,
             created_at: now,
             updated_at: now,
+            origin: None,
         }
+    }
+
+    /// Mirrored from another service: read-only locally.
+    pub fn is_mirrored(&self) -> bool {
+        self.origin.is_some()
     }
 
     pub fn duration_seconds(&self) -> u32 {

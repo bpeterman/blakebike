@@ -49,6 +49,38 @@ describe("WorkoutLibrary", () => {
     expect(onExportAll).toHaveBeenCalledOnce();
   });
 
+  it("shows mirrored Intervals.icu workouts read-only, with their folder and a copy to edit", () => {
+    const onEdit = vi.fn();
+    const onDelete = vi.fn();
+    const mirrored: Workout = {
+      ...workout,
+      id: "22222222-2222-4222-8222-222222222222",
+      name: "Threshold 2x20",
+      source: "intervals",
+      origin: { externalId: 7, folderId: 3, folder: "Base", updated: "2026-09-01T08:00:00", plannedLoad: 92 },
+    };
+    render(<WorkoutLibrary {...props} workouts={[mirrored, workout]} onEdit={onEdit} onDelete={onDelete} />);
+
+    expect(screen.getByText("INTERVALS.ICU · BASE · 5 MIN")).toBeInTheDocument();
+    expect(screen.getByText("LOCAL · 5 MIN")).toBeInTheDocument();
+    expect(screen.getByText("92 load")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Delete Threshold 2x20" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Delete Tempo" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit a copy" }));
+    expect(onEdit).toHaveBeenCalledOnce();
+    const copy = onEdit.mock.calls[0][0] as Workout;
+    expect(copy.id).not.toBe(mirrored.id);
+    expect(copy.source).toBe("local");
+    expect(copy.origin).toBeNull();
+    expect(copy.name).toBe("Threshold 2x20 (copy)");
+    expect(copy.steps).toEqual(mirrored.steps);
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit Tempo" }));
+    expect(onEdit).toHaveBeenLastCalledWith(workout);
+    expect(onDelete).not.toHaveBeenCalled();
+  });
+
   it("disables bulk export when the library is empty", () => {
     render(<WorkoutLibrary {...props} workouts={[]} />);
     expect(

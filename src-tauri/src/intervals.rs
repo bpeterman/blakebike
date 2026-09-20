@@ -5,14 +5,29 @@
 //! `API_KEY`, password the key, which is how Intervals.icu documents personal
 //! API keys. `base_url` is a constructor parameter so tests can point the
 //! client at a local listener serving canned JSON.
+//!
+//! Workout structure travels as ZWO on both the calendar and the library
+//! path, so Intervals.icu resolves `%FTP` / `%MMP` targets with its own model
+//! and `formats::import_zwo` reads the result.
 
 use std::{fmt, time::Duration};
 
-use reqwest::StatusCode;
-use serde::{Deserialize, de::DeserializeOwned};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use chrono::{NaiveDate, Utc};
+use reqwest::{RequestBuilder, Response, StatusCode};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use uuid::Uuid;
+
+use crate::{
+    domain::{PlannedWorkout, Workout},
+    formats::import_zwo,
+};
 
 const BASE_URL: &str = "https://intervals.icu";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+/// Namespace for the v5 UUIDs given to planned workouts, so the same
+/// Intervals.icu event always maps to the same local id.
+const PLANNED_WORKOUT_NAMESPACE: Uuid = Uuid::from_u128(0x6b1d_2f3e_4a5c_4d7e_8f90_1a2b_3c4d_5e6f);
 
 /// Why a request to Intervals.icu did not produce data. The command layer
 /// turns these into the strings the UI shows; keeping them apart here means
@@ -25,7 +40,7 @@ pub enum IntervalsError {
     Network(String),
     /// Any other non-2xx status.
     Http { status: u16, what: &'static str },
-    /// 2xx, but the body was not the JSON we expected.
+    /// 2xx, but the body was not what we expected.
     Unreadable { what: &'static str, error: String },
 }
 
@@ -50,6 +65,15 @@ impl From<IntervalsError> for String {
     fn from(error: IntervalsError) -> Self {
         error.to_string()
     }
+}
+
+/// The athlete a key belongs to, as `GET /athlete/0` reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IntervalsAthlete {
+    /// Intervals.icu athlete id, e.g. `i12345`.
+    pub id: String,
+    pub name: Option<String>,
 }
 
 pub struct IntervalsClient {
@@ -77,14 +101,20 @@ impl IntervalsClient {
         })
     }
 
-    async fn get_json<T: DeserializeOwned>(
+    fn get(&self, path: &str) -> RequestBuilder {
+        self.http.get(format!("{}{path}", self.base_url))
+    }
+
+    fn post(&self, path: &str) -> RequestBuilder {
+        self.http.post(format!("{}{path}", self.base_url))
+    }
+
+    async fn send(
         &self,
-        path: &str,
+        request: RequestBuilder,
         what: &'static str,
-    ) -> Result<T, IntervalsError> {
-        let response = self
-            .http
-            .get(format!("{}{path}", self.base_url))
+    ) -> Result<Response, IntervalsError> {
+        let response = request
             .basic_auth("API_KEY", Some(&self.api_key))
             .send()
             .await
@@ -99,13 +129,42 @@ impl IntervalsClient {
                 what,
             });
         }
-        response
+        Ok(response)
+    }
+
+    async fn get_json<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        what: &'static str,
+    ) -> Result<T, IntervalsError> {
+        self.send(self.get(path), what)
+            .await?
             .json()
             .await
             .map_err(|error| IntervalsError::Unreadable {
                 what,
                 error: error.to_string(),
             })
+    }
+
+    /// The athlete the key belongs to.
+    pub async fn athlete(&self) -> Result<IntervalsAthlete, IntervalsError> {
+        #[derive(Deserialize)]
+        struct Athlete {
+            id: String,
+            name: Option<String>,
+        }
+        let athlete: Athlete = self.get_json("/api/v1/athlete/0", "athlete").await?;
+        if athlete.id.trim().is_empty() {
+            return Err(IntervalsError::Unreadable {
+                what: "athlete",
+                error: "missing id".into(),
+            });
+        }
+        Ok(IntervalsAthlete {
+            id: athlete.id,
+            name: athlete.name.filter(|name| !name.trim().is_empty()),
+        })
     }
 
     /// The athlete's cycling ("Ride") sport settings, normalized. `Ok(None)`
@@ -122,19 +181,137 @@ impl IntervalsClient {
             .await?;
         Ok(settings
             .into_iter()
-            .find(|setting| {
-                setting
-                    .types
-                    .iter()
-                    .any(|kind| kind.eq_ignore_ascii_case("ride"))
-            })
+            .find(|setting| setting.types.iter().any(|kind| is_ride(kind)))
             .map(normalized_cycling_settings))
     }
+
+    /// Planned cycling workouts between two local dates, inclusive, with
+    /// their structure decoded from the ZWO Intervals.icu attaches when asked
+    /// with `ext=zwo`. A ZWO that cannot be read is a per-event failure.
+    pub async fn planned_workouts(
+        &self,
+        athlete_id: &str,
+        oldest: NaiveDate,
+        newest: NaiveDate,
+    ) -> Result<CalendarFetch, IntervalsError> {
+        let events: Vec<Event> = self
+            .get_json(
+                &format!(
+                    "/api/v1/athlete/{athlete_id}/events?oldest={oldest}&newest={newest}&category=WORKOUT&ext=zwo"
+                ),
+                "calendar",
+            )
+            .await?;
+        let fetched_at = Utc::now();
+        let mut fetch = CalendarFetch::default();
+        for event in events {
+            let Some(planned) = planned_workout_from_event(event, fetched_at) else {
+                fetch.skipped += 1;
+                continue;
+            };
+            fetch.planned.push(planned);
+        }
+        Ok(fetch)
+    }
+
+    /// The cycling workouts in the athlete's library with their folder names.
+    /// Structure is not included; fetch it per workout with `workout_zwo`.
+    pub async fn library(&self, athlete_id: &str) -> Result<LibraryFetch, IntervalsError> {
+        let raw: Vec<serde_json::Value> = self
+            .get_json(
+                &format!("/api/v1/athlete/{athlete_id}/workouts"),
+                "workout library",
+            )
+            .await?;
+        let folders: Vec<Folder> = self
+            .get_json(&format!("/api/v1/athlete/{athlete_id}/folders"), "folders")
+            .await?;
+        let mut fetch = LibraryFetch::default();
+        for value in raw {
+            let workout: LibraryWorkout =
+                serde_json::from_value(value.clone()).map_err(|error| {
+                    IntervalsError::Unreadable {
+                        what: "workout library",
+                        error: error.to_string(),
+                    }
+                })?;
+            let activity_type = workout.activity_type.unwrap_or_default();
+            if !is_ride(&activity_type) {
+                fetch.skipped += 1;
+                continue;
+            }
+            let folder = workout.folder_id.and_then(|id| {
+                folders
+                    .iter()
+                    .find(|folder| folder.id == id)
+                    .and_then(|folder| folder.name.clone())
+            });
+            fetch.entries.push(LibraryEntry {
+                external_id: workout.id,
+                name: non_empty(workout.name).unwrap_or_else(|| "Untitled workout".into()),
+                description: workout.description.unwrap_or_default(),
+                activity_type,
+                folder_id: workout.folder_id,
+                folder,
+                updated: workout.updated.unwrap_or_default(),
+                planned_load: to_u16(workout.icu_training_load),
+                duration_seconds: to_u32(workout.moving_time),
+                raw: value,
+            });
+        }
+        Ok(fetch)
+    }
+
+    /// One library workout as ZWO, converted by Intervals.icu from the
+    /// workout JSON it gave us in the listing.
+    pub async fn workout_zwo(
+        &self,
+        athlete_id: &str,
+        entry: &LibraryEntry,
+    ) -> Result<String, IntervalsError> {
+        let what = "workout download";
+        self.send(
+            self.post(&format!(
+                "/api/v1/athlete/{athlete_id}/download-workout.zwo"
+            ))
+            .json(&entry.raw),
+            what,
+        )
+        .await?
+        .text()
+        .await
+        .map_err(|error| IntervalsError::Unreadable {
+            what,
+            error: error.to_string(),
+        })
+    }
+}
+
+/// Intervals.icu activity types are Strava's: `Ride`, `VirtualRide`,
+/// `GravelRide`, `MountainBikeRide`, `EBikeRide`. All of them are rides.
+fn is_ride(activity_type: &str) -> bool {
+    activity_type.to_ascii_lowercase().contains("ride")
+}
+
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.trim().is_empty())
+}
+
+fn to_u16(value: Option<f64>) -> Option<u16> {
+    value
+        .filter(|value| value.is_finite() && *value >= 0.0 && *value <= f64::from(u16::MAX))
+        .map(|value| value.round() as u16)
+}
+
+fn to_u32(value: Option<f64>) -> Option<u32> {
+    value
+        .filter(|value| value.is_finite() && *value >= 0.0 && *value <= f64::from(u32::MAX))
+        .map(|value| value.round() as u32)
 }
 
 /// Which Intervals.icu field an FTP came from. blake.bike is an indoor app,
 /// so a configured indoor FTP wins over the general one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum FtpSource {
     IndoorFtp,
@@ -181,6 +358,142 @@ struct SportSettings {
     power_zones: Option<Vec<f64>>,
     #[serde(default)]
     power_zone_names: Option<Vec<String>>,
+}
+
+/// A calendar event as `GET /events?ext=zwo` returns it; only the fields we
+/// keep. `workout_file_base64` is present when the event has structure.
+#[derive(Deserialize)]
+struct Event {
+    id: i64,
+    start_date_local: Option<String>,
+    name: Option<String>,
+    description: Option<String>,
+    #[serde(rename = "type")]
+    activity_type: Option<String>,
+    category: Option<String>,
+    icu_training_load: Option<f64>,
+    moving_time: Option<f64>,
+    updated: Option<String>,
+    workout_doc: Option<serde_json::Value>,
+    workout_file_base64: Option<String>,
+}
+
+#[derive(Debug, Default)]
+pub struct CalendarFetch {
+    pub planned: Vec<PlannedWorkout>,
+    /// Events that were not cycling workouts.
+    pub skipped: usize,
+}
+
+/// `None` when the event is not a cycling workout.
+fn planned_workout_from_event(
+    event: Event,
+    fetched_at: chrono::DateTime<Utc>,
+) -> Option<PlannedWorkout> {
+    if event
+        .category
+        .as_deref()
+        .is_some_and(|category| category != "WORKOUT")
+    {
+        return None;
+    }
+    let activity_type = event.activity_type.unwrap_or_default();
+    if !is_ride(&activity_type) {
+        return None;
+    }
+    let date = event
+        .start_date_local
+        .as_deref()
+        .and_then(|stamp| NaiveDate::parse_from_str(stamp.get(..10)?, "%Y-%m-%d").ok())?;
+    let name = non_empty(event.name).unwrap_or_else(|| "Planned workout".into());
+    let workout_id = planned_workout_uuid(event.id);
+    let (workout, parse_error) = match (event.workout_file_base64, event.workout_doc) {
+        (Some(encoded), _) => match decode_zwo(&encoded).and_then(|zwo| import_zwo(&zwo)) {
+            Ok(mut parsed) => {
+                parsed.id = workout_id;
+                parsed.name = name.clone();
+                parsed.source = "intervals".into();
+                (Some(parsed), None)
+            }
+            Err(error) => (None, Some(error)),
+        },
+        (None, Some(_)) => (
+            None,
+            Some("Intervals.icu did not attach a ZWO file for this workout".into()),
+        ),
+        (None, None) => (None, None),
+    };
+    Some(PlannedWorkout {
+        event_id: event.id,
+        workout_id,
+        date,
+        name,
+        description: event.description.unwrap_or_default(),
+        activity_type,
+        planned_load: to_u16(event.icu_training_load),
+        duration_seconds: workout
+            .as_ref()
+            .map(Workout::duration_seconds)
+            .or_else(|| to_u32(event.moving_time)),
+        workout,
+        parse_error,
+        updated: event.updated,
+        fetched_at,
+    })
+}
+
+pub fn planned_workout_uuid(event_id: i64) -> Uuid {
+    Uuid::new_v5(&PLANNED_WORKOUT_NAMESPACE, event_id.to_string().as_bytes())
+}
+
+fn decode_zwo(encoded: &str) -> Result<String, String> {
+    let bytes = BASE64
+        .decode(encoded.trim())
+        .map_err(|error| format!("Intervals.icu sent an unreadable workout file: {error}"))?;
+    String::from_utf8(bytes)
+        .map_err(|error| format!("Intervals.icu sent a workout file that is not UTF-8: {error}"))
+}
+
+#[derive(Deserialize)]
+struct LibraryWorkout {
+    id: i64,
+    name: Option<String>,
+    description: Option<String>,
+    #[serde(rename = "type")]
+    activity_type: Option<String>,
+    folder_id: Option<i64>,
+    updated: Option<String>,
+    icu_training_load: Option<f64>,
+    moving_time: Option<f64>,
+}
+
+#[derive(Deserialize)]
+struct Folder {
+    id: i64,
+    name: Option<String>,
+}
+
+/// One cycling workout in the library, without structure.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LibraryEntry {
+    pub external_id: i64,
+    pub name: String,
+    pub description: String,
+    pub activity_type: String,
+    pub folder_id: Option<i64>,
+    pub folder: Option<String>,
+    pub updated: String,
+    pub planned_load: Option<u16>,
+    pub duration_seconds: Option<u32>,
+    /// The workout exactly as listed, posted back for ZWO conversion.
+    raw: serde_json::Value,
+}
+
+#[derive(Debug, Default)]
+pub struct LibraryFetch {
+    pub entries: Vec<LibraryEntry>,
+    /// Library workouts that were not cycling workouts.
+    pub skipped: usize,
 }
 
 fn in_range(value: Option<f64>, minimum: f64, maximum: f64) -> Option<u16> {
@@ -273,15 +586,69 @@ fn normalized_cycling_settings(settings: SportSettings) -> CyclingSettings {
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    //! A one-shot HTTP listener serving canned JSON. The joined handle
-    //! returns the raw request so tests can assert on path and headers.
+    //! Local HTTP listeners serving canned responses. The joined handle
+    //! returns the raw requests so tests can assert on path, headers and body.
 
     use std::{
         io::{Read, Write},
-        net::TcpListener,
+        net::{TcpListener, TcpStream},
         thread,
     };
 
+    /// One canned answer, matched by `METHOD /path` prefix.
+    pub struct Route {
+        pub prefix: &'static str,
+        pub status: &'static str,
+        pub content_type: &'static str,
+        pub body: String,
+    }
+
+    pub fn json(prefix: &'static str, body: &str) -> Route {
+        Route {
+            prefix,
+            status: "200 OK",
+            content_type: "application/json",
+            body: body.to_string(),
+        }
+    }
+
+    fn read_request(stream: &mut TcpStream) -> String {
+        let mut buffer = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            let bytes = stream.read(&mut chunk).unwrap();
+            if bytes == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&chunk[..bytes]);
+            let text = String::from_utf8_lossy(&buffer);
+            if let Some(end) = text.find("\r\n\r\n") {
+                let content_length = text[..end]
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())?
+                    })
+                    .unwrap_or(0);
+                if buffer.len() >= end + 4 + content_length {
+                    break;
+                }
+            }
+        }
+        String::from_utf8_lossy(&buffer).into_owned()
+    }
+
+    fn respond(stream: &mut TcpStream, status: &str, content_type: &str, body: &str) {
+        write!(
+            stream,
+            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+    }
+
+    /// Serve exactly one request.
     pub fn serve_once(status: &str, body: &str) -> (String, thread::JoinHandle<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -289,16 +656,39 @@ pub(crate) mod test_support {
         let body = body.to_string();
         let handle = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 4096];
-            let bytes = stream.read(&mut request).unwrap();
-            let request = String::from_utf8_lossy(&request[..bytes]).into_owned();
-            write!(
-                stream,
-                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            )
-            .unwrap();
+            let request = read_request(&mut stream);
+            respond(&mut stream, &status, "application/json", &body);
             request
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    /// Serve `count` requests, each answered by the first route whose prefix
+    /// matches `METHOD /path`; an unmatched request gets a 404 so the test
+    /// fails loudly instead of hanging.
+    pub fn serve_routes(
+        routes: Vec<Route>,
+        count: usize,
+    ) -> (String, thread::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for _ in 0..count {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_request(&mut stream);
+                match routes
+                    .iter()
+                    .find(|route| request.starts_with(route.prefix))
+                {
+                    Some(route) => {
+                        respond(&mut stream, route.status, route.content_type, &route.body)
+                    }
+                    None => respond(&mut stream, "404 Not Found", "text/plain", "no route"),
+                }
+                requests.push(request);
+            }
+            requests
         });
         (format!("http://{address}"), handle)
     }
@@ -306,10 +696,24 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::{test_support::serve_once, *};
+    use super::{
+        test_support::{Route, json, serve_once, serve_routes},
+        *,
+    };
+    use crate::domain::WorkoutStep;
 
     fn ride(json: &str) -> SportSettings {
         serde_json::from_str(json).unwrap()
+    }
+
+    const ZWO: &str = r#"<workout_file><name>Sweet Spot</name><description>3x12</description><workout>
+      <Warmup Duration="600" PowerLow="0.5" PowerHigh="0.7"/>
+      <IntervalsT Repeat="3" OnDuration="720" OffDuration="240" OnPower="0.9" OffPower="0.55"/>
+      <Cooldown Duration="120" PowerLow="0.55" PowerHigh="0.4"/>
+    </workout></workout_file>"#;
+
+    fn encoded(zwo: &str) -> String {
+        BASE64.encode(zwo.as_bytes())
     }
 
     #[test]
@@ -470,5 +874,141 @@ mod tests {
             client.cycling_settings("0").await.unwrap_err(),
             IntervalsError::Network(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn resolves_the_athlete_behind_the_key() {
+        let (base_url, server) = serve_once(
+            "200 OK",
+            r#"{"id":"i98765","name":"Blake P","email":"x@y.z","sportSettings":[]}"#,
+        );
+        let client = IntervalsClient::with_base_url("secret", &base_url).unwrap();
+        assert_eq!(
+            client.athlete().await.unwrap(),
+            IntervalsAthlete {
+                id: "i98765".into(),
+                name: Some("Blake P".into())
+            }
+        );
+        assert!(server.join().unwrap().starts_with("GET /api/v1/athlete/0 "));
+
+        let (base_url, server) = serve_once("200 OK", r#"{"id":"i1","name":""}"#);
+        let client = IntervalsClient::with_base_url("secret", &base_url).unwrap();
+        assert_eq!(client.athlete().await.unwrap().name, None);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn decodes_planned_cycling_workouts_from_the_calendar() {
+        let body = format!(
+            r#"[
+              {{"id":501,"start_date_local":"2026-09-21T00:00:00","name":"Sweet Spot 3x12","description":"- 10m 50-70%",
+                "type":"Ride","category":"WORKOUT","icu_training_load":68.4,"moving_time":3720,"updated":"2026-09-20T10:00:00",
+                "workout_doc":{{"steps":[]}},"workout_filename":"Sweet_Spot.zwo","workout_file_base64":"{zwo}"}},
+              {{"id":502,"start_date_local":"2026-09-22T00:00:00","name":"Easy spin","type":"VirtualRide","category":"WORKOUT",
+                "icu_training_load":25,"moving_time":2700}},
+              {{"id":503,"start_date_local":"2026-09-22T00:00:00","name":"Long run","type":"Run","category":"WORKOUT",
+                "workout_file_base64":"{zwo}"}},
+              {{"id":504,"start_date_local":"2026-09-23T00:00:00","name":"Broken","type":"Ride","category":"WORKOUT",
+                "workout_doc":{{}},"workout_file_base64":"{broken}"}}
+            ]"#,
+            zwo = encoded(ZWO),
+            broken = encoded(
+                "<workout_file><workout><Sprint Duration=\"10\"/></workout></workout_file>"
+            ),
+        );
+        let (base_url, server) = serve_once("200 OK", &body);
+        let client = IntervalsClient::with_base_url("secret", &base_url).unwrap();
+        let oldest = NaiveDate::from_ymd_opt(2026, 9, 21).unwrap();
+        let newest = NaiveDate::from_ymd_opt(2026, 9, 27).unwrap();
+        let fetch = client.planned_workouts("i1", oldest, newest).await.unwrap();
+        let request = server.join().unwrap();
+        assert!(request.starts_with(
+            "GET /api/v1/athlete/i1/events?oldest=2026-09-21&newest=2026-09-27&category=WORKOUT&ext=zwo "
+        ));
+        assert_eq!(fetch.skipped, 1, "the run is not a cycling workout");
+        assert_eq!(fetch.planned.len(), 3);
+
+        let structured = &fetch.planned[0];
+        assert_eq!(structured.event_id, 501);
+        assert_eq!(structured.workout_id, planned_workout_uuid(501));
+        assert_eq!(structured.date, oldest);
+        assert_eq!(structured.name, "Sweet Spot 3x12");
+        assert_eq!(structured.planned_load, Some(68));
+        assert_eq!(structured.duration_seconds, Some(3600));
+        assert_eq!(structured.parse_error, None);
+        let workout = structured.workout.as_ref().unwrap();
+        assert_eq!(workout.id, structured.workout_id);
+        assert_eq!(workout.name, "Sweet Spot 3x12");
+        assert_eq!(workout.source, "intervals");
+        assert_eq!(workout.steps.len(), 3);
+        assert!(matches!(
+            workout.steps[1],
+            WorkoutStep::Repeat { repetitions: 3, .. }
+        ));
+
+        let unstructured = &fetch.planned[1];
+        assert_eq!(unstructured.workout, None);
+        assert_eq!(unstructured.parse_error, None);
+        assert_eq!(unstructured.duration_seconds, Some(2700));
+        assert_eq!(unstructured.planned_load, Some(25));
+
+        let broken = &fetch.planned[2];
+        assert_eq!(broken.workout, None);
+        assert_eq!(
+            broken.parse_error.as_deref(),
+            Some("Unsupported workout element <Sprint>")
+        );
+    }
+
+    #[test]
+    fn planned_workout_ids_are_stable_per_event() {
+        assert_eq!(planned_workout_uuid(42), planned_workout_uuid(42));
+        assert_ne!(planned_workout_uuid(42), planned_workout_uuid(43));
+    }
+
+    #[tokio::test]
+    async fn lists_the_cycling_library_with_folder_names_and_converts_one_to_zwo() {
+        let workouts = r#"[
+          {"id":7,"name":"Threshold 2x20","description":"- 2x 20m 98%","type":"Ride","folder_id":3,
+           "updated":"2026-09-01T08:00:00","icu_training_load":92,"moving_time":4500},
+          {"id":8,"name":"Tempo run","type":"Run","folder_id":3,"updated":"2026-09-01T08:00:00"},
+          {"id":9,"name":"Openers","type":"VirtualRide","folder_id":null,"updated":"2026-09-02T08:00:00"}
+        ]"#;
+        let folders = r#"[{"id":3,"name":"Base","type":"FOLDER","children":[]}]"#;
+        let (base_url, server) = serve_routes(
+            vec![
+                json("GET /api/v1/athlete/i1/workouts ", workouts),
+                json("GET /api/v1/athlete/i1/folders ", folders),
+                Route {
+                    prefix: "POST /api/v1/athlete/i1/download-workout.zwo ",
+                    status: "200 OK",
+                    content_type: "application/xml",
+                    body: ZWO.to_string(),
+                },
+            ],
+            3,
+        );
+        let client = IntervalsClient::with_base_url("secret", &base_url).unwrap();
+        let library = client.library("i1").await.unwrap();
+        assert_eq!(library.skipped, 1);
+        assert_eq!(library.entries.len(), 2);
+        let threshold = &library.entries[0];
+        assert_eq!(threshold.external_id, 7);
+        assert_eq!(threshold.folder.as_deref(), Some("Base"));
+        assert_eq!(threshold.folder_id, Some(3));
+        assert_eq!(threshold.planned_load, Some(92));
+        assert_eq!(threshold.duration_seconds, Some(4500));
+        assert_eq!(threshold.updated, "2026-09-01T08:00:00");
+        assert_eq!(library.entries[1].folder, None);
+
+        let zwo = client.workout_zwo("i1", threshold).await.unwrap();
+        assert_eq!(import_zwo(&zwo).unwrap().steps.len(), 3);
+
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[2].contains("content-type: application/json"));
+        assert!(requests[2].ends_with(r#"}"#));
+        assert!(requests[2].contains(r#""id":7"#));
     }
 }
