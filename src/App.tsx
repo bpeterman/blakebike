@@ -1721,9 +1721,15 @@ export function Ride({
               ) : rideable.map((workout, index) => <button key={workout.id} className={selectedWorkout === workout.id ? "selected" : ""} aria-pressed={selectedWorkout === workout.id} onClick={() => setSelectedWorkout(workout.id)}>
                 <div><strong>{index < plannedRides.length && <em className="today-chip">Today</em>}{workout.name}</strong><span>{formatDuration(workoutDuration(workout.steps))}</span></div><WorkoutProfile steps={workout.steps} ftpWatts={profile.ftpWatts} powerZones={powerZones} /></button>)}
             </div>
-            <button className="primary start-button" disabled={!connected || !selectedWorkout} onClick={() => selectedWorkout && void perform(() => api.startWorkout(selectedWorkout), "start workout")}><Play fill="currentColor" /> Start workout</button>
           </div>
-          <div className="card ride-preview"><span className="label">WORKOUT PREVIEW</span><h2>{selected?.name ?? "Choose a workout"}</h2><p>{selected?.description}</p>{selected && <><div className="preview-chart"><WorkoutProfile variant="editor" steps={selected.steps} ftpWatts={profile.ftpWatts} powerZones={powerZones} /></div><div className="preview-stats"><Metric value={formatDuration(workoutDuration(selected.steps))} unit="duration" /><Metric value={`${selected.steps.length}`} unit="blocks" /></div></>}</div>
+          <div className="card ride-preview">
+            <div className="ride-preview-header">
+              <div><span className="label">WORKOUT PREVIEW</span><h2>{selected?.name ?? "Choose a workout"}</h2></div>
+              <button className="primary start-button" disabled={!connected || !selectedWorkout} onClick={() => selectedWorkout && void perform(() => api.startWorkout(selectedWorkout), "start workout")}><Play fill="currentColor" /> Start workout</button>
+            </div>
+            <p>{selected?.description}</p>
+            {selected && <><div className="preview-chart"><WorkoutProfile variant="editor" steps={selected.steps} ftpWatts={profile.ftpWatts} powerZones={powerZones} /></div><div className="preview-stats"><Metric value={formatDuration(workoutDuration(selected.steps))} unit="duration" /><Metric value={`${selected.steps.length}`} unit="blocks" /></div></>}
+          </div>
         </section>
       ) : (
         <section className="live-ride">
