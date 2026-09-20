@@ -938,6 +938,17 @@ impl Storage {
             .map_err(|error| error.to_string())
     }
 
+    /// A workout the runner can start: the library first, then today's plan
+    /// from the calendar cache. One lookup so `start_workout` has one path.
+    pub fn rideable_workout(&self, id: Uuid) -> Result<Option<Workout>, String> {
+        if let Some(workout) = self.workout(id)? {
+            return Ok(Some(workout));
+        }
+        Ok(self
+            .planned_workout(id)?
+            .and_then(|planned| planned.workout))
+    }
+
     pub fn clear_planned_workouts(&self) -> Result<(), String> {
         self.connection()?
             .execute("DELETE FROM planned_workouts", [])
@@ -2193,6 +2204,25 @@ mod tests {
             Some(rows[0].clone())
         );
         assert_eq!(storage.planned_workout(Uuid::new_v4()).unwrap(), None);
+
+        // The runner resolves library workouts first, then planned ones.
+        assert_eq!(
+            storage.rideable_workout(structured.id).unwrap(),
+            Some(structured.clone())
+        );
+        let mut clashing = structured.clone();
+        clashing.name = "Library copy".into();
+        storage.save_workout(&clashing).unwrap();
+        assert_eq!(
+            storage
+                .rideable_workout(structured.id)
+                .unwrap()
+                .unwrap()
+                .name,
+            "Library copy"
+        );
+        assert_eq!(storage.rideable_workout(Uuid::new_v4()).unwrap(), None);
+        storage.delete_workout(clashing.id).unwrap();
 
         // A replace drops what is no longer planned.
         storage.replace_planned_workouts(&rows[1..]).unwrap();

@@ -421,9 +421,11 @@ already reads.
   failed, skipped} | error, library: LibrarySyncReport | error }`; runs the enabled
   halves, records `last_synced_at` / `last_error`.
 - `planned_workouts -> Vec<PlannedWorkout>` (the cached range; the UI picks today by
-  local date), `get_intervals_sync_settings`, `set_intervals_sync_settings`,
-  `intervals_status -> { configured, athleteName, lastSyncedAt, lastError, settings }`
-  replacing `intervals_api_key_configured`.
+  local date), `set_intervals_sync_settings` (turning a mirror off purges its copies
+  at once, so nothing read-only lingers that the sync no longer refreshes), and
+  `intervals_status -> { configured, athleteId, athleteName, settings, lastSyncedAt,
+  lastError }` replacing `intervals_api_key_configured`; the settings are read
+  through the status rather than a command of their own.
 - `start_workout` fallback to the planned cache; `save_workout` / `delete_workout`
   reject mirrored workouts.
 

@@ -50,6 +50,49 @@ pub fn status(storage: &Storage) -> Result<IntervalsStatus, String> {
     })
 }
 
+/// Change which mirrors are kept. Turning a mirror off removes its copies at
+/// once, so nothing read-only lingers that the sync will no longer refresh;
+/// the toggle copy promises exactly that.
+pub fn update_settings(
+    storage: &Storage,
+    settings: IntervalsSyncSettings,
+) -> Result<IntervalsStatus, String> {
+    let mut state = storage.intervals_sync_state()?;
+    let previous = state.settings;
+    state.settings = settings;
+    storage.save_intervals_sync_state(&state)?;
+    if previous.library && !settings.library {
+        let removed = storage.delete_mirrored_workouts_not_in(&[])?;
+        tracing::info!(
+            removed,
+            "Library mirror turned off; mirrored workouts removed"
+        );
+    }
+    if previous.calendar && !settings.calendar {
+        storage.clear_planned_workouts()?;
+        tracing::info!("Calendar mirror turned off; planned workouts cleared");
+    }
+    status(storage)
+}
+
+/// Mirrored workouts are refreshed by the sync and never edited or deleted
+/// locally. `incoming` is the payload being saved, if any, so a client cannot
+/// smuggle a mirror in by hand either.
+pub fn ensure_editable(
+    storage: &Storage,
+    id: Uuid,
+    incoming: Option<&Workout>,
+) -> Result<(), String> {
+    if incoming.is_some_and(Workout::is_mirrored)
+        || storage
+            .workout(id)?
+            .is_some_and(|stored| stored.is_mirrored())
+    {
+        return Err(MIRRORED_WORKOUT_MESSAGE.into());
+    }
+    Ok(())
+}
+
 /// The athlete id every call needs. Stored → use it. Key but no athlete
 /// (saved before ids were stored) → fetch once and keep it. No key → error.
 pub async fn resolve_athlete(
@@ -583,6 +626,66 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(after, before);
+    }
+
+    #[tokio::test]
+    async fn turning_a_mirror_off_removes_its_copies_and_mirrors_stay_read_only() {
+        let storage = Storage::in_memory().unwrap();
+        storage.save_intervals_api_key("secret").unwrap();
+        let local_count = storage.workouts().unwrap().len();
+        let (base_url, server) = serve_routes(routes(&library_body("2026-09-01T08:00:00", 3)), 6);
+        let client = IntervalsClient::with_base_url("secret", &base_url).unwrap();
+        let athlete = resolve_athlete(&storage, &client).await.unwrap();
+        sync_calendar(&storage, &client, &athlete.id).await.unwrap();
+        sync_library(&storage, &client, &athlete.id).await.unwrap();
+        server.join().unwrap();
+        let mirrored = storage
+            .workout_by_external_key("intervals:7")
+            .unwrap()
+            .unwrap();
+        let local = storage
+            .workouts()
+            .unwrap()
+            .into_iter()
+            .find(|workout| !workout.is_mirrored())
+            .unwrap();
+
+        assert_eq!(
+            ensure_editable(&storage, mirrored.id, None).unwrap_err(),
+            MIRRORED_WORKOUT_MESSAGE
+        );
+        assert_eq!(
+            ensure_editable(&storage, local.id, Some(&mirrored)).unwrap_err(),
+            MIRRORED_WORKOUT_MESSAGE
+        );
+        ensure_editable(&storage, local.id, Some(&local)).unwrap();
+        ensure_editable(&storage, Uuid::new_v4(), None).unwrap();
+
+        let status = update_settings(
+            &storage,
+            IntervalsSyncSettings {
+                calendar: true,
+                library: false,
+            },
+        )
+        .unwrap();
+        assert!(!status.settings.library);
+        assert_eq!(storage.mirrored_workouts().unwrap(), vec![]);
+        assert_eq!(storage.workouts().unwrap().len(), local_count);
+        assert_eq!(storage.planned_workouts().unwrap().len(), 2);
+
+        update_settings(
+            &storage,
+            IntervalsSyncSettings {
+                calendar: false,
+                library: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(storage.planned_workouts().unwrap(), vec![]);
+        // Turning a mirror back on purges nothing; the next sync refills it.
+        let status = update_settings(&storage, IntervalsSyncSettings::default()).unwrap();
+        assert_eq!(status.settings, IntervalsSyncSettings::default());
     }
 
     #[tokio::test]

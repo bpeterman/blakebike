@@ -243,7 +243,9 @@ function App() {
   const syncIntervals = useCallback(async (): Promise<IntervalsSyncReport> => {
     try {
       const report = await api.syncIntervals();
-      await refreshIntervalsMirrors(report.library.status === "done");
+      // A failed library half may still have written some rows before it
+      // stopped, so reload whenever that half ran at all.
+      await refreshIntervalsMirrors(report.library.status !== "off");
       return report;
     } catch (cause) {
       await refreshIntervalsMirrors(false).catch(() => undefined);
@@ -522,6 +524,17 @@ function App() {
     if (connected) void perform(() => api.startFreeRide(), "start free ride");
   };
 
+  // Today's plan, shown on the home screen and at the top of the ride picker
+  // only while the calendar mirror is on; the cache itself is cleared when the
+  // toggle goes off, this just keeps the two views in step immediately.
+  const plannedToday = useMemo(
+    () =>
+      intervalsStatus.configured && intervalsStatus.settings.calendar
+        ? plannedOn(plannedWorkouts, localDateString())
+        : [],
+    [intervalsStatus, plannedWorkouts],
+  );
+
   const importZwo = async (file: File) => {
     await perform(async () => {
       await api.importZwo(await file.text());
@@ -627,7 +640,7 @@ function App() {
             sessions={sessions}
             connected={connected}
             devMode={devMode}
-            plannedToday={plannedOn(plannedWorkouts, localDateString())}
+            plannedToday={plannedToday}
             intervalsStatus={intervalsStatus}
             onConnect={() => setDevicePicker("trainer")}
             onRide={openRide}
@@ -692,7 +705,7 @@ function App() {
         {page === "ride" && (
           <Ride
             workouts={workouts}
-            plannedToday={plannedOn(plannedWorkouts, localDateString())}
+            plannedToday={plannedToday}
             selectedWorkout={selectedWorkout}
             setSelectedWorkout={setSelectedWorkout}
             connected={connected}
@@ -791,7 +804,10 @@ function App() {
               setWorkouts(await api.workouts());
             }}
             onIntervalsSyncSettings={async (settings) => {
+              // Turning a mirror off purges its copies on the backend, so the
+              // plan, the library and the status all need a re-read.
               setIntervalsStatus(await api.saveIntervalsSyncSettings(settings));
+              await refreshIntervalsMirrors(true);
             }}
             onSyncIntervals={syncIntervals}
           />
@@ -1058,7 +1074,11 @@ export function TodayPlanCard({
     }
   };
   const syncLine = status.lastError
-    ? `${describeLastSynced(status.lastSyncedAt)} · Intervals.icu unreachable`
+    ? `${describeLastSynced(status.lastSyncedAt)} · ${
+        status.lastError.startsWith("Could not reach")
+          ? "Intervals.icu unreachable"
+          : `Last sync failed: ${status.lastError}`
+      }`
     : describeLastSynced(status.lastSyncedAt);
   return (
     <section className="card today-card" aria-label="Today's plan">
@@ -1956,7 +1976,7 @@ export function SettingsPage({
   const [rideFilesPath, setRideFilesPath] = useState("Loading ride files location…");
   const [apiKey, setApiKey] = useState("");
   const intervalsConfigured = intervalsStatus.configured;
-  const [intervalsBusy, setIntervalsBusy] = useState<"save" | "clear" | "sync" | "mirrors" | null>(null);
+  const [intervalsBusy, setIntervalsBusy] = useState<"save" | "clear" | "sync" | "mirrors" | "settings" | null>(null);
   const [trainingSyncStatus, setTrainingSyncStatus] = useState<string | null>(null);
   const [mirrorSyncStatus, setMirrorSyncStatus] = useState<string | null>(null);
   const [zoneSyncConfirm, setZoneSyncConfirm] = useState<"power" | "heartRate" | null>(null);
@@ -2006,11 +2026,16 @@ export function SettingsPage({
     setIntervalsBusy(null);
   };
 
-  const setMirrorSetting = (patch: Partial<IntervalsSyncSettings>) =>
-    void perform(
+  // One round trip at a time: the toggles disable while busy, so two quick
+  // clicks cannot send stale settings that undo each other.
+  const setMirrorSetting = async (patch: Partial<IntervalsSyncSettings>) => {
+    setIntervalsBusy("settings");
+    await perform(
       () => onIntervalsSyncSettings({ ...intervalsStatus.settings, ...patch }),
       "save Intervals.icu sync settings",
     );
+    setIntervalsBusy(null);
+  };
 
   // A sync result replaces both drafts, so unsaved edits would be lost: the
   // button waits until they are saved (or discarded) rather than saving them
@@ -2156,7 +2181,7 @@ export function SettingsPage({
               type="checkbox"
               disabled={!intervalsConfigured || intervalsBusy !== null}
               checked={intervalsStatus.settings.calendar}
-              onChange={(event) => setMirrorSetting({ calendar: event.target.checked })}
+              onChange={(event) => void setMirrorSetting({ calendar: event.target.checked })}
             />
             <span>
               Show today's planned workout
@@ -2168,7 +2193,7 @@ export function SettingsPage({
               type="checkbox"
               disabled={!intervalsConfigured || intervalsBusy !== null}
               checked={intervalsStatus.settings.library}
-              onChange={(event) => setMirrorSetting({ library: event.target.checked })}
+              onChange={(event) => void setMirrorSetting({ library: event.target.checked })}
             />
             <span>
               Mirror the workout library

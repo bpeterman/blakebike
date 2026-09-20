@@ -206,7 +206,7 @@ describe("Intervals.icu settings", () => {
     await waitFor(() => expect(onClearIntervalsKey).toHaveBeenCalledOnce());
   });
 
-  it("saves the mirror toggles at once and shows the last sync", () => {
+  it("saves the mirror toggles at once and shows the last sync", async () => {
     const onIntervalsSyncSettings = vi.fn(() => Promise.resolve());
     renderSettings({
       intervalsStatus: {
@@ -219,9 +219,14 @@ describe("Intervals.icu settings", () => {
     expect(screen.getByText(/Synced 2 hours ago\./)).toBeInTheDocument();
     expect(screen.getByText("Last sync failed: Could not reach Intervals.icu")).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("checkbox", { name: /Mirror the workout library/ }));
+    const library = screen.getByRole("checkbox", { name: /Mirror the workout library/ });
+    const calendar = screen.getByRole("checkbox", { name: /Show today's planned workout/ });
+    fireEvent.click(library);
     expect(onIntervalsSyncSettings).toHaveBeenCalledWith({ calendar: true, library: false });
-    fireEvent.click(screen.getByRole("checkbox", { name: /Show today's planned workout/ }));
+    // One round trip at a time: the other toggle waits until this one lands.
+    expect(calendar).toBeDisabled();
+    await waitFor(() => expect(calendar).toBeEnabled());
+    fireEvent.click(calendar);
     expect(onIntervalsSyncSettings).toHaveBeenLastCalledWith({ calendar: false, library: true });
   });
 

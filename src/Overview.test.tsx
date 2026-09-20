@@ -124,6 +124,16 @@ describe("today's plan on the home screen", () => {
     });
     expect(screen.getByText("Nothing planned today")).toBeInTheDocument();
     expect(screen.getByText("Synced 3 hours ago · Intervals.icu unreachable")).toBeInTheDocument();
+    cleanup();
+
+    // Only a network failure is "unreachable"; anything else is quoted.
+    renderOverview({
+      intervalsStatus: { ...connectedStatus, lastError: "Intervals.icu rejected the API key" },
+      plannedToday: [],
+    });
+    expect(
+      screen.getByText("Synced just now · Last sync failed: Intervals.icu rejected the API key"),
+    ).toBeInTheDocument();
   });
 
   it("refreshes the plan from its own button", async () => {

@@ -19,9 +19,7 @@ use crate::{
     fit::ensure_ride_file,
     formats::{export_zwo, import_zwo},
     intervals::{CyclingSettings, FtpSource, IntervalsClient, ZoneBoundaries},
-    intervals_sync::{
-        self, IntervalsStatus, IntervalsSyncReport, MIRRORED_WORKOUT_MESSAGE, resolve_athlete,
-    },
+    intervals_sync::{self, IntervalsStatus, IntervalsSyncReport, resolve_athlete},
     runner::RunnerState,
     storage::{
         IntervalsSyncSettings, PowerSmoothing, RideDisplayPreferences, Storage,
@@ -357,10 +355,7 @@ pub fn set_intervals_sync_settings(
     settings: IntervalsSyncSettings,
 ) -> Result<IntervalsStatus, String> {
     tracing::info!(?settings, "command set_intervals_sync_settings");
-    let mut sync = state.storage.intervals_sync_state()?;
-    sync.settings = settings;
-    state.storage.save_intervals_sync_state(&sync)?;
-    intervals_sync::status(&state.storage)
+    intervals_sync::update_settings(&state.storage, settings)
 }
 
 /// Refresh the calendar cache and the mirrored library, whichever are on.
@@ -796,12 +791,7 @@ pub async fn delete_workout(state: State<'_, AppState>, id: Uuid) -> Result<(), 
     tracing::info!(workout_id = %id, "Deleting workout");
     let storage = Arc::clone(&state.storage);
     blocking(move || {
-        if storage
-            .workout(id)?
-            .is_some_and(|stored| stored.is_mirrored())
-        {
-            return Err(MIRRORED_WORKOUT_MESSAGE.into());
-        }
+        intervals_sync::ensure_editable(&storage, id, None)?;
         storage.delete_workout(id)
     })
     .await
@@ -815,14 +805,7 @@ pub async fn save_workout(
     workout.updated_at = Utc::now();
     let storage = Arc::clone(&state.storage);
     blocking(move || {
-        // Mirrors are refreshed by the Intervals.icu sync, never edited here.
-        if workout.is_mirrored()
-            || storage
-                .workout(workout.id)?
-                .is_some_and(|stored| stored.is_mirrored())
-        {
-            return Err(MIRRORED_WORKOUT_MESSAGE.into());
-        }
+        intervals_sync::ensure_editable(&storage, workout.id, Some(&workout))?;
         if let Err(error) = storage.save_workout(&workout) {
             tracing::error!(
                 workout_id = %workout.id,
@@ -968,15 +951,10 @@ pub async fn start_workout(
     workout_id: Uuid,
 ) -> Result<Uuid, String> {
     tracing::debug!(workout_id = %workout_id, "command start_workout");
-    // Library first, then today's plan from the Intervals.icu calendar cache.
-    let workout = match state.storage.workout(workout_id)? {
-        Some(workout) => workout,
-        None => state
-            .storage
-            .planned_workout(workout_id)?
-            .and_then(|planned| planned.workout)
-            .ok_or_else(|| "Workout not found".to_string())?,
-    };
+    let workout = state
+        .storage
+        .rideable_workout(workout_id)?
+        .ok_or_else(|| "Workout not found".to_string())?;
     let profile = state.storage.profile()?;
     state
         .runner
