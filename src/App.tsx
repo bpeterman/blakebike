@@ -647,6 +647,8 @@ function App() {
             trainingZones={trainingZones}
             displayPreferences={rideDisplayPreferences}
             onBrowseWorkouts={() => setPage("workouts")}
+            onEndRequest={() => setEndRideConfirm(true)}
+            endRideConfirmOpen={endRideConfirm}
             perform={perform}
           />
         )}
@@ -1004,6 +1006,8 @@ export function Ride({
   trainingZones,
   displayPreferences,
   onBrowseWorkouts = () => undefined,
+  onEndRequest = () => undefined,
+  endRideConfirmOpen = false,
   perform,
 }: {
   workouts: Workout[];
@@ -1027,6 +1031,10 @@ export function Ride({
   trainingZones: TrainingZoneSettings;
   displayPreferences: RideDisplayPreferences;
   onBrowseWorkouts?: () => void;
+  /** Brings up the end-ride confirmation modal (Esc shortcut mirrors the sidebar End button). */
+  onEndRequest?: () => void;
+  /** True while the end-ride confirmation is already open, so Esc doesn't fight its own close handler. */
+  endRideConfirmOpen?: boolean;
   perform: (action: () => Promise<unknown>, label?: string) => Promise<void>;
 }) {
   const [targetDraft, setTargetDraft] = useState("100");
@@ -1128,6 +1136,7 @@ export function Ride({
       if (applied !== null) setTargetDraft(String(applied));
     }, "clear target override");
 
+  const canSkip = structured && activeWorkout !== undefined && workoutIntervals.length > 0;
   useEffect(() => {
     if (!active) return;
     const onKeyDown = (event: KeyboardEvent) => {
@@ -1143,6 +1152,24 @@ export function Ride({
         );
         return;
       }
+      if (action.kind === "pause") {
+        event.preventDefault();
+        void perform(() => api.pauseOrResume(), "pause/resume");
+        return;
+      }
+      if (action.kind === "skip") {
+        if (!canSkip) return;
+        event.preventDefault();
+        void perform(() => api.skipInterval(), "skip interval");
+        return;
+      }
+      if (action.kind === "end") {
+        // The confirmation dialog's own Escape handler already closes it; don't reopen it.
+        if (endRideConfirmOpen) return;
+        event.preventDefault();
+        onEndRequest();
+        return;
+      }
       // Targets only move while a ride is actually running and adjustable.
       if (runner.status !== "running" || !adjustable) return;
       if (action.kind === "bias" && !structured) return;
@@ -1155,7 +1182,7 @@ export function Ride({
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [active, adjustable, biasPercent, perform, runner.status, screens.length, structured]);
+  }, [active, adjustable, biasPercent, canSkip, endRideConfirmOpen, onEndRequest, perform, runner.status, screens.length, structured]);
 
   const intervalHistory = useMemo(() => {
     if (!riding || runner.intervalElapsedSeconds >= elapsed) return telemetryHistory;

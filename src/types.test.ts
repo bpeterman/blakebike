@@ -170,6 +170,16 @@ describe("workout helpers", () => {
     expect(rideKeyAction("a", true, false)).toBeNull();
   });
 
+  it("routes Space to pause, S to skip, and Escape to end", () => {
+    expect(rideKeyAction(" ", false, false)).toEqual({ kind: "pause" });
+    expect(rideKeyAction("s", false, false)).toEqual({ kind: "skip" });
+    expect(rideKeyAction("S", false, false)).toEqual({ kind: "skip" });
+    expect(rideKeyAction("Escape", false, false)).toEqual({ kind: "end" });
+    expect(rideKeyAction(" ", false, true)).toBeNull();
+    expect(rideKeyAction("s", false, true)).toBeNull();
+    expect(rideKeyAction("Escape", false, true)).toBeNull();
+  });
+
   it("keeps the bias inside 50–150 %", () => {
     expect(clampBias(100.4)).toBe(100);
     expect(clampBias(10)).toBe(50);
