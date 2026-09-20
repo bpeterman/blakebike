@@ -389,7 +389,15 @@ pub async fn sync_training_settings(
     })?;
     let profile = state.storage.profile()?;
     let zones = state.storage.training_zones()?;
-    let result = apply_cycling_settings(profile, zones, settings)?;
+    // Only the eFTP costs a second request, so only fetch it when it is what
+    // the rider asked for.
+    let preferred = state.storage.intervals_sync_state()?.settings.ftp_source;
+    let estimated = if preferred == FtpSource::EstimatedFtp {
+        client.estimated_ftp(&athlete.id).await?
+    } else {
+        None
+    };
+    let result = apply_cycling_settings(profile, zones, settings, preferred, estimated)?;
     state
         .storage
         .save_training_settings(&result.profile, &result.zones)?;
@@ -408,13 +416,17 @@ pub async fn sync_training_settings(
 /// the rules are testable without a server: FTP and max HR always update,
 /// each zone set only when its toggle is on, and an imported set is marked
 /// `ZoneMode::Intervals` so a hand-edited (`Custom`) set stays recognizable.
+/// `preferred` is the rider's FTP source; `estimated` the modeled eFTP when
+/// it was fetched.
 fn apply_cycling_settings(
     mut profile: Profile,
     mut zones: TrainingZoneSettings,
     settings: CyclingSettings,
+    preferred: FtpSource,
+    estimated: Option<u16>,
 ) -> Result<TrainingSyncResult, String> {
-    let ftp = settings.ftp.ok_or_else(|| {
-        "Intervals.icu cycling settings have no FTP between 50 and 500 W".to_string()
+    let ftp = settings.resolve_ftp(preferred, estimated).ok_or_else(|| {
+        "Intervals.icu has no FTP between 50 and 500 W for this athlete".to_string()
     })?;
     let ftp_outcome = FtpOutcome {
         watts: ftp.watts,
@@ -526,7 +538,16 @@ fn power_zone_boundaries(ftp: u16, percentages: &[u16]) -> Vec<u16> {
 #[cfg(test)]
 mod training_sync_tests {
     use super::*;
-    use crate::intervals::CyclingFtp;
+
+    /// `apply_cycling_settings` with the default FTP preference (indoor) and
+    /// no eFTP fetched, which is what most of these cases are about.
+    fn applied(
+        profile: Profile,
+        zones: TrainingZoneSettings,
+        settings: CyclingSettings,
+    ) -> Result<TrainingSyncResult, String> {
+        apply_cycling_settings(profile, zones, settings, FtpSource::default(), None)
+    }
 
     fn names(list: &[&str]) -> Vec<String> {
         list.iter().map(|name| (*name).to_string()).collect()
@@ -534,10 +555,8 @@ mod training_sync_tests {
 
     fn settings() -> CyclingSettings {
         CyclingSettings {
-            ftp: Some(CyclingFtp {
-                watts: 280,
-                source: FtpSource::IndoorFtp,
-            }),
+            indoor_ftp: Some(280),
+            ftp: Some(305),
             max_heart_rate_bpm: Some(192),
             heart_rate_zones: Ok(ZoneBoundaries {
                 boundaries: vec![120, 145, 166, 182, 192],
@@ -585,8 +604,7 @@ mod training_sync_tests {
             max_heart_rate_bpm: 185,
             ..Profile::default()
         };
-        let result =
-            apply_cycling_settings(profile, TrainingZoneSettings::default(), settings()).unwrap();
+        let result = applied(profile, TrainingZoneSettings::default(), settings()).unwrap();
         assert_eq!(
             result.ftp,
             FtpOutcome {
@@ -610,8 +628,40 @@ mod training_sync_tests {
     }
 
     #[test]
+    fn the_rider_preference_chooses_which_ftp_the_sync_uses() {
+        for (preferred, estimated, expected) in [
+            (FtpSource::IndoorFtp, None, (280, FtpSource::IndoorFtp)),
+            (FtpSource::Ftp, None, (305, FtpSource::Ftp)),
+            (
+                FtpSource::EstimatedFtp,
+                Some(318),
+                (318, FtpSource::EstimatedFtp),
+            ),
+            // No eFTP modeled yet: the sync still lands a value and says so.
+            (FtpSource::EstimatedFtp, None, (280, FtpSource::IndoorFtp)),
+        ] {
+            let result = apply_cycling_settings(
+                Profile::default(),
+                both_on(),
+                settings(),
+                preferred,
+                estimated,
+            )
+            .unwrap();
+            assert_eq!(result.ftp.watts, expected.0);
+            assert_eq!(result.ftp.source, expected.1);
+            assert_eq!(result.profile.ftp_watts, expected.0);
+            // Power zones scale from whichever FTP was used.
+            assert_eq!(
+                result.zones.power_zones[0].upper_bound,
+                Some(expected.0 * 55 / 100)
+            );
+        }
+    }
+
+    #[test]
     fn toggles_on_import_both_sets_scaled_from_the_chosen_ftp() {
-        let result = apply_cycling_settings(Profile::default(), both_on(), settings()).unwrap();
+        let result = applied(Profile::default(), both_on(), settings()).unwrap();
         assert_eq!(result.power_zones, ZoneSetOutcome::Imported);
         assert_eq!(result.heart_rate_zones, ZoneSetOutcome::Imported);
         assert_eq!(result.zones.power_mode, ZoneMode::Intervals);
@@ -640,16 +690,15 @@ mod training_sync_tests {
 
     #[test]
     fn identical_imported_zones_are_unchanged_but_identical_custom_zones_are_imported() {
-        let first = apply_cycling_settings(Profile::default(), both_on(), settings()).unwrap();
-        let again =
-            apply_cycling_settings(first.profile.clone(), first.zones.clone(), settings()).unwrap();
+        let first = applied(Profile::default(), both_on(), settings()).unwrap();
+        let again = applied(first.profile.clone(), first.zones.clone(), settings()).unwrap();
         assert_eq!(again.power_zones, ZoneSetOutcome::Unchanged);
         assert_eq!(again.heart_rate_zones, ZoneSetOutcome::Unchanged);
         assert_eq!(again.ftp.previous_watts, 280);
 
         let mut custom = first.zones.clone();
         custom.power_mode = ZoneMode::Custom;
-        let flipped = apply_cycling_settings(first.profile, custom, settings()).unwrap();
+        let flipped = applied(first.profile, custom, settings()).unwrap();
         assert_eq!(flipped.power_zones, ZoneSetOutcome::Imported);
         assert_eq!(flipped.zones.power_mode, ZoneMode::Intervals);
     }
@@ -659,7 +708,7 @@ mod training_sync_tests {
         let mut fetched = settings();
         fetched.heart_rate_zones = Ok(ZoneBoundaries::default());
         fetched.power_zones = Err("Intervals.icu returned power zones that do not increase".into());
-        let result = apply_cycling_settings(Profile::default(), both_on(), fetched).unwrap();
+        let result = applied(Profile::default(), both_on(), fetched).unwrap();
         assert_eq!(result.heart_rate_zones, ZoneSetOutcome::NotConfigured);
         assert_eq!(
             result.power_zones,
@@ -677,7 +726,7 @@ mod training_sync_tests {
             boundaries: vec![192],
             names: Vec::new(),
         });
-        let result = apply_cycling_settings(Profile::default(), both_on(), lone).unwrap();
+        let result = applied(Profile::default(), both_on(), lone).unwrap();
         assert!(matches!(
             result.heart_rate_zones,
             ZoneSetOutcome::Invalid { .. }
@@ -687,15 +736,12 @@ mod training_sync_tests {
         // Power percentages that collapse to the same watt at a low FTP fail
         // storage's validation; that is this set's outcome, not a command error.
         let mut collapsing = settings();
-        collapsing.ftp = Some(CyclingFtp {
-            watts: 50,
-            source: FtpSource::Ftp,
-        });
+        collapsing.indoor_ftp = Some(50);
         collapsing.power_zones = Ok(ZoneBoundaries {
             boundaries: vec![55, 56, 57, 90],
             names: Vec::new(),
         });
-        let result = apply_cycling_settings(Profile::default(), both_on(), collapsing).unwrap();
+        let result = applied(Profile::default(), both_on(), collapsing).unwrap();
         assert!(matches!(result.power_zones, ZoneSetOutcome::Invalid { .. }));
         assert_eq!(result.heart_rate_zones, ZoneSetOutcome::Imported);
         assert_eq!(result.profile.ftp_watts, 50);
@@ -709,7 +755,7 @@ mod training_sync_tests {
             boundaries: vec![120, 145, 166, 182, 200],
             names: Vec::new(),
         });
-        let result = apply_cycling_settings(Profile::default(), both_on(), fetched).unwrap();
+        let result = applied(Profile::default(), both_on(), fetched).unwrap();
         assert_eq!(
             bounds(&result.zones.heart_rate_zones),
             vec![Some(120), Some(145), Some(166), Some(182), None]
@@ -721,7 +767,7 @@ mod training_sync_tests {
         let mut fetched = settings();
         fetched.heart_rate_zones = Err("bad".into());
         fetched.max_heart_rate_bpm = None;
-        let result = apply_cycling_settings(Profile::default(), both_on(), fetched).unwrap();
+        let result = applied(Profile::default(), both_on(), fetched).unwrap();
         let json = serde_json::to_value(&result).unwrap();
         assert_eq!(json["ftp"]["source"], "indoorFtp");
         assert_eq!(json["ftp"]["previousWatts"], 200);
@@ -737,7 +783,7 @@ mod training_sync_tests {
         assert_eq!(json["zones"]["powerMode"], "intervals");
         assert_eq!(json["zones"]["syncHeartRateZonesFromIntervals"], true);
 
-        let off = apply_cycling_settings(
+        let off = applied(
             Profile::default(),
             TrainingZoneSettings::default(),
             settings(),
@@ -760,7 +806,7 @@ mod training_sync_tests {
             max_heart_rate_bpm: 177,
             ..Profile::default()
         };
-        let result = apply_cycling_settings(profile, both_on(), fetched).unwrap();
+        let result = applied(profile, both_on(), fetched).unwrap();
         assert_eq!(result.max_heart_rate, None);
         assert_eq!(result.profile.max_heart_rate_bpm, 177);
     }
@@ -768,8 +814,9 @@ mod training_sync_tests {
     #[test]
     fn no_usable_ftp_is_an_error_before_anything_changes() {
         let mut fetched = settings();
+        fetched.indoor_ftp = None;
         fetched.ftp = None;
-        let error = apply_cycling_settings(Profile::default(), both_on(), fetched).unwrap_err();
+        let error = applied(Profile::default(), both_on(), fetched).unwrap_err();
         assert!(error.contains("no FTP"));
     }
 }

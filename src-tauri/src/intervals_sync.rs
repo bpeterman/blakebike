@@ -666,6 +666,7 @@ mod tests {
             IntervalsSyncSettings {
                 calendar: true,
                 library: false,
+                ..IntervalsSyncSettings::default()
             },
         )
         .unwrap();
@@ -679,6 +680,7 @@ mod tests {
             IntervalsSyncSettings {
                 calendar: false,
                 library: false,
+                ..IntervalsSyncSettings::default()
             },
         )
         .unwrap();

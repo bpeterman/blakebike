@@ -19,6 +19,10 @@ Conventions:
 
 ## [Unreleased]
 
+### Added
+
+- An FTP source setting on the Intervals.icu card: sync your FTP from your indoor FTP (the default), your FTP, or the eFTP Intervals.icu models from your recent rides. Power zones scale from whichever one you pick, and if Intervals.icu has no number there the sync falls back to one it does have and the status line names it.
+
 ## [0.4.0] - 2026-09-20
 
 Today's Intervals.icu plan on the home screen, a mirrored Intervals.icu workout library, an honest training-settings sync, and ride screens you build from fields.
