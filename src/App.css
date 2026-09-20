@@ -120,7 +120,7 @@ p { color: #8d9587; font-size: 13px; }
 .connection-card h2 { margin: 3px 0 4px; }
 .connection-card p { margin: 0; max-width: 460px; }
 .ftp-card { position: relative; padding: 23px; }
-.ftp-refresh { position: absolute; top: 16px; right: 16px; width: 32px; height: 32px; }
+.ftp-refresh { position: absolute; top: 23px; right: 23px; width: 32px; height: 32px; }
 .spinning { animation: spin .8s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 .big-number { margin: 8px 0 2px; font-size: 42px; font-weight: 760; letter-spacing: -.05em; }
@@ -313,7 +313,8 @@ textarea { min-height: 70px; resize: vertical; }
 .settings-note.warn { color: #f4d35e; }
 
 /* Today's plan from Intervals.icu on the home screen. */
-.today-card { display: grid; gap: 12px; margin-bottom: 18px; }
+.today-card { display: grid; gap: 12px; margin-bottom: 18px; padding: 23px; }
+.today-card > p { margin: 0; }
 .today-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
 .today-head h2 { margin: 4px 0 0; }
 .today-entry { display: grid; gap: 10px; }
