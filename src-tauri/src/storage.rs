@@ -48,12 +48,16 @@ pub struct ZoneDefinition {
     pub upper_bound: Option<u16>,
 }
 
+/// Where a zone set comes from. `Derived` follows FTP / max HR, `Custom` was
+/// edited by hand, `Intervals` was imported from Intervals.icu. Keeping the
+/// last two apart is what lets a sync avoid overwriting hand-tuned zones.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ZoneMode {
     #[default]
     Derived,
     Custom,
+    Intervals,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -61,6 +65,7 @@ pub enum ZoneMode {
 pub struct TrainingZoneSettings {
     pub version: u8,
     pub sync_power_zones_from_intervals: bool,
+    pub sync_heart_rate_zones_from_intervals: bool,
     pub power_mode: ZoneMode,
     pub power_zones: Vec<ZoneDefinition>,
     pub heart_rate_mode: ZoneMode,
@@ -72,6 +77,7 @@ impl Default for TrainingZoneSettings {
         Self {
             version: 1,
             sync_power_zones_from_intervals: false,
+            sync_heart_rate_zones_from_intervals: false,
             power_mode: ZoneMode::Derived,
             power_zones: Vec::new(),
             heart_rate_mode: ZoneMode::Derived,
@@ -1378,12 +1384,26 @@ mod tests {
             storage.training_zones().unwrap(),
             TrainingZoneSettings::default()
         );
+        assert!(!TrainingZoneSettings::default().sync_power_zones_from_intervals);
+        assert!(!TrainingZoneSettings::default().sync_heart_rate_zones_from_intervals);
         assert_eq!(
             storage.ride_display_preferences().unwrap(),
             RideDisplayPreferences::default()
         );
         let zones = TrainingZoneSettings {
             sync_power_zones_from_intervals: true,
+            sync_heart_rate_zones_from_intervals: true,
+            power_mode: ZoneMode::Intervals,
+            power_zones: vec![
+                ZoneDefinition {
+                    name: "Endurance".into(),
+                    upper_bound: Some(200),
+                },
+                ZoneDefinition {
+                    name: "Threshold".into(),
+                    upper_bound: None,
+                },
+            ],
             heart_rate_mode: ZoneMode::Custom,
             heart_rate_zones: vec![
                 ZoneDefinition {
@@ -1399,6 +1419,33 @@ mod tests {
         };
         storage.save_training_zones(&zones).unwrap();
         assert_eq!(storage.training_zones().unwrap(), zones);
+        // Imported zones are validated like custom ones.
+        let bad_import = TrainingZoneSettings {
+            power_mode: ZoneMode::Intervals,
+            power_zones: vec![ZoneDefinition {
+                name: "Only".into(),
+                upper_bound: None,
+            }],
+            ..TrainingZoneSettings::default()
+        };
+        assert!(storage.save_training_zones(&bad_import).is_err());
+        // Settings written before the heart-rate toggle existed load with it off.
+        storage
+            .save_setting(
+                TRAINING_ZONES_KEY,
+                &serde_json::json!({
+                    "version": 1,
+                    "syncPowerZonesFromIntervals": true,
+                    "powerMode": "derived",
+                    "powerZones": [],
+                    "heartRateMode": "derived",
+                    "heartRateZones": []
+                }),
+            )
+            .unwrap();
+        let loaded = storage.training_zones().unwrap();
+        assert!(loaded.sync_power_zones_from_intervals);
+        assert!(!loaded.sync_heart_rate_zones_from_intervals);
         let mut display = RideDisplayPreferences::default();
         display.cards.swap(0, 1);
         display.cards[0].visible = false;

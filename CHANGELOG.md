@@ -19,6 +19,22 @@ Conventions:
 
 ## [Unreleased]
 
+Syncing from Intervals.icu now says exactly what it changes, imports heart-rate zones only when you ask, and never overwrites zones you edited by hand without warning.
+
+### Changed
+
+- The Intervals.icu sync pulls your FTP and maximum heart rate from your cycling sport settings, preferring the indoor FTP when you have set one, and no longer uses the modeled eFTP. Power zones scale from that same number, so the FTP you see and the FTP behind your zones always agree, and the status line names which one was used.
+- Heart-rate zones now have their own "Import from Intervals.icu" toggle, next to the power zones toggle in each zone editor. Both are off by default and both are saved with your zone settings.
+- After a sync the Settings card reports each item: the new FTP and max heart rate with their previous values, and for each zone set whether it was imported, already up to date, left alone because import is off, not configured on Intervals.icu, or unusable and why.
+- Zones imported from Intervals.icu are labelled "From Intervals.icu" in the editor instead of "Custom", and can be reset to derived zones like any other set.
+- "Refresh training settings" is now "Sync from Intervals.icu", on the Settings card and on the home screen's FTP card.
+
+### Fixed
+
+- Heart-rate zones were imported on every refresh whether or not you wanted them, replacing hand-edited zones without warning. They are now imported only when their toggle is on, and turning the toggle on over custom zones asks first.
+- Pressing Refresh silently saved whatever you had half-typed in the zone editors. The sync button now waits until unsaved profile or zone edits are saved, and says so.
+- A failed zone request used to be reported as "Intervals.icu did not return usable training zones" while the FTP was written anyway. The sync is now a single request: if it fails nothing changes and the error says why; if it succeeds, missing zones are reported as not configured rather than as a failure.
+
 ## [0.3.0] - 2026-09-19
 
 A "Stats for nerds" card for diagnosing your connected devices, and zeroing power meters and trainer spin-downs right from the app.

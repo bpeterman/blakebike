@@ -12,7 +12,11 @@ import {
   formatSpeed,
   derivedHeartRateZones,
   derivedPowerZones,
+  defaultTrainingZoneSettings,
+  describeTrainingSync,
   downsampleTelemetry,
+  effectiveHeartRateZones,
+  effectivePowerZones,
   manualPowerDeltaForKey,
   rideKeyAction,
   clampBias,
@@ -21,6 +25,8 @@ import {
   withActiveElapsed,
   zoneIndex,
   workoutDuration,
+  zoneModeLabel,
+  type TrainingSyncResult,
   type WorkoutStep,
 } from "./types";
 
@@ -293,5 +299,60 @@ describe("ride display preferences", () => {
     expect(chosen.cards[0]).toEqual({ id: "deviceStats", visible: true });
     expect(chosen.cards).toHaveLength(rideCardIds.length);
     expect(chosen.cards.filter((card) => card.id === "deviceStats")).toHaveLength(1);
+  });
+});
+
+describe("zone provenance and sync reporting", () => {
+  const imported = {
+    ...defaultTrainingZoneSettings,
+    powerMode: "intervals" as const,
+    powerZones: derivedPowerZones(300),
+    heartRateMode: "intervals" as const,
+    heartRateZones: derivedHeartRateZones(200),
+  };
+
+  it("treats imported zones like custom ones when picking the effective set", () => {
+    expect(effectivePowerZones(imported, 200)).toEqual(derivedPowerZones(300));
+    expect(effectiveHeartRateZones(imported, 180)).toEqual(derivedHeartRateZones(200));
+    expect(effectivePowerZones(defaultTrainingZoneSettings, 200)).toEqual(derivedPowerZones(200));
+    expect(zoneModeLabel.intervals).toBe("From Intervals.icu");
+  });
+
+  it("describes every item of a training-settings sync", () => {
+    const base: TrainingSyncResult = {
+      profile: {
+        id: "p",
+        name: "Blake",
+        ftpWatts: 265,
+        maxPowerWatts: 1000,
+        maxHeartRateBpm: 190,
+        riderWeightKg: 75,
+        bikeWeightKg: 9,
+        weightUnit: "kg",
+        distanceUnit: "km",
+      },
+      zones: imported,
+      ftp: { watts: 265, previousWatts: 250, source: "indoorFtp" },
+      maxHeartRate: { bpm: 190, previousBpm: 190 },
+      powerZones: { status: "imported" },
+      heartRateZones: { status: "unchanged" },
+    };
+    expect(describeTrainingSync(base)).toBe(
+      "FTP 265 W from your Intervals.icu indoor FTP (was 250 W) · Max HR 190 bpm (unchanged) · Power zones imported · Heart-rate zones already up to date",
+    );
+    expect(
+      describeTrainingSync({
+        ...base,
+        ftp: { watts: 250, previousWatts: 250, source: "ftp" },
+        maxHeartRate: null,
+        powerZones: { status: "invalid", reason: "Intervals.icu returned power zones that do not increase" },
+        heartRateZones: { status: "notConfigured" },
+      }),
+    ).toBe(
+      "FTP 250 W from your Intervals.icu FTP (unchanged) · Intervals.icu has no max HR; yours is unchanged · Power zones not imported: Intervals.icu returned power zones that do not increase · Intervals.icu has no heart-rate zones",
+    );
+    expect(describeTrainingSync({ ...base, powerZones: { status: "syncOff" } })).toContain(
+      "Power zones not imported (import is off)",
+    );
   });
 });

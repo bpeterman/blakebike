@@ -1,4 +1,5 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import type { ComponentProps } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("./api", () => ({
@@ -10,7 +11,7 @@ vi.mock("./api", () => ({
     intervalsApiKeyConfigured: vi.fn(() => Promise.resolve(false)),
     saveIntervalsApiKey: vi.fn(() => Promise.resolve()),
     clearIntervalsApiKey: vi.fn(() => Promise.resolve()),
-    refreshEstimatedFtp: vi.fn(),
+    syncTrainingSettings: vi.fn(),
     saveTrainingZones: vi.fn(() => Promise.resolve()),
     revealRideFiles: vi.fn(() => Promise.resolve()),
     revealLogFile: vi.fn(() => Promise.resolve()),
@@ -23,7 +24,10 @@ import { latestRelease } from "./releaseNotes";
 import {
   defaultRideDisplayPreferences,
   defaultTrainingZoneSettings,
+  derivedPowerZones,
   type Profile,
+  type TrainingSyncResult,
+  type TrainingZoneSettings,
 } from "./types";
 
 const profile: Profile = {
@@ -42,30 +46,42 @@ const perform = async (action: () => Promise<unknown>) => {
   await action();
 };
 
+const renderSettings = (
+  overrides: Partial<ComponentProps<typeof SettingsPage>> = {},
+) =>
+  render(
+    <SettingsPage
+      profile={profile}
+      trainingZones={defaultTrainingZoneSettings}
+      rideDisplayPreferences={defaultRideDisplayPreferences}
+      perform={perform}
+      onProfileUpdate={vi.fn()}
+      onTrainingZonesUpdate={vi.fn()}
+      onSave={vi.fn()}
+      onSaveTrainingZones={vi.fn()}
+      onSaveRideDisplayPreferences={vi.fn()}
+      devMode={false}
+      onDevMode={vi.fn()}
+      onForgetDevices={() => Promise.resolve()}
+      {...overrides}
+    />,
+  );
+
+const powerToggle = () =>
+  screen.getByRole("checkbox", { name: /Import power zones from Intervals\.icu/ });
+const heartRateToggle = () =>
+  screen.getByRole("checkbox", { name: /Import heart rate zones from Intervals\.icu/ });
+const syncButton = () => screen.getByRole("button", { name: "Sync from Intervals.icu" });
+
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
 });
 
-describe("Intervals.icu settings", () => {
-  it("switches edited zones to custom and can reset them", async () => {
+describe("training zone settings", () => {
+  it("switches edited zones to custom and can reset them", () => {
     const onSaveTrainingZones = vi.fn();
-    render(
-      <SettingsPage
-        profile={profile}
-        trainingZones={defaultTrainingZoneSettings}
-        rideDisplayPreferences={defaultRideDisplayPreferences}
-        perform={perform}
-        onProfileUpdate={vi.fn()}
-        onTrainingZonesUpdate={vi.fn()}
-        onSave={vi.fn()}
-        onSaveTrainingZones={onSaveTrainingZones}
-        onSaveRideDisplayPreferences={vi.fn()}
-        devMode={false}
-        onDevMode={vi.fn()}
-        onForgetDevices={() => Promise.resolve()}
-      />,
-    );
+    renderSettings({ onSaveTrainingZones });
     fireEvent.change(screen.getByLabelText("Power zone 1 upper bound"), {
       target: { value: "125" },
     });
@@ -83,35 +99,82 @@ describe("Intervals.icu settings", () => {
     expect(onSaveTrainingZones).toHaveBeenLastCalledWith(
       expect.objectContaining({ powerMode: "derived", powerZones: [] }),
     );
+  });
 
-    fireEvent.click(
-      screen.getByRole("checkbox", {
-        name: /Import power zones from Intervals\.icu/,
-      }),
-    );
+  it("has one independent import toggle per zone set, saved with the zone settings", () => {
+    const onSaveTrainingZones = vi.fn();
+    renderSettings({ onSaveTrainingZones });
+    expect(powerToggle()).not.toBeChecked();
+    expect(heartRateToggle()).not.toBeChecked();
+
+    fireEvent.click(heartRateToggle());
+    expect(heartRateToggle()).toBeChecked();
+    expect(powerToggle()).not.toBeChecked();
     fireEvent.click(screen.getByRole("button", { name: "Save zone settings" }));
     expect(onSaveTrainingZones).toHaveBeenLastCalledWith(
-      expect.objectContaining({ syncPowerZonesFromIntervals: true }),
+      expect.objectContaining({
+        syncPowerZonesFromIntervals: false,
+        syncHeartRateZonesFromIntervals: true,
+      }),
+    );
+
+    fireEvent.click(powerToggle());
+    fireEvent.click(screen.getByRole("button", { name: "Save zone settings" }));
+    expect(onSaveTrainingZones).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        syncPowerZonesFromIntervals: true,
+        syncHeartRateZonesFromIntervals: true,
+      }),
     );
   });
 
-  it("saves and clears the API key without reading it back", async () => {
-    render(
-      <SettingsPage
-        profile={profile}
-        trainingZones={defaultTrainingZoneSettings}
-        rideDisplayPreferences={defaultRideDisplayPreferences}
-        perform={perform}
-        onProfileUpdate={vi.fn()}
-        onTrainingZonesUpdate={vi.fn()}
-        onSave={vi.fn()}
-        onSaveTrainingZones={vi.fn()}
-        onSaveRideDisplayPreferences={vi.fn()}
-        devMode={false}
-        onDevMode={vi.fn()}
-        onForgetDevices={() => Promise.resolve()}
-      />,
+  it("asks before turning import on over custom zones and keeps them on cancel", () => {
+    renderSettings();
+    fireEvent.change(screen.getByLabelText("Heart rate zone 1 upper bound"), {
+      target: { value: "121" },
+    });
+    fireEvent.click(heartRateToggle());
+    expect(
+      screen.getByRole("alertdialog", { name: "Replace your custom heart-rate zones?" }),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Keep it" }));
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    expect(heartRateToggle()).not.toBeChecked();
+
+    fireEvent.click(heartRateToggle());
+    fireEvent.click(screen.getByRole("button", { name: "Replace on sync" }));
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    expect(heartRateToggle()).toBeChecked();
+    expect(
+      screen.getByText(/the next sync replaces the boundaries you edited by hand/),
+    ).toBeInTheDocument();
+    // Derived zones have nothing to lose, so the power toggle flips without asking.
+    fireEvent.click(powerToggle());
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    expect(powerToggle()).toBeChecked();
+  });
+
+  it("labels imported zones and lets them go back to derived", () => {
+    const onSaveTrainingZones = vi.fn();
+    const imported: TrainingZoneSettings = {
+      ...defaultTrainingZoneSettings,
+      syncPowerZonesFromIntervals: true,
+      powerMode: "intervals",
+      powerZones: derivedPowerZones(250),
+    };
+    renderSettings({ trainingZones: imported, onSaveTrainingZones });
+    expect(screen.getByText("From Intervals.icu")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Reset defaults" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save zone settings" }));
+    expect(onSaveTrainingZones).toHaveBeenLastCalledWith(
+      expect.objectContaining({ powerMode: "derived", powerZones: [] }),
     );
+  });
+});
+
+describe("Intervals.icu settings", () => {
+  it("saves and clears the API key without reading it back", async () => {
+    renderSettings();
 
     await screen.findByText("API key not configured");
     fireEvent.change(screen.getByLabelText("API key"), {
@@ -126,87 +189,78 @@ describe("Intervals.icu settings", () => {
     fireEvent.click(screen.getByRole("button", { name: "Clear key" }));
     await screen.findByText("API key not configured");
     expect(api.clearIntervalsApiKey).toHaveBeenCalledOnce();
-    expect(
-      screen.getByRole("button", { name: "Refresh training settings" }),
-    ).toBeDisabled();
+    expect(syncButton()).toBeDisabled();
   });
 
-  it("shows refresh progress and publishes the updated profile", async () => {
+  it("syncs without saving drafts and reports every item", async () => {
     vi.mocked(api.intervalsApiKeyConfigured).mockResolvedValue(true);
-    let resolveRefresh!: (result: {
-      profile: Profile;
-      zones: typeof defaultTrainingZoneSettings;
-      powerZonesImported: boolean;
-      heartRateZonesImported: boolean;
-    }) => void;
-    vi.mocked(api.refreshEstimatedFtp).mockReturnValue(
+    let resolveSync!: (result: TrainingSyncResult) => void;
+    vi.mocked(api.syncTrainingSettings).mockReturnValue(
       new Promise((resolve) => {
-        resolveRefresh = resolve;
+        resolveSync = resolve;
       }),
     );
     const onProfileUpdate = vi.fn();
+    const onTrainingZonesUpdate = vi.fn();
+    renderSettings({ onProfileUpdate, onTrainingZonesUpdate });
 
-    render(
-      <SettingsPage
-        profile={profile}
-        trainingZones={defaultTrainingZoneSettings}
-        rideDisplayPreferences={defaultRideDisplayPreferences}
-        perform={perform}
-        onProfileUpdate={onProfileUpdate}
-        onTrainingZonesUpdate={vi.fn()}
-        onSave={vi.fn()}
-        onSaveTrainingZones={vi.fn()}
-        onSaveRideDisplayPreferences={vi.fn()}
-        devMode={false}
-        onDevMode={vi.fn()}
-        onForgetDevices={() => Promise.resolve()}
-      />,
-    );
+    const sync = await screen.findByRole("button", { name: "Sync from Intervals.icu" });
+    await waitFor(() => expect(sync).toBeEnabled());
+    fireEvent.click(sync);
+    expect(screen.getByRole("button", { name: "Syncing…" })).toBeDisabled();
 
-    const refresh = await screen.findByRole("button", {
-      name: "Refresh training settings",
-    });
-    await waitFor(() => expect(refresh).toBeEnabled());
-    fireEvent.click(refresh);
-    expect(
-      screen.getByRole("button", { name: "Refreshing…" }),
-    ).toBeDisabled();
-
-    const updated = { ...profile, ftpWatts: 267 };
-    resolveRefresh({
+    const updated = { ...profile, ftpWatts: 267, maxHeartRateBpm: 192 };
+    const zones: TrainingZoneSettings = {
+      ...defaultTrainingZoneSettings,
+      syncPowerZonesFromIntervals: true,
+      powerMode: "intervals",
+      powerZones: derivedPowerZones(267),
+    };
+    resolveSync({
       profile: updated,
-      zones: defaultTrainingZoneSettings,
-      powerZonesImported: true,
-      heartRateZonesImported: true,
+      zones,
+      ftp: { watts: 267, previousWatts: 220, source: "indoorFtp" },
+      maxHeartRate: { bpm: 192, previousBpm: 190 },
+      powerZones: { status: "imported" },
+      heartRateZones: { status: "syncOff" },
     });
     await waitFor(() => expect(onProfileUpdate).toHaveBeenCalledWith(updated));
-    expect(api.saveTrainingZones).toHaveBeenCalledWith(defaultTrainingZoneSettings);
+    expect(onTrainingZonesUpdate).toHaveBeenCalledWith(zones);
+    expect(api.saveTrainingZones).not.toHaveBeenCalled();
     expect(
-      screen.getByText("FTP, heart-rate zones, and power zones updated."),
+      screen.getByText(
+        "FTP 267 W from your Intervals.icu indoor FTP (was 220 W) · Max HR 192 bpm (was 190 bpm) · Power zones imported · Heart-rate zones not imported (import is off)",
+      ),
     ).toBeInTheDocument();
+    expect(syncButton()).toBeEnabled();
+  });
+
+  it("waits for unsaved profile or zone edits instead of saving them itself", async () => {
+    vi.mocked(api.intervalsApiKeyConfigured).mockResolvedValue(true);
+    renderSettings();
+    const sync = await screen.findByRole("button", { name: "Sync from Intervals.icu" });
+    await waitFor(() => expect(sync).toBeEnabled());
+
+    fireEvent.change(screen.getByLabelText("Power zone 1 upper bound"), {
+      target: { value: "125" },
+    });
+    expect(sync).toBeDisabled();
+    expect(screen.getByText("Save your zone settings first.")).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText("Rider name"), { target: { value: "B" } });
     expect(
-      screen.getByRole("button", { name: "Refresh training settings" }),
-    ).toBeEnabled();
+      screen.getByText("Save your rider profile and zone settings first."),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getAllByRole("button", { name: "Reset defaults" })[0]);
+    expect(screen.getByText("Save your rider profile first.")).toBeInTheDocument();
+    expect(api.syncTrainingSettings).not.toHaveBeenCalled();
+    expect(api.saveTrainingZones).not.toHaveBeenCalled();
   });
 
   it("toggles developer mode", () => {
     const onDevMode = vi.fn();
-    render(
-      <SettingsPage
-        profile={profile}
-        trainingZones={defaultTrainingZoneSettings}
-        rideDisplayPreferences={defaultRideDisplayPreferences}
-        perform={perform}
-        onProfileUpdate={vi.fn()}
-        onTrainingZonesUpdate={vi.fn()}
-        onSave={vi.fn()}
-        onSaveTrainingZones={vi.fn()}
-        onSaveRideDisplayPreferences={vi.fn()}
-        devMode={false}
-        onDevMode={onDevMode}
-        onForgetDevices={() => Promise.resolve()}
-      />,
-    );
+    renderSettings({ onDevMode });
 
     const toggle = screen.getByRole("checkbox", {
       name: /Offer simulated devices/,
@@ -218,22 +272,7 @@ describe("Intervals.icu settings", () => {
 
   it("drafts, reorders, resets, and saves the ride layout", () => {
     const onSaveRideDisplayPreferences = vi.fn();
-    render(
-      <SettingsPage
-        profile={profile}
-        trainingZones={defaultTrainingZoneSettings}
-        rideDisplayPreferences={defaultRideDisplayPreferences}
-        perform={perform}
-        onProfileUpdate={vi.fn()}
-        onTrainingZonesUpdate={vi.fn()}
-        onSave={vi.fn()}
-        onSaveTrainingZones={vi.fn()}
-        onSaveRideDisplayPreferences={onSaveRideDisplayPreferences}
-        devMode={false}
-        onDevMode={vi.fn()}
-        onForgetDevices={() => Promise.resolve()}
-      />,
-    );
+    renderSettings({ onSaveRideDisplayPreferences });
 
     // Stats for nerds is in the list but off until the rider asks for it.
     const nerdStats = screen.getByRole("checkbox", { name: "Stats for nerds" });
@@ -266,24 +305,6 @@ describe("Intervals.icu settings", () => {
 });
 
 describe("about card", () => {
-  const renderSettings = () =>
-    render(
-      <SettingsPage
-        profile={profile}
-        trainingZones={defaultTrainingZoneSettings}
-        rideDisplayPreferences={defaultRideDisplayPreferences}
-        devMode={false}
-        onDevMode={vi.fn()}
-        perform={perform}
-        onProfileUpdate={vi.fn()}
-        onTrainingZonesUpdate={vi.fn()}
-        onSave={vi.fn()}
-        onSaveTrainingZones={vi.fn()}
-        onSaveRideDisplayPreferences={vi.fn()}
-        onForgetDevices={() => Promise.resolve()}
-      />,
-    );
-
   it("shows the running version with only the latest summary, not every note", async () => {
     renderSettings();
 

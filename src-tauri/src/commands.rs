@@ -18,9 +18,12 @@ use crate::{
     domain::{Profile, SessionDetail, SessionSummary, Workout},
     fit::ensure_ride_file,
     formats::{export_zwo, import_zwo},
-    intervals::{fetch_cycling_training_zones, fetch_estimated_ftp},
+    intervals::{CyclingSettings, FtpSource, IntervalsClient, ZoneBoundaries},
     runner::RunnerState,
-    storage::{PowerSmoothing, RideDisplayPreferences, Storage, TrainingZoneSettings},
+    storage::{
+        PowerSmoothing, RideDisplayPreferences, Storage, TrainingZoneSettings, ZoneDefinition,
+        ZoneMode,
+    },
 };
 
 /// Run storage or file work on the blocking pool. Non-async commands run on
@@ -34,13 +37,48 @@ async fn blocking<T: Send + 'static>(
         .map_err(|error| format!("Background work failed: {error}"))?
 }
 
-#[derive(serde::Serialize)]
+/// What one "Sync from Intervals.icu" did, item by item, so the UI can say
+/// exactly which numbers moved and which zone sets were left alone and why.
+#[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TrainingSyncResult {
-    profile: Profile,
-    zones: TrainingZoneSettings,
-    power_zones_imported: bool,
-    heart_rate_zones_imported: bool,
+    pub profile: Profile,
+    pub zones: TrainingZoneSettings,
+    pub ftp: FtpOutcome,
+    /// `None` when Intervals.icu has no max HR; the local value is kept.
+    pub max_heart_rate: Option<MaxHeartRateOutcome>,
+    pub power_zones: ZoneSetOutcome,
+    pub heart_rate_zones: ZoneSetOutcome,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FtpOutcome {
+    pub watts: u16,
+    pub previous_watts: u16,
+    pub source: FtpSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MaxHeartRateOutcome {
+    pub bpm: u16,
+    pub previous_bpm: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "status", rename_all = "camelCase")]
+pub enum ZoneSetOutcome {
+    /// The set was replaced with the Intervals.icu zones.
+    Imported,
+    /// The set already held exactly these Intervals.icu zones.
+    Unchanged,
+    /// The rider has not turned import on for this set.
+    SyncOff,
+    /// Intervals.icu has no zones configured for this set.
+    NotConfigured,
+    /// Intervals.icu has zones, but they are unusable.
+    Invalid { reason: String },
 }
 
 #[derive(serde::Serialize)]
@@ -296,78 +334,131 @@ pub fn clear_intervals_api_key(state: State<'_, AppState>) -> Result<(), String>
     state.storage.clear_intervals_api_key()
 }
 
+/// Pull FTP, max HR and (when the rider has asked for them) the power and
+/// heart-rate zones from the athlete's Intervals.icu cycling settings. One
+/// request; if it fails nothing is written.
 #[tauri::command]
-pub async fn refresh_estimated_ftp(
+pub async fn sync_training_settings(
     state: State<'_, AppState>,
 ) -> Result<TrainingSyncResult, String> {
     let api_key = state
         .storage
         .intervals_api_key()?
-        .ok_or_else(|| "Save an Intervals.icu API key before refreshing FTP".to_string())?;
-    let ftp = fetch_estimated_ftp(&api_key).await?;
-    let mut profile = state.storage.profile()?;
-    profile.ftp_watts = ftp;
-    let mut zones = state.storage.training_zones()?;
-    let mut power_zones_imported = false;
-    let mut heart_rate_zones_imported = false;
-    let mut power_zone_ftp = None;
-    match fetch_cycling_training_zones(&api_key).await {
-        Ok(Some(imported)) => {
-            if let Some(max_hr) = imported.max_heart_rate_bpm {
-                profile.max_heart_rate_bpm = max_hr;
-            }
-            if !imported.heart_rate_boundaries.is_empty() {
-                let mut boundaries = imported.heart_rate_boundaries;
-                if boundaries
-                    .last()
-                    .is_some_and(|bound| *bound >= profile.max_heart_rate_bpm)
-                {
-                    boundaries.pop();
-                }
-                zones.heart_rate_mode = crate::storage::ZoneMode::Custom;
-                zones.heart_rate_zones = zone_definitions(&boundaries, &imported.heart_rate_names);
-                heart_rate_zones_imported = true;
-            }
-            if zones.sync_power_zones_from_intervals
-                && !imported.power_percent_boundaries.is_empty()
-            {
-                let zone_ftp = imported.cycling_ftp_watts.unwrap_or(ftp);
-                let boundaries =
-                    power_zone_boundaries(zone_ftp, &imported.power_percent_boundaries);
-                zones.power_mode = crate::storage::ZoneMode::Custom;
-                zones.power_zones = zone_definitions(&boundaries, &imported.power_names);
-                power_zones_imported = true;
-                power_zone_ftp = Some(zone_ftp);
-            }
-            state.storage.save_training_zones(&zones)?;
-        }
-        Ok(None) => {
-            tracing::warn!("Intervals.icu has no cycling sport settings; keeping derived HR zones");
-        }
-        Err(error) => {
-            tracing::warn!(%error, "Could not import Intervals.icu training zones; keeping current zones");
-        }
-    }
-    state.storage.save_profile(&profile)?;
+        .ok_or_else(|| "Save an Intervals.icu API key before syncing".to_string())?;
+    let client = IntervalsClient::new(&api_key)?;
+    let settings = client.cycling_settings("0").await?.ok_or_else(|| {
+        "Intervals.icu has no cycling (Ride) settings for this athlete".to_string()
+    })?;
+    let profile = state.storage.profile()?;
+    let zones = state.storage.training_zones()?;
+    let result = apply_cycling_settings(profile, zones, settings)?;
+    state.storage.save_training_zones(&result.zones)?;
+    state.storage.save_profile(&result.profile)?;
     tracing::info!(
-        ftp,
-        max_hr = profile.max_heart_rate_bpm,
-        power_zone_ftp,
-        power_zones_imported,
-        heart_rate_zones_imported,
-        "Updated training settings from Intervals.icu"
+        ftp = result.ftp.watts,
+        ftp_source = ?result.ftp.source,
+        max_hr = result.profile.max_heart_rate_bpm,
+        power_zones = ?result.power_zones,
+        heart_rate_zones = ?result.heart_rate_zones,
+        "Synced training settings from Intervals.icu"
+    );
+    Ok(result)
+}
+
+/// Fold fetched cycling settings into the rider's profile and zones. Pure, so
+/// the rules are testable without a server: FTP and max HR always update,
+/// each zone set only when its toggle is on, and an imported set is marked
+/// `ZoneMode::Intervals` so a hand-edited (`Custom`) set stays recognizable.
+fn apply_cycling_settings(
+    mut profile: Profile,
+    mut zones: TrainingZoneSettings,
+    settings: CyclingSettings,
+) -> Result<TrainingSyncResult, String> {
+    let ftp = settings.ftp.ok_or_else(|| {
+        "Intervals.icu cycling settings have no FTP between 50 and 500 W".to_string()
+    })?;
+    let ftp_outcome = FtpOutcome {
+        watts: ftp.watts,
+        previous_watts: profile.ftp_watts,
+        source: ftp.source,
+    };
+    profile.ftp_watts = ftp.watts;
+    let max_heart_rate = settings.max_heart_rate_bpm.map(|bpm| {
+        let previous_bpm = profile.max_heart_rate_bpm;
+        profile.max_heart_rate_bpm = bpm;
+        MaxHeartRateOutcome { bpm, previous_bpm }
+    });
+    let max_hr = profile.max_heart_rate_bpm;
+    let heart_rate_zones = import_zone_set(
+        zones.sync_heart_rate_zones_from_intervals,
+        settings.heart_rate_zones,
+        |set| {
+            // Intervals.icu closes the top HR zone at max HR; ours is open-ended.
+            let mut boundaries = set.boundaries;
+            if boundaries.last().is_some_and(|bound| *bound >= max_hr) {
+                boundaries.pop();
+            }
+            zone_definitions(&boundaries, &set.names)
+        },
+        &mut zones.heart_rate_mode,
+        &mut zones.heart_rate_zones,
+    );
+    let power_zones = import_zone_set(
+        zones.sync_power_zones_from_intervals,
+        settings.power_zones,
+        |set| {
+            zone_definitions(
+                &power_zone_boundaries(ftp.watts, &set.boundaries),
+                &set.names,
+            )
+        },
+        &mut zones.power_mode,
+        &mut zones.power_zones,
     );
     Ok(TrainingSyncResult {
         profile,
         zones,
-        power_zones_imported,
-        heart_rate_zones_imported,
+        ftp: ftp_outcome,
+        max_heart_rate,
+        power_zones,
+        heart_rate_zones,
     })
 }
 
-fn zone_definitions(boundaries: &[u16], names: &[String]) -> Vec<crate::storage::ZoneDefinition> {
+fn import_zone_set(
+    enabled: bool,
+    fetched: Result<ZoneBoundaries, String>,
+    definitions: impl FnOnce(ZoneBoundaries) -> Vec<ZoneDefinition>,
+    mode: &mut ZoneMode,
+    current: &mut Vec<ZoneDefinition>,
+) -> ZoneSetOutcome {
+    if !enabled {
+        return ZoneSetOutcome::SyncOff;
+    }
+    let set = match fetched {
+        Ok(set) => set,
+        Err(reason) => return ZoneSetOutcome::Invalid { reason },
+    };
+    if set.boundaries.is_empty() {
+        return ZoneSetOutcome::NotConfigured;
+    }
+    let imported = definitions(set);
+    if imported.len() < 2 {
+        return ZoneSetOutcome::Invalid {
+            reason: "Intervals.icu zones leave fewer than two zones".into(),
+        };
+    }
+    if *mode == ZoneMode::Intervals && *current == imported {
+        return ZoneSetOutcome::Unchanged;
+    }
+    *mode = ZoneMode::Intervals;
+    *current = imported;
+    ZoneSetOutcome::Imported
+}
+
+fn zone_definitions(boundaries: &[u16], names: &[String]) -> Vec<ZoneDefinition> {
     (0..=boundaries.len())
-        .map(|index| crate::storage::ZoneDefinition {
+        .map(|index| ZoneDefinition {
             name: names
                 .get(index)
                 .filter(|name| !name.trim().is_empty())
@@ -389,7 +480,50 @@ fn power_zone_boundaries(ftp: u16, percentages: &[u16]) -> Vec<u16> {
 
 #[cfg(test)]
 mod training_sync_tests {
-    use super::power_zone_boundaries;
+    use super::*;
+    use crate::intervals::CyclingFtp;
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|name| (*name).to_string()).collect()
+    }
+
+    fn settings() -> CyclingSettings {
+        CyclingSettings {
+            ftp: Some(CyclingFtp {
+                watts: 280,
+                source: FtpSource::IndoorFtp,
+            }),
+            max_heart_rate_bpm: Some(192),
+            heart_rate_zones: Ok(ZoneBoundaries {
+                boundaries: vec![120, 145, 166, 182, 192],
+                names: names(&["Recovery", "Endurance", "Tempo", "Threshold", "Max"]),
+            }),
+            power_zones: Ok(ZoneBoundaries {
+                boundaries: vec![55, 75, 90, 105, 120, 150],
+                names: names(&[
+                    "Recovery",
+                    "Endurance",
+                    "Tempo",
+                    "Threshold",
+                    "VO2",
+                    "Anaerobic",
+                    "Neuro",
+                ]),
+            }),
+        }
+    }
+
+    fn both_on() -> TrainingZoneSettings {
+        TrainingZoneSettings {
+            sync_power_zones_from_intervals: true,
+            sync_heart_rate_zones_from_intervals: true,
+            ..TrainingZoneSettings::default()
+        }
+    }
+
+    fn bounds(zones: &[ZoneDefinition]) -> Vec<Option<u16>> {
+        zones.iter().map(|zone| zone.upper_bound).collect()
+    }
 
     #[test]
     fn converts_intervals_power_zones_with_cycling_profile_ftp() {
@@ -397,6 +531,135 @@ mod training_sync_tests {
             power_zone_boundaries(280, &[55, 75, 90, 105, 120, 150]),
             vec![154, 210, 252, 294, 336, 420]
         );
+    }
+
+    #[test]
+    fn toggles_off_update_anchors_and_leave_zones_alone() {
+        let profile = Profile {
+            ftp_watts: 250,
+            max_heart_rate_bpm: 185,
+            ..Profile::default()
+        };
+        let result =
+            apply_cycling_settings(profile, TrainingZoneSettings::default(), settings()).unwrap();
+        assert_eq!(
+            result.ftp,
+            FtpOutcome {
+                watts: 280,
+                previous_watts: 250,
+                source: FtpSource::IndoorFtp
+            }
+        );
+        assert_eq!(result.profile.ftp_watts, 280);
+        assert_eq!(
+            result.max_heart_rate,
+            Some(MaxHeartRateOutcome {
+                bpm: 192,
+                previous_bpm: 185
+            })
+        );
+        assert_eq!(result.profile.max_heart_rate_bpm, 192);
+        assert_eq!(result.power_zones, ZoneSetOutcome::SyncOff);
+        assert_eq!(result.heart_rate_zones, ZoneSetOutcome::SyncOff);
+        assert_eq!(result.zones, TrainingZoneSettings::default());
+    }
+
+    #[test]
+    fn toggles_on_import_both_sets_scaled_from_the_chosen_ftp() {
+        let result = apply_cycling_settings(Profile::default(), both_on(), settings()).unwrap();
+        assert_eq!(result.power_zones, ZoneSetOutcome::Imported);
+        assert_eq!(result.heart_rate_zones, ZoneSetOutcome::Imported);
+        assert_eq!(result.zones.power_mode, ZoneMode::Intervals);
+        assert_eq!(result.zones.heart_rate_mode, ZoneMode::Intervals);
+        assert_eq!(
+            bounds(&result.zones.power_zones),
+            vec![
+                Some(154),
+                Some(210),
+                Some(252),
+                Some(294),
+                Some(336),
+                Some(420),
+                None
+            ]
+        );
+        assert_eq!(result.zones.power_zones[6].name, "Neuro");
+        // The 192 bpm top boundary equals max HR and becomes the open-ended zone.
+        assert_eq!(
+            bounds(&result.zones.heart_rate_zones),
+            vec![Some(120), Some(145), Some(166), Some(182), None]
+        );
+        assert_eq!(result.zones.heart_rate_zones[4].name, "Max");
+        result.zones.validate().unwrap();
+    }
+
+    #[test]
+    fn identical_imported_zones_are_unchanged_but_identical_custom_zones_are_imported() {
+        let first = apply_cycling_settings(Profile::default(), both_on(), settings()).unwrap();
+        let again =
+            apply_cycling_settings(first.profile.clone(), first.zones.clone(), settings()).unwrap();
+        assert_eq!(again.power_zones, ZoneSetOutcome::Unchanged);
+        assert_eq!(again.heart_rate_zones, ZoneSetOutcome::Unchanged);
+        assert_eq!(again.ftp.previous_watts, 280);
+
+        let mut custom = first.zones.clone();
+        custom.power_mode = ZoneMode::Custom;
+        let flipped = apply_cycling_settings(first.profile, custom, settings()).unwrap();
+        assert_eq!(flipped.power_zones, ZoneSetOutcome::Imported);
+        assert_eq!(flipped.zones.power_mode, ZoneMode::Intervals);
+    }
+
+    #[test]
+    fn empty_and_invalid_sets_report_without_spoiling_the_rest() {
+        let mut fetched = settings();
+        fetched.heart_rate_zones = Ok(ZoneBoundaries::default());
+        fetched.power_zones = Err("Intervals.icu returned power zones that do not increase".into());
+        let result = apply_cycling_settings(Profile::default(), both_on(), fetched).unwrap();
+        assert_eq!(result.heart_rate_zones, ZoneSetOutcome::NotConfigured);
+        assert_eq!(
+            result.power_zones,
+            ZoneSetOutcome::Invalid {
+                reason: "Intervals.icu returned power zones that do not increase".into()
+            }
+        );
+        assert_eq!(result.profile.ftp_watts, 280);
+        assert_eq!(result.zones.power_mode, ZoneMode::Derived);
+        assert_eq!(result.zones.heart_rate_mode, ZoneMode::Derived);
+
+        // A lone HR boundary at max HR would leave one zone: invalid, not imported.
+        let mut lone = settings();
+        lone.heart_rate_zones = Ok(ZoneBoundaries {
+            boundaries: vec![192],
+            names: Vec::new(),
+        });
+        let result = apply_cycling_settings(Profile::default(), both_on(), lone).unwrap();
+        assert!(matches!(
+            result.heart_rate_zones,
+            ZoneSetOutcome::Invalid { .. }
+        ));
+        assert_eq!(result.power_zones, ZoneSetOutcome::Imported);
+    }
+
+    #[test]
+    fn missing_max_hr_keeps_the_local_value() {
+        let mut fetched = settings();
+        fetched.max_heart_rate_bpm = None;
+        fetched.heart_rate_zones = Ok(ZoneBoundaries::default());
+        let profile = Profile {
+            max_heart_rate_bpm: 177,
+            ..Profile::default()
+        };
+        let result = apply_cycling_settings(profile, both_on(), fetched).unwrap();
+        assert_eq!(result.max_heart_rate, None);
+        assert_eq!(result.profile.max_heart_rate_bpm, 177);
+    }
+
+    #[test]
+    fn no_usable_ftp_is_an_error_before_anything_changes() {
+        let mut fetched = settings();
+        fetched.ftp = None;
+        let error = apply_cycling_settings(Profile::default(), both_on(), fetched).unwrap_err();
+        assert!(error.contains("no FTP"));
     }
 }
 

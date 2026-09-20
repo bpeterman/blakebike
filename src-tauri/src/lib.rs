@@ -193,7 +193,7 @@ pub fn run() {
             commands::intervals_api_key_configured,
             commands::save_intervals_api_key,
             commands::clear_intervals_api_key,
-            commands::refresh_estimated_ftp,
+            commands::sync_training_settings,
             commands::list_workouts,
             commands::get_workout,
             commands::save_workout,

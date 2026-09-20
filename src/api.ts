@@ -23,16 +23,10 @@ import type {
   SessionDetail,
   SessionSummary,
   Telemetry,
+  TrainingSyncResult,
   TrainingZoneSettings,
   Workout,
 } from "./types";
-
-export type TrainingSyncResult = {
-  profile: Profile;
-  zones: TrainingZoneSettings;
-  powerZonesImported: boolean;
-  heartRateZonesImported: boolean;
-};
 
 export type WorkoutExportResult = {
   exportedCount: number;
@@ -78,8 +72,8 @@ export const api = {
     invoke<void>("save_intervals_api_key", { apiKey }),
   clearIntervalsApiKey: () =>
     invoke<void>("clear_intervals_api_key"),
-  refreshEstimatedFtp: () =>
-    invoke<TrainingSyncResult>("refresh_estimated_ftp"),
+  syncTrainingSettings: () =>
+    invoke<TrainingSyncResult>("sync_training_settings"),
   workouts: () => invoke<Workout[]>("list_workouts"),
   workout: (id: string) => invoke<Workout | null>("get_workout", { id }),
   saveWorkout: (workout: Workout) =>
