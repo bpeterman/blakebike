@@ -19,6 +19,8 @@ Conventions:
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-20
+
 Today's Intervals.icu plan on the home screen, a mirrored Intervals.icu workout library, an honest training-settings sync, and ride screens you build from fields.
 
 ### Added
