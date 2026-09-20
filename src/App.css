@@ -313,7 +313,7 @@ textarea { min-height: 70px; resize: vertical; }
 .settings-note.warn { color: #f4d35e; }
 
 /* Today's plan from Intervals.icu on the home screen. */
-.today-card { display: grid; gap: 12px; margin-bottom: 18px; }
+.today-card { display: grid; gap: 12px; margin-bottom: 18px; padding: 23px; }
 .today-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
 .today-head h2 { margin: 4px 0 0; }
 .today-entry { display: grid; gap: 10px; }
