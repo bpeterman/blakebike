@@ -4,8 +4,11 @@ import { Ride } from "./App";
 import { emptySlot } from "./devices";
 import { defaultSourcePreferences } from "./sourcePreferences";
 import {
-  deviceRoles,
   defaultRideDisplayPreferences,
+  type RideDisplayPreferences,
+} from "./rideScreens";
+import {
+  deviceRoles,
   defaultTrainingZoneSettings,
   type DevicesSnapshot,
   type Profile,
@@ -34,6 +37,7 @@ const runner: RunnerState = {
   totalSeconds: null,
   intervalIndex: 0,
   intervalElapsedSeconds: 30,
+  distanceMeters: 0,
   targetPowerWatts: 100,
   plannedTargetWatts: null,
   manualErg: true,
@@ -92,9 +96,39 @@ const hub: DevicesSnapshot = {
   slots: deviceRoles.map(emptySlot),
 };
 
+/** One screen holding exactly the fields under test, as `metric:scope:aggregate`. */
+const screenWith = (...keys: string[]): RideDisplayPreferences => ({
+  version: 3,
+  screens: [
+    {
+      id: "test",
+      name: "Test",
+      items: keys.map((key) => {
+        const [metric, scope, aggregate] = key.split(":");
+        return { kind: "field", field: { metric, scope, aggregate }, span: 1 };
+      }) as RideDisplayPreferences["screens"][number]["items"],
+    },
+  ],
+});
+
 afterEach(cleanup);
 
 describe("Ride charts", () => {
+  const panelScreen: RideDisplayPreferences = {
+    version: 3,
+    screens: [
+      {
+        id: "panels",
+        name: "Panels",
+        items: [
+          { kind: "panel", panel: "powerChart" },
+          { kind: "panel", panel: "heartRateChart" },
+          { kind: "panel", panel: "timeInZone" },
+        ],
+      },
+    ],
+  };
+
   it("always shows time in zone and collapses each session chart", () => {
     const { container } = render(
       <Ride
@@ -113,7 +147,7 @@ describe("Ride charts", () => {
         hub={hub}
         profile={profile}
         trainingZones={defaultTrainingZoneSettings}
-        displayPreferences={defaultRideDisplayPreferences}
+        displayPreferences={panelScreen}
         perform={async () => undefined}
       />,
     );
@@ -134,6 +168,132 @@ describe("Ride charts", () => {
     expect(container.querySelector("#ride-heart-rate-chart")).not.toBeInTheDocument();
   });
 
+  it("counts the work done in kilojoules, calories and average power", () => {
+    // 200 W held for 60 s, then 300 W for 60 s: 12 kJ + 18 kJ.
+    const history: Telemetry[] = Array.from({ length: 121 }, (_, second) => ({
+      ...telemetry,
+      timestampMs: second * 1_000,
+      powerWatts: second < 60 ? 200 : 300,
+    }));
+    const { container } = render(
+      <Ride
+        workouts={[]}
+        selectedWorkout={null}
+        setSelectedWorkout={vi.fn()}
+        connected
+        onConnect={vi.fn()}
+        runner={runner}
+        telemetry={telemetry}
+        telemetryHistory={history}
+        powerSmoothing="instant"
+        onPowerSmoothing={vi.fn()}
+        sourcePreferences={defaultSourcePreferences}
+        onSourcePreference={vi.fn()}
+        hub={hub}
+        profile={profile}
+        trainingZones={defaultTrainingZoneSettings}
+        displayPreferences={screenWith(
+          "energy:ride:total",
+          "calories:ride:total",
+          "power:ride:average",
+          "power:ride:max",
+        )}
+        perform={async () => undefined}
+      />,
+    );
+    expect(container.querySelector('[data-ride-field="energy:ride:total"]')).toHaveTextContent("ENERGY30kJ");
+    expect(container.querySelector('[data-ride-field="calories:ride:total"]')).toHaveTextContent("CALORIES30Cal");
+    // The same two minutes average out to 250 W, and peaked at 300 W.
+    expect(container.querySelector('[data-ride-field="power:ride:average"]')).toHaveTextContent(
+      "AVG POWER250W",
+    );
+    expect(container.querySelector('[data-ride-field="power:ride:max"]')).toHaveTextContent(
+      "MAX POWER300W",
+    );
+  });
+
+  it("shows pace-and-progress fields, hiding time remaining on an open-ended ride", () => {
+    const freeRide = { ...runner, elapsedSeconds: 125, distanceMeters: 5_000 };
+    const { container, rerender } = render(
+      <Ride
+        workouts={[]}
+        selectedWorkout={null}
+        setSelectedWorkout={vi.fn()}
+        connected
+        onConnect={vi.fn()}
+        runner={freeRide}
+        telemetry={telemetry}
+        telemetryHistory={[telemetry]}
+        powerSmoothing="instant"
+        onPowerSmoothing={vi.fn()}
+        sourcePreferences={defaultSourcePreferences}
+        onSourcePreference={vi.fn()}
+        hub={hub}
+        profile={profile}
+        trainingZones={defaultTrainingZoneSettings}
+        displayPreferences={defaultRideDisplayPreferences}
+        perform={async () => undefined}
+      />,
+    );
+    // 150 W for a 75 kg rider, and 5 km in the profile's own unit.
+    expect(container.querySelector('[data-ride-field="wattsPerKilogram:ride:current"]')).toHaveTextContent(
+      "2.00W/kg",
+    );
+    expect(container.querySelector('[data-ride-field="distance:ride:total"]')).toHaveTextContent("5.00km");
+    expect(container.querySelector('[data-ride-field="time:ride:total"]')).toHaveTextContent("2:05");
+    expect(container.querySelector('[data-ride-field="time:ride:remaining"]')).not.toBeInTheDocument();
+
+    rerender(
+      <Ride
+        workouts={[]}
+        selectedWorkout={null}
+        setSelectedWorkout={vi.fn()}
+        connected
+        onConnect={vi.fn()}
+        runner={{ ...freeRide, totalSeconds: 600 }}
+        telemetry={telemetry}
+        telemetryHistory={[telemetry]}
+        powerSmoothing="instant"
+        onPowerSmoothing={vi.fn()}
+        sourcePreferences={defaultSourcePreferences}
+        onSourcePreference={vi.fn()}
+        hub={hub}
+        profile={profile}
+        trainingZones={defaultTrainingZoneSettings}
+        displayPreferences={defaultRideDisplayPreferences}
+        perform={async () => undefined}
+      />,
+    );
+    expect(container.querySelector('[data-ride-field="time:ride:remaining"]')).toHaveTextContent("7:55");
+  });
+
+  it("shows a dash for average power before any ride time", () => {
+    const { container } = render(
+      <Ride
+        workouts={[]}
+        selectedWorkout={null}
+        setSelectedWorkout={vi.fn()}
+        connected
+        onConnect={vi.fn()}
+        runner={runner}
+        telemetry={telemetry}
+        telemetryHistory={[telemetry]}
+        powerSmoothing="instant"
+        onPowerSmoothing={vi.fn()}
+        sourcePreferences={defaultSourcePreferences}
+        onSourcePreference={vi.fn()}
+        hub={hub}
+        profile={profile}
+        trainingZones={defaultTrainingZoneSettings}
+        displayPreferences={defaultRideDisplayPreferences}
+        perform={async () => undefined}
+      />,
+    );
+    expect(container.querySelector('[data-ride-field="power:ride:average"]')).toHaveTextContent(
+      "AVG POWER—W",
+    );
+  });
+
   it("shows expanded workout progress and both countdowns while running or paused", () => {
     const structuredRunner: RunnerState = {
       status: "running",
@@ -143,6 +303,7 @@ describe("Ride charts", () => {
       totalSeconds: 150,
       intervalIndex: 1,
       intervalElapsedSeconds: 10,
+      distanceMeters: 0,
       targetPowerWatts: 200,
       plannedTargetWatts: 200,
       manualErg: false,
@@ -178,11 +339,13 @@ describe("Ride charts", () => {
     ]);
     expect(timelineBlocks[1]).toHaveClass("current");
     expect(container.querySelectorAll(".workout-timeline .workout-profile-progress")).toHaveLength(2);
-    expect(screen.getByText("0:20")).toBeInTheDocument();
-    expect(screen.getByText("1:20")).toBeInTheDocument();
-    const timeline = screen.getByRole("button", { name: "Skip block" }).closest("[data-ride-card]");
-    const controls = screen.getByText("TARGET & BIAS").closest("[data-ride-card]");
-    const powerChart = screen.getAllByText("FULL SESSION")[0].closest("[data-ride-card]");
+    // Scoped to the timeline: the elapsed and remaining cards show clocks too.
+    expect(
+      [...container.querySelectorAll(".timeline-countdowns strong")].map((node) => node.textContent),
+    ).toEqual(["0:20", "1:20"]);
+    const timeline = screen.getByRole("button", { name: "Skip block" }).closest("[data-ride-panel]");
+    const controls = screen.getByText("TARGET & BIAS").closest("[data-ride-panel]");
+    const powerChart = screen.getAllByText("FULL SESSION")[0].closest("[data-ride-panel]");
     expect(timeline?.nextElementSibling).toBe(controls);
     expect(controls?.nextElementSibling).toBe(powerChart);
     expect(screen.queryByRole("button", { name: "Pause" })).not.toBeInTheDocument();
@@ -192,6 +355,7 @@ describe("Ride charts", () => {
       ...structuredRunner,
       status: "paused",
       intervalElapsedSeconds: 10,
+      distanceMeters: 0,
     };
     rerender(<Ride {...commonProps} runner={pausedRunner} />);
     expect(screen.getByText("200 W · Paused")).toBeInTheDocument();
@@ -210,6 +374,7 @@ describe("Ride charts", () => {
       totalSeconds: 150,
       intervalIndex: 1,
       intervalElapsedSeconds: 10,
+      distanceMeters: 0,
       targetPowerWatts: 200,
       plannedTargetWatts: 200,
       manualErg: false,
@@ -262,16 +427,26 @@ describe("Ride charts", () => {
     expect(screen.getByText("Plan 200 W · 110% bias")).toBeInTheDocument();
   });
 
-  it("hides cards and renders visible cards in the saved order", () => {
-    const displayPreferences = {
-      version: 2 as const,
-      cards: [
-        { id: "heartRate" as const, visible: true },
-        { id: "power" as const, visible: false },
-        { id: "speed" as const, visible: true },
-        ...defaultRideDisplayPreferences.cards.filter(
-          ({ id }) => !["heartRate", "power", "speed"].includes(id),
-        ).map((card) => ({ ...card, visible: false })),
+  it("renders the active screen's slots in order, at the size they were given", () => {
+    const displayPreferences: RideDisplayPreferences = {
+      version: 3,
+      screens: [
+        {
+          id: "ride",
+          name: "Ride",
+          items: [
+            { kind: "field", field: { metric: "heartRate", scope: "ride", aggregate: "current" }, span: 1 },
+            { kind: "field", field: { metric: "power", scope: "ride", aggregate: "current" }, span: 2 },
+            { kind: "panel", panel: "timeInZone" },
+          ],
+        },
+        {
+          id: "detail",
+          name: "Detail",
+          items: [
+            { kind: "field", field: { metric: "speed", scope: "ride", aggregate: "current" }, span: 4 },
+          ],
+        },
       ],
     };
     const { container } = render(
@@ -296,15 +471,62 @@ describe("Ride charts", () => {
       />,
     );
 
-    expect(screen.queryByText("POWER")).not.toBeInTheDocument();
-    expect(screen.getByText("HEART RATE")).toBeInTheDocument();
-    expect(screen.getByText("SPEED")).toBeInTheDocument();
-    expect(
-      [...container.querySelectorAll("[data-ride-card]")].map((card) =>
-        card.getAttribute("data-ride-card"),
-      ),
-    ).toEqual(["heartRate", "speed"]);
+    const slots = () =>
+      [...container.querySelectorAll(".ride-slot")].map((slot) => [
+        slot.getAttribute("data-ride-field") ?? slot.getAttribute("data-ride-panel"),
+        slot.getAttribute("data-span"),
+      ]);
+    expect(slots()).toEqual([
+      ["heartRate:ride:current", "1"],
+      ["power:ride:current", "2"],
+      ["timeInZone", "4"],
+    ]);
+    // Nothing from another screen leaks onto this one.
+    expect(screen.queryByText("SPEED")).not.toBeInTheDocument();
+
+    // Paging with the tabs, and with the arrow keys.
+    fireEvent.click(screen.getByRole("tab", { name: "Detail" }));
+    expect(slots()).toEqual([["speed:ride:current", "4"]]);
+    expect(screen.getByRole("tab", { name: "Detail" })).toHaveAttribute("aria-selected", "true");
+
+    fireEvent.keyDown(window, { key: "ArrowLeft" });
+    expect(slots()).toEqual([
+      ["heartRate:ride:current", "1"],
+      ["power:ride:current", "2"],
+      ["timeInZone", "4"],
+    ]);
+    // The first screen is as far left as it goes.
+    fireEvent.keyDown(window, { key: "ArrowLeft" });
+    expect(screen.getByRole("tab", { name: "Ride" })).toHaveAttribute("aria-selected", "true");
+    fireEvent.keyDown(window, { key: "ArrowRight" });
+    expect(slots()).toEqual([["speed:ride:current", "4"]]);
   });
+
+  it("shows no screen tabs when there is only one screen", () => {
+    render(
+      <Ride
+        workouts={[]}
+        selectedWorkout={null}
+        setSelectedWorkout={vi.fn()}
+        connected
+        onConnect={vi.fn()}
+        runner={runner}
+        telemetry={telemetry}
+        telemetryHistory={[telemetry]}
+        powerSmoothing="instant"
+        onPowerSmoothing={vi.fn()}
+        sourcePreferences={defaultSourcePreferences}
+        onSourcePreference={vi.fn()}
+        hub={hub}
+        profile={profile}
+        trainingZones={defaultTrainingZoneSettings}
+        displayPreferences={screenWith("power:ride:current")}
+        perform={async () => undefined}
+      />,
+    );
+    expect(screen.queryByRole("tablist")).not.toBeInTheDocument();
+  });
+
   it("explains an error that ended before a ride could be saved", () => {
     const errored: RunnerState = {
       status: "error",
@@ -451,12 +673,11 @@ describe("Ride charts", () => {
         emptySlot("cadence"),
       ],
     };
-    const displayPreferences = {
-      version: 2 as const,
-      cards: defaultRideDisplayPreferences.cards.map((card) => ({
-        ...card,
-        visible: card.id === "deviceStats",
-      })),
+    const displayPreferences: RideDisplayPreferences = {
+      version: 3,
+      screens: [
+        { id: "nerds", name: "Nerds", items: [{ kind: "panel", panel: "deviceStats" }] },
+      ],
     };
     const props = {
       workouts: [], selectedWorkout: null, setSelectedWorkout: vi.fn(), connected: true,

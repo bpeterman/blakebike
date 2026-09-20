@@ -36,7 +36,7 @@ use uuid::Uuid;
 
 use crate::{
     devices::{ControlError, DeviceHub, DeviceState},
-    distance::estimate_distance,
+    distance::{DistanceAccumulator, estimate_distance},
     domain::{Interval, SessionSummary, Telemetry, Workout},
     fit::ensure_ride_file,
     ftms::ResponseCode,
@@ -99,6 +99,9 @@ pub enum RunnerState {
         total_seconds: Option<u32>,
         interval_index: usize,
         interval_elapsed_seconds: u32,
+        /// Distance ridden so far, from the same estimator as the saved ride.
+        #[serde(default)]
+        distance_meters: f64,
         /// Target the ride wants on the trainer right now (after bias and any
         /// override). Whether the trainer has it is `control`.
         target_power_watts: Option<u16>,
@@ -120,6 +123,8 @@ pub enum RunnerState {
         total_seconds: Option<u32>,
         interval_index: usize,
         interval_elapsed_seconds: u32,
+        #[serde(default)]
+        distance_meters: f64,
         target_power_watts: Option<u16>,
         planned_target_watts: Option<u16>,
         manual_erg: bool,
@@ -477,6 +482,7 @@ impl WorkoutRunner {
             total_seconds,
             standalone,
             rider_max,
+            distance_weight_kg,
             session_id,
             devices,
             state: self.state.clone(),
@@ -899,6 +905,7 @@ struct Ride {
     total_seconds: Option<u32>,
     standalone: bool,
     rider_max: u16,
+    distance_weight_kg: f32,
     session_id: Uuid,
     devices: Arc<DeviceHub>,
     state: Arc<RwLock<RunnerState>>,
@@ -916,6 +923,7 @@ async fn run_timeline(ride: &mut Ride, stats: &mut RideStats) -> bool {
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut clock = RideClock::new(Instant::now());
+    let mut distance = DistanceAccumulator::new(ride.distance_weight_kg);
     let mut interval_index = 0_usize;
     let mut interval_start: u64 = 0;
     let mut current_target: Option<u16> = None;
@@ -934,6 +942,7 @@ async fn run_timeline(ride: &mut Ride, stats: &mut RideStats) -> bool {
                     Ok(mut sample) => {
                         sample.target_power_watts = current_target;
                         stats.record(&sample);
+                        distance.push(&sample);
                         ride.recorder.push(sample);
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
@@ -975,6 +984,7 @@ async fn run_timeline(ride: &mut Ride, stats: &mut RideStats) -> bool {
                     interval_index,
                     interval_start,
                     current_target,
+                    distance.meters(),
                 )
                 .await;
                 continue;
@@ -1034,7 +1044,16 @@ async fn run_timeline(ride: &mut Ride, stats: &mut RideStats) -> bool {
         }
         controls.set_target(target);
         current_target = target;
-        publish(ride, false, elapsed, interval_index, interval_start, target).await;
+        publish(
+            ride,
+            false,
+            elapsed,
+            interval_index,
+            interval_start,
+            target,
+            distance.meters(),
+        )
+        .await;
     }
 }
 
@@ -1071,6 +1090,7 @@ async fn publish(
     interval_index: usize,
     interval_start: u64,
     target: Option<u16>,
+    distance_meters: f64,
 ) {
     let interval = &ride.intervals[interval_index];
     let interval_elapsed = elapsed.saturating_sub(interval_start) as u32;
@@ -1088,6 +1108,7 @@ async fn publish(
             total_seconds: ride.total_seconds,
             interval_index,
             interval_elapsed_seconds: interval_elapsed,
+            distance_meters,
             target_power_watts: target,
             planned_target_watts: planned,
             manual_erg: interval.free_ride,
@@ -1104,6 +1125,7 @@ async fn publish(
             total_seconds: ride.total_seconds,
             interval_index,
             interval_elapsed_seconds: interval_elapsed,
+            distance_meters,
             target_power_watts: target,
             planned_target_watts: planned,
             manual_erg: interval.free_ride,
@@ -1681,6 +1703,7 @@ mod tests {
             total_seconds: None,
             interval_index: 0,
             interval_elapsed_seconds: 12,
+            distance_meters: 1234.5,
             target_power_watts: Some(100),
             planned_target_watts: None,
             manual_erg: true,
@@ -1694,6 +1717,7 @@ mod tests {
         assert_eq!(json["workoutName"], "Free Ride");
         assert_eq!(json["targetPowerWatts"], 100);
         assert_eq!(json["manualErg"], true);
+        assert_eq!(json["distanceMeters"], 1234.5);
         assert_eq!(json["biasPercent"], 100);
         assert_eq!(json["overrideActive"], false);
         assert_eq!(json["control"], "lost");
@@ -1710,6 +1734,7 @@ mod tests {
             total_seconds: Some(300),
             interval_index: 1,
             interval_elapsed_seconds: 15,
+            distance_meters: 0.0,
             target_power_watts: Some(200),
             planned_target_watts: Some(200),
             manual_erg: false,
@@ -2025,6 +2050,35 @@ mod tests {
         .await;
         let stored = rig.storage.session(session_id).unwrap().unwrap().summary;
         assert!(stored.ended_at.is_some());
+        rig.hub.disconnect().await;
+    }
+
+    /// Real time, not the paused clock the other ride tests use: distance is
+    /// integrated from telemetry timestamps, which do not follow a virtual
+    /// clock, so the samples have to arrive genuinely seconds apart.
+    #[tokio::test]
+    async fn the_ride_publishes_distance_as_it_is_ridden() {
+        let rig = rig().await;
+        rig.runner
+            .start_free_ride(None, 800, 84.0, rig.hub.clone(), rig.storage.clone())
+            .await
+            .unwrap();
+        let rolling = wait_for(&rig.runner, |state| {
+            matches!(state, RunnerState::Running { distance_meters, .. } if *distance_meters > 0.0)
+        })
+        .await;
+        let RunnerState::Running {
+            distance_meters: first,
+            ..
+        } = rolling
+        else {
+            panic!("{rolling:?}");
+        };
+        wait_for(&rig.runner, |state| {
+            matches!(state, RunnerState::Running { distance_meters, .. } if *distance_meters > first)
+        })
+        .await;
+        rig.runner.stop().await.unwrap();
         rig.hub.disconnect().await;
     }
 

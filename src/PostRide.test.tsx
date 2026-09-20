@@ -32,6 +32,7 @@ const running: RunnerState = {
   totalSeconds: 60,
   intervalIndex: 0,
   intervalElapsedSeconds: 60,
+  distanceMeters: 0,
   targetPowerWatts: 200,
   plannedTargetWatts: 200,
   manualErg: false,
