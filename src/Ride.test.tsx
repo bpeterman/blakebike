@@ -732,4 +732,34 @@ describe("Ride charts", () => {
     );
   });
 
+  it("shows the live trainer-versus-meter delta in stats for nerds only with both devices", () => {
+    const displayPreferences: RideDisplayPreferences = {
+      version: 3,
+      screens: [
+        { id: "nerds", name: "Nerds", items: [{ kind: "panel", panel: "deviceStats" }] },
+      ],
+    };
+    const props = {
+      workouts: [], selectedWorkout: null, setSelectedWorkout: vi.fn(), connected: true,
+      onConnect: vi.fn(), runner, telemetryHistory: [telemetry], hub, displayPreferences,
+      powerSmoothing: "instant" as const, onPowerSmoothing: vi.fn(),
+      sourcePreferences: defaultSourcePreferences, onSourcePreference: vi.fn(),
+      profile, trainingZones: defaultTrainingZoneSettings, perform: async () => undefined,
+    };
+    const { container, rerender } = render(<Ride {...props} telemetry={telemetry} />);
+    expect(container.querySelector("[data-nerd-delta]")).toBeNull();
+
+    rerender(<Ride {...props} telemetry={{ ...telemetry, powerBySource: { trainer: 248, power: 241 } }} />);
+    const delta = container.querySelector("[data-nerd-delta]")!;
+    expect(delta).toHaveTextContent("Trainer 248 W · Meter 241 W · +7 W (+2.9%)");
+    expect(delta).toHaveTextContent("trainer − meter");
+
+    rerender(<Ride {...props} telemetry={{ ...telemetry, powerBySource: { trainer: 248 } }} />);
+    expect(container.querySelector("[data-nerd-delta]")).toBeNull();
+
+    // Coasting on either device: watts, but no percent.
+    rerender(<Ride {...props} telemetry={{ ...telemetry, powerBySource: { trainer: 15, power: 0 } }} />);
+    expect(container.querySelector("[data-nerd-delta]")).toHaveTextContent("+15 W");
+    expect(container.querySelector("[data-nerd-delta]")).toHaveTextContent("no percent while coasting");
+  });
 });

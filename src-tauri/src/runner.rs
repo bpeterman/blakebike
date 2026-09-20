@@ -9,12 +9,16 @@
 //!   stopped plus the current target), retries with backoff and reports a
 //!   [`ControlStatus`] instead of ever failing the ride;
 //! - the **recorder** thread batches telemetry into SQLite so a slow or
-//!   failing write never stalls the ride.
+//!   failing write never stalls the ride. A second, independent recorder
+//!   instance stores each power device's own readings when the rider has two
+//!   of them (the dual-power comparison); its trouble is logged and nothing
+//!   more.
 //!
 //! Trainer trouble degrades a ride; it never ends it. The session is finalized
 //! on every exit path.
 
 use std::{
+    collections::HashSet,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -35,7 +39,7 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
-    devices::{ControlError, DeviceHub, DeviceState},
+    devices::{ControlError, DeviceHub, DeviceRole, DeviceState, SourceSample},
     distance::{DistanceAccumulator, estimate_distance},
     domain::{Interval, SessionSummary, Telemetry, Workout},
     fit::ensure_ride_file,
@@ -71,9 +75,15 @@ const STOP_GRACE: Duration = Duration::from_secs(3);
 const PAUSE_ACK_GRACE: Duration = Duration::from_millis(500);
 /// How long the ride waits for the recorder to write the last samples.
 const FLUSH_GRACE: Duration = Duration::from_secs(5);
+/// How long the per-device (dual-power) recorder gets for its last samples,
+/// after the telemetry flush has already been settled.
+const SOURCE_FLUSH_GRACE: Duration = Duration::from_secs(1);
 /// Samples the recorder keeps while the database stays unwritable (about ten
 /// minutes at 5 Hz); older ones are dropped first.
 const MAX_PENDING_SAMPLES: usize = 3_000;
+/// The same backlog for per-device readings (about ten minutes of a 4 Hz
+/// trainer plus a 1 Hz meter).
+const MAX_PENDING_SOURCE_SAMPLES: usize = 3_000;
 
 /// How the trainer is keeping up with the ride, shown on the ride screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -423,6 +433,19 @@ impl WorkoutRunner {
         })?;
         let session = storage.start_session(workout_id, &ride_name, distance_weight_kg)?;
         let session_id = session.id;
+        // What is riding with us, for History and the dual-power report. Never
+        // worth failing the ride over.
+        let mut recorded_devices = HashSet::new();
+        for device in devices.ride_devices() {
+            match storage.record_session_device(session_id, &device) {
+                Ok(()) => {
+                    recorded_devices.insert(device.role);
+                }
+                Err(error) => {
+                    tracing::warn!(%session_id, role = ?device.role, %error, "Could not record ride device")
+                }
+            }
+        }
         devices.set_ride_active(true);
         // A ride is not a good time for the Mac to go to sleep. Headless runs
         // (tests) leave power management alone.
@@ -488,11 +511,19 @@ impl WorkoutRunner {
             rider_max,
             distance_weight_kg,
             session_id,
+            sources_rx: devices.subscribe_sources(),
             devices,
+            storage: storage.clone(),
+            recorded_devices,
             state: self.state.clone(),
             controls: self.controls.clone(),
             status_rx,
-            recorder: Recorder::start(storage.clone(), session_id),
+            recorder: Recorder::start(storage.clone(), session_id, MAX_PENDING_SAMPLES),
+            source_recorder: Recorder::start(
+                storage.clone(),
+                session_id,
+                MAX_PENDING_SOURCE_SAMPLES,
+            ),
         };
         let ride_files_dir = self.ride_files_dir.clone();
         let awake = self.awake.clone();
@@ -512,6 +543,15 @@ impl WorkoutRunner {
             let dropped = ride.recorder.dropped();
             if dropped > 0 {
                 tracing::warn!(session_id = %session_id, dropped, "Telemetry samples were dropped during the ride");
+            }
+            // The per-device readings are settled after the ride's own data,
+            // with a short grace, and only ever make it into the log.
+            if let Err(error) = ride.source_recorder.flush(SOURCE_FLUSH_GRACE).await {
+                tracing::warn!(%session_id, %error, "Per-device power samples could not all be saved");
+            }
+            let source_dropped = ride.source_recorder.dropped();
+            if source_dropped > 0 {
+                tracing::warn!(%session_id, dropped = source_dropped, "Per-device power samples were dropped during the ride");
             }
             // Whatever happened, the ride is closed out and lands in History.
             match finish(
@@ -912,10 +952,28 @@ struct Ride {
     distance_weight_kg: f32,
     session_id: Uuid,
     devices: Arc<DeviceHub>,
+    storage: Arc<Storage>,
+    /// Roles whose device is already on record for this session.
+    recorded_devices: HashSet<DeviceRole>,
     state: Arc<RwLock<RunnerState>>,
     controls: Controls,
     status_rx: watch::Receiver<ControlStatus>,
-    recorder: Recorder,
+    recorder: Recorder<Telemetry>,
+    /// Each power device's own readings, kept only while two are present.
+    sources_rx: broadcast::Receiver<SourceSample>,
+    source_recorder: Recorder<SourceSample>,
+}
+
+/// Whether a device's own readings are worth keeping: only when the rider has
+/// another power-capable device in play, so a single-trainer ride records
+/// nothing extra and a meter that joins mid-ride starts both streams. Gated on
+/// the other slot *having* a device (connected, connecting or reconnecting)
+/// rather than on its last reading, so a Bluetooth hiccup on one device does
+/// not punch a hole in the other's stream.
+fn records_dual_power(role: DeviceRole, has_device: impl Fn(DeviceRole) -> bool) -> bool {
+    DeviceRole::POWER_CAPABLE
+        .into_iter()
+        .any(|other| other != role && has_device(other))
 }
 
 /// Drive the ride to its end on wall time. Never fails: trainer and storage
@@ -932,7 +990,9 @@ async fn run_timeline(ride: &mut Ride, stats: &mut RideStats) -> bool {
     let mut interval_start: u64 = 0;
     let mut current_target: Option<u16> = None;
     let mut lag_logged = false;
+    let mut source_lag_logged = false;
     let mut telemetry_open = true;
+    let mut sources_open = true;
     let mut writer_alive = true;
     enter_interval(ride, 0, 0);
 
@@ -956,6 +1016,25 @@ async fn run_timeline(ride: &mut Ride, stats: &mut RideStats) -> bool {
                         }
                     }
                     Err(broadcast::error::RecvError::Closed) => telemetry_open = false,
+                }
+                continue;
+            }
+            received = ride.sources_rx.recv(), if sources_open => {
+                match received {
+                    Ok(sample) => {
+                        let devices = &ride.devices;
+                        if records_dual_power(sample.role, |role| devices.has_device(role)) {
+                            ride.source_recorder.push(sample);
+                            record_ride_device(ride, sample.role);
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        if !source_lag_logged {
+                            tracing::warn!(skipped, "Per-device power consumer lagged; some readings were not recorded");
+                            source_lag_logged = true;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => sources_open = false,
                 }
                 continue;
             }
@@ -1058,6 +1137,25 @@ async fn run_timeline(ride: &mut Ride, stats: &mut RideStats) -> bool {
             distance.meters(),
         )
         .await;
+    }
+}
+
+/// Put a device that joined after the ride started on the session's record,
+/// once. Nothing here can fail the ride.
+fn record_ride_device(ride: &mut Ride, role: DeviceRole) {
+    if ride.recorded_devices.contains(&role) {
+        return;
+    }
+    let Some(device) = ride.devices.slot(role).ride_device() else {
+        return;
+    };
+    match ride.storage.record_session_device(ride.session_id, &device) {
+        Ok(()) => {
+            ride.recorded_devices.insert(role);
+        }
+        Err(error) => {
+            tracing::warn!(session_id = %ride.session_id, ?role, %error, "Could not record ride device")
+        }
     }
 }
 
@@ -1351,16 +1449,55 @@ async fn classify_failure(
 /// failing sinks.
 pub trait SampleSink: Send + Sync {
     fn write_samples(&self, session_id: Uuid, samples: &[Telemetry]) -> Result<(), String>;
+    /// Each power device's own readings (the dual-power recording).
+    fn write_source_samples(
+        &self,
+        session_id: Uuid,
+        samples: &[SourceSample],
+    ) -> Result<(), String>;
 }
 
 impl SampleSink for Storage {
     fn write_samples(&self, session_id: Uuid, samples: &[Telemetry]) -> Result<(), String> {
         self.record_samples(session_id, samples)
     }
+
+    fn write_source_samples(
+        &self,
+        session_id: Uuid,
+        samples: &[SourceSample],
+    ) -> Result<(), String> {
+        self.record_source_samples(session_id, samples)
+    }
 }
 
-enum RecorderMessage {
-    Sample(Telemetry),
+/// A sample type a `Recorder` can persist. Each type is one recorder instance
+/// with its own queue and thread, so one stream's trouble is never the
+/// other's.
+pub trait Recordable: Send + 'static {
+    /// Names the stream in logs and thread names.
+    const KIND: &'static str;
+    fn write(sink: &dyn SampleSink, session_id: Uuid, batch: &[Self]) -> Result<(), String>
+    where
+        Self: Sized;
+}
+
+impl Recordable for Telemetry {
+    const KIND: &'static str = "telemetry";
+    fn write(sink: &dyn SampleSink, session_id: Uuid, batch: &[Self]) -> Result<(), String> {
+        sink.write_samples(session_id, batch)
+    }
+}
+
+impl Recordable for SourceSample {
+    const KIND: &'static str = "source";
+    fn write(sink: &dyn SampleSink, session_id: Uuid, batch: &[Self]) -> Result<(), String> {
+        sink.write_source_samples(session_id, batch)
+    }
+}
+
+enum RecorderMessage<T> {
+    Sample(T),
     Flush(std::sync::mpsc::Sender<Result<(), String>>),
 }
 
@@ -1396,27 +1533,28 @@ fn recording_health(health: &SharedRecordingHealth) -> std::sync::MutexGuard<'_,
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Persists telemetry independently of the ride clock. Health is shared with
-/// the timeline so disk failures are visible even while it keeps running.
-struct Recorder {
-    tx: Option<SyncSender<RecorderMessage>>,
+/// Persists one stream of samples independently of the ride clock. Health is
+/// shared with the timeline so disk failures are visible even while it keeps
+/// running (for telemetry; the source recorder's health only reaches the log).
+struct Recorder<T: Recordable> {
+    tx: Option<SyncSender<RecorderMessage<T>>>,
     health: SharedRecordingHealth,
 }
 
-impl Recorder {
-    fn start(sink: Arc<dyn SampleSink>, session_id: Uuid) -> Self {
+impl<T: Recordable> Recorder<T> {
+    fn start(sink: Arc<dyn SampleSink>, session_id: Uuid, max_pending: usize) -> Self {
         let (tx, rx) = sync_channel(256);
         let health = Arc::new(std::sync::Mutex::new(RecordingHealth::default()));
         let worker_health = health.clone();
         let spawned = std::thread::Builder::new()
-            .name("ride-recorder".into())
+            .name(format!("ride-recorder-{}", T::KIND))
             .spawn(move || {
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    recorder_loop(rx, sink, session_id, &worker_health);
+                    recorder_loop(rx, sink, session_id, max_pending, &worker_health);
                 }));
                 if outcome.is_err() {
                     recording_health(&worker_health).stopped = true;
-                    tracing::error!(%session_id, "Ride recorder panicked");
+                    tracing::error!(%session_id, kind = T::KIND, "Ride recorder panicked");
                 }
             });
         match spawned {
@@ -1425,14 +1563,14 @@ impl Recorder {
                 health,
             },
             Err(error) => {
-                tracing::error!(error = %error, "Could not start the ride recorder");
+                tracing::error!(error = %error, kind = T::KIND, "Could not start the ride recorder");
                 recording_health(&health).stopped = true;
                 Self { tx: None, health }
             }
         }
     }
 
-    fn push(&self, sample: Telemetry) {
+    fn push(&self, sample: T) {
         let Some(tx) = &self.tx else {
             recording_health(&self.health).dropped += 1;
             return;
@@ -1444,7 +1582,8 @@ impl Recorder {
             if health.dropped == 1 || health.dropped.is_multiple_of(100) {
                 tracing::warn!(
                     dropped = health.dropped,
-                    "Recorder dropped telemetry samples"
+                    kind = T::KIND,
+                    "Recorder dropped samples"
                 );
             }
         }
@@ -1492,24 +1631,29 @@ impl Recorder {
     }
 }
 
-fn recorder_loop(
-    rx: Receiver<RecorderMessage>,
+fn recorder_loop<T: Recordable>(
+    rx: Receiver<RecorderMessage<T>>,
     sink: Arc<dyn SampleSink>,
     session_id: Uuid,
+    max_pending: usize,
     health: &SharedRecordingHealth,
 ) {
-    let mut pending: Vec<Telemetry> = Vec::new();
+    let mut pending: Vec<T> = Vec::new();
     let mut oldest: Option<std::time::Instant> = None;
     loop {
         match rx.recv_timeout(Duration::from_millis(250)) {
             Ok(RecorderMessage::Sample(sample)) => {
                 pending.push(sample);
                 oldest.get_or_insert_with(std::time::Instant::now);
-                if pending.len() > MAX_PENDING_SAMPLES {
-                    let excess = pending.len() - MAX_PENDING_SAMPLES;
+                if pending.len() > max_pending {
+                    let excess = pending.len() - max_pending;
                     pending.drain(..excess);
                     recording_health(health).dropped += excess as u32;
-                    tracing::warn!(excess, "Recorder backlog full; oldest samples dropped");
+                    tracing::warn!(
+                        excess,
+                        kind = T::KIND,
+                        "Recorder backlog full; oldest samples dropped"
+                    );
                 }
             }
             Ok(RecorderMessage::Flush(ack)) => {
@@ -1538,10 +1682,10 @@ fn recorder_loop(
     }
 }
 
-fn write_with_retries(
+fn write_with_retries<T: Recordable>(
     sink: &dyn SampleSink,
     session_id: Uuid,
-    pending: &mut Vec<Telemetry>,
+    pending: &mut Vec<T>,
     attempts: u32,
     health: &SharedRecordingHealth,
 ) -> Result<(), String> {
@@ -1549,11 +1693,11 @@ fn write_with_retries(
         if pending.is_empty() {
             return Ok(());
         }
-        match sink.write_samples(session_id, pending) {
+        match T::write(sink, session_id, pending) {
             Ok(()) => {
                 let mut health = recording_health(health);
                 if health.write_failed {
-                    tracing::info!("Telemetry writes recovered");
+                    tracing::info!(kind = T::KIND, "Recorder writes recovered");
                 }
                 health.write_failed = false;
                 pending.clear();
@@ -1562,7 +1706,7 @@ fn write_with_retries(
             Err(error) => {
                 let mut health = recording_health(health);
                 if !health.write_failed {
-                    tracing::error!(%error, "Could not save telemetry; retaining samples for retry");
+                    tracing::error!(%error, kind = T::KIND, "Could not save samples; retaining them for retry");
                 }
                 health.write_failed = true;
             }
@@ -2335,6 +2479,203 @@ mod tests {
             }
             self.inner.write_samples(session_id, samples)
         }
+
+        fn write_source_samples(
+            &self,
+            session_id: Uuid,
+            samples: &[SourceSample],
+        ) -> Result<(), String> {
+            self.inner.write_source_samples(session_id, samples)
+        }
+    }
+
+    /// Telemetry saves; every per-device write fails. The ride must not care.
+    struct SourceFailingSink(Arc<Storage>);
+
+    impl SampleSink for SourceFailingSink {
+        fn write_samples(&self, session_id: Uuid, samples: &[Telemetry]) -> Result<(), String> {
+            self.0.write_samples(session_id, samples)
+        }
+
+        fn write_source_samples(&self, _: Uuid, _: &[SourceSample]) -> Result<(), String> {
+            Err("source table on fire".into())
+        }
+    }
+
+    fn source_sample(role: DeviceRole, index: i64) -> SourceSample {
+        SourceSample {
+            role,
+            timestamp_ms: 1_700_000_000_000 + index * 250,
+            power_watts: Some(200),
+            cadence_rpm: Some(90.0),
+            balance_left_percent: None,
+        }
+    }
+
+    #[test]
+    fn dual_power_is_recorded_only_with_a_second_power_device() {
+        let has = |present: &'static [DeviceRole]| move |role: DeviceRole| present.contains(&role);
+        // A lone trainer, or a trainer with only a strap and cadence sensor.
+        assert!(!records_dual_power(
+            DeviceRole::Trainer,
+            has(&[DeviceRole::Trainer])
+        ));
+        assert!(!records_dual_power(
+            DeviceRole::Trainer,
+            has(&[
+                DeviceRole::Trainer,
+                DeviceRole::HeartRate,
+                DeviceRole::Cadence
+            ])
+        ));
+        // Trainer plus meter: both streams are kept.
+        let both = has(&[DeviceRole::Trainer, DeviceRole::Power]);
+        assert!(records_dual_power(DeviceRole::Trainer, both));
+        assert!(records_dual_power(DeviceRole::Power, both));
+        // The meter's own presence is not a second device.
+        assert!(!records_dual_power(
+            DeviceRole::Power,
+            has(&[DeviceRole::Power])
+        ));
+    }
+
+    #[tokio::test]
+    async fn source_recording_failures_never_reach_the_ride() {
+        let storage = Arc::new(Storage::in_memory().unwrap());
+        let session = storage.start_session(None, "Sources", 84.0).unwrap();
+        let sink = Arc::new(SourceFailingSink(storage.clone()));
+        let telemetry: Recorder<Telemetry> = Recorder::start(sink.clone(), session.id, 100);
+        let sources: Recorder<SourceSample> = Recorder::start(sink, session.id, 100);
+        for index in 0..10_i64 {
+            telemetry.push(Telemetry {
+                timestamp_ms: 1_700_000_000_000 + index * 200,
+                power_watts: 150,
+                ..Telemetry::default()
+            });
+            sources.push(source_sample(DeviceRole::Trainer, index));
+            sources.push(source_sample(DeviceRole::Power, index));
+        }
+        telemetry.flush(Duration::from_secs(5)).await.unwrap();
+        assert_eq!(telemetry.warning(), None);
+        assert_eq!(telemetry.dropped(), 0);
+        // The source recorder reports its own trouble; nobody shows it.
+        assert!(sources.flush(Duration::from_secs(2)).await.is_err());
+        assert_eq!(
+            storage.session(session.id).unwrap().unwrap().samples.len(),
+            10
+        );
+        assert!(storage.source_samples(session.id).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_saturated_source_recorder_leaves_telemetry_untouched() {
+        let storage = Arc::new(Storage::in_memory().unwrap());
+        let session = storage.start_session(None, "Saturated", 84.0).unwrap();
+        let telemetry: Recorder<Telemetry> =
+            Recorder::start(storage.clone(), session.id, MAX_PENDING_SAMPLES);
+        // A tiny backlog cap so the source stream overflows at once.
+        let sources: Recorder<SourceSample> = Recorder::start(storage.clone(), session.id, 8);
+        for index in 0..600_i64 {
+            sources.push(source_sample(DeviceRole::Trainer, index));
+            if index % 60 == 0 {
+                telemetry.push(Telemetry {
+                    timestamp_ms: 1_700_000_000_000 + index * 200,
+                    power_watts: 150,
+                    ..Telemetry::default()
+                });
+            }
+        }
+        telemetry.flush(Duration::from_secs(5)).await.unwrap();
+        let _ = sources.flush(Duration::from_secs(2)).await;
+        assert_eq!(telemetry.dropped(), 0);
+        assert_eq!(telemetry.warning(), None);
+        assert_eq!(
+            storage.session(session.id).unwrap().unwrap().samples.len(),
+            10
+        );
+        // Whatever the source recorder kept is a coherent subset; the count of
+        // what it lost is in its own tally.
+        let kept = storage.source_samples(session.id).unwrap().len() as u32;
+        assert_eq!(kept + sources.dropped(), 600);
+    }
+
+    #[tokio::test]
+    async fn a_dual_power_ride_records_both_devices_and_their_readings() {
+        let rig = rig().await;
+        rig.hub
+            .connect(
+                DeviceRole::Power,
+                crate::devices::cycling_power::simulated_device(),
+            )
+            .await
+            .unwrap();
+        let session_id = rig
+            .runner
+            .start_free_ride(None, 800, 84.0, rig.hub.clone(), rig.storage.clone())
+            .await
+            .unwrap();
+        wait_for(&rig.runner, |state| {
+            matches!(state, RunnerState::Running { .. })
+        })
+        .await;
+        // Real time: the simulators report every 500 ms.
+        tokio::time::sleep(Duration::from_millis(1_600)).await;
+        rig.runner.stop().await.unwrap();
+        wait_for(&rig.runner, |state| {
+            matches!(state, RunnerState::Finished { .. })
+        })
+        .await;
+        let devices = rig.storage.session_devices(session_id).unwrap();
+        assert_eq!(
+            devices.iter().map(|device| device.role).collect::<Vec<_>>(),
+            vec![DeviceRole::Trainer, DeviceRole::Power]
+        );
+        assert_eq!(devices[1].name, "Simulated Power Meter");
+        assert!(devices[0].firmware.is_some());
+        let sources = rig.storage.source_samples(session_id).unwrap();
+        let trainer = sources
+            .iter()
+            .filter(|sample| sample.role == DeviceRole::Trainer)
+            .count();
+        let meter = sources
+            .iter()
+            .filter(|sample| sample.role == DeviceRole::Power)
+            .count();
+        assert!(
+            trainer >= 2 && meter >= 2,
+            "trainer {trainer} meter {meter}"
+        );
+        assert!(sources.iter().all(|sample| sample.power_watts.is_some()));
+        // The ride itself is untouched by the second stream.
+        let stored = rig.storage.session(session_id).unwrap().unwrap();
+        assert!(stored.summary.recording_warning.is_none());
+        assert!(stored.samples.len() >= 2);
+        rig.hub.disconnect().await;
+    }
+
+    #[tokio::test]
+    async fn a_single_trainer_ride_records_no_source_samples() {
+        let rig = rig().await;
+        let session_id = rig
+            .runner
+            .start_free_ride(None, 800, 84.0, rig.hub.clone(), rig.storage.clone())
+            .await
+            .unwrap();
+        wait_for(&rig.runner, |state| {
+            matches!(state, RunnerState::Running { .. })
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        rig.runner.stop().await.unwrap();
+        wait_for(&rig.runner, |state| {
+            matches!(state, RunnerState::Finished { .. })
+        })
+        .await;
+        assert!(rig.storage.source_samples(session_id).unwrap().is_empty());
+        let devices = rig.storage.session_devices(session_id).unwrap();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].role, DeviceRole::Trainer);
+        rig.hub.disconnect().await;
     }
 
     #[tokio::test]
@@ -2346,7 +2687,7 @@ mod tests {
             remaining_failures: std::sync::Mutex::new(2),
             calls: std::sync::Mutex::new(0),
         });
-        let recorder = Recorder::start(sink.clone(), session.id);
+        let recorder = Recorder::start(sink.clone(), session.id, MAX_PENDING_SAMPLES);
         for index in 0..25_i64 {
             recorder.push(Telemetry {
                 timestamp_ms: 1_700_000_000_000 + index * 200,
@@ -2568,7 +2909,7 @@ mod tests {
             remaining_failures: std::sync::Mutex::new(100),
             calls: std::sync::Mutex::new(0),
         });
-        let recorder = Recorder::start(sink.clone(), session.id);
+        let recorder = Recorder::start(sink.clone(), session.id, MAX_PENDING_SAMPLES);
         for i in 0..20 {
             recorder.push(Telemetry {
                 timestamp_ms: 1700000000000 + i * 200,
@@ -2640,8 +2981,12 @@ mod tests {
             fn write_samples(&self, _: Uuid, _: &[Telemetry]) -> Result<(), String> {
                 panic!("injected recorder failure")
             }
+            fn write_source_samples(&self, _: Uuid, _: &[SourceSample]) -> Result<(), String> {
+                panic!("injected recorder failure")
+            }
         }
-        let recorder = Recorder::start(Arc::new(PanickingSink), Uuid::new_v4());
+        let recorder: Recorder<Telemetry> =
+            Recorder::start(Arc::new(PanickingSink), Uuid::new_v4(), MAX_PENDING_SAMPLES);
         recorder.push(Telemetry::default());
         assert!(recorder.flush(Duration::from_secs(2)).await.is_err());
         for _ in 0..100 {

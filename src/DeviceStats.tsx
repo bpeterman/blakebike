@@ -1,4 +1,6 @@
+import { useEffect, useRef } from "react";
 import { Activity } from "lucide-react";
+import { DELTA_LABEL, DeltaWindow, formatSigned, liveDelta } from "./dualPower";
 import {
   deviceName,
   emptySlot,
@@ -93,6 +95,15 @@ export function DeviceStatsCard({
   control: ControlStatus | undefined;
 }) {
   const now = useNowTick();
+  // Trainer versus meter, live: the instantaneous pair plus a 30 s mean from
+  // the samples this card has seen (not ride history, which is empty before a
+  // ride starts, when riders compare the most).
+  const deltaWindow = useRef(new DeltaWindow());
+  useEffect(() => {
+    deltaWindow.current.push(telemetry);
+  }, [telemetry]);
+  const delta = liveDelta(telemetry.powerBySource);
+  const rolling = delta ? deltaWindow.current.mean(now) : null;
   // Every role, in the hub's order, so a role that has never been connected is
   // still named rather than silently missing.
   const slots = deviceRoles.map(
@@ -137,6 +148,20 @@ export function DeviceStatsCard({
           <dt>Last sample</dt>
           <dd>{telemetryAge === null ? "—" : formatAge(telemetryAge)} · {historySampleCount} recorded</dd>
         </dl>
+        {delta && (
+          <div className="nerd-delta" data-nerd-delta>
+            <span className="label">TRAINER VS METER</span>
+            <strong>
+              Trainer {delta.trainerWatts} W · Meter {delta.meterWatts} W · {formatSigned(delta.watts, 0, "W")}
+              {delta.percent !== null && ` (${formatSigned(delta.percent, 1, "%")})`}
+            </strong>
+            <small>
+              {DELTA_LABEL}
+              {delta.percent === null && " · no percent while coasting"}
+              {rolling && ` · 30 s mean ${formatSigned(rolling.watts, 0, "W")} (${formatSigned(rolling.percent, 1, "%")}) over ${rolling.count} samples`}
+            </small>
+          </div>
+        )}
       </div>
 
       <div className="nerd-devices">

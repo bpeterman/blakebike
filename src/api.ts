@@ -1,5 +1,6 @@
 import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
+import type { PowerComparison } from "./dualPower";
 import type { RideDisplayPreferences } from "./rideScreens";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
@@ -38,6 +39,9 @@ export type WorkoutExportResult = {
 };
 
 export const websiteUrl = "https://blake.bike";
+
+/** Header carrying the percent-encoded destination of a raw-body PNG export (mirrors Rust). */
+const EXPORT_PATH_HEADER = "x-export-path";
 
 export const api = {
   appVersion: () => getVersion(),
@@ -142,6 +146,21 @@ export const api = {
   sessions: () => invoke<SessionSummary[]>("list_sessions"),
   session: (id: string) =>
     invoke<SessionDetail | null>("get_session", { id }),
+  /** Null for rides that did not record both power devices. */
+  powerComparison: (id: string) =>
+    invoke<PowerComparison | null>("get_power_comparison", { id }),
+  exportPowerComparisonPng: async (session: SessionSummary, png: Uint8Array) => {
+    const path = await save({
+      defaultPath: `${safeName(session.workoutName)}-${session.startedAt.slice(0, 10)}-power-comparison.png`,
+      filters: [{ name: "PNG image", extensions: ["png"] }],
+    });
+    if (!path) return false;
+    // The image travels as the raw request body, not JSON.
+    await invoke<void>("export_png", png, {
+      headers: { [EXPORT_PATH_HEADER]: encodeURIComponent(path) },
+    });
+    return true;
+  },
   exportSessionCsv: async (session: SessionSummary) => {
     const path = await save({
       defaultPath: `${safeName(session.workoutName)}-${session.startedAt.slice(0, 10)}.csv`,

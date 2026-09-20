@@ -6,7 +6,10 @@ use std::{
 };
 
 use chrono::Utc;
-use tauri::{AppHandle, State};
+use tauri::{
+    AppHandle, State,
+    ipc::{InvokeBody, Request},
+};
 use uuid::Uuid;
 
 use crate::{
@@ -16,6 +19,7 @@ use crate::{
         KnownConnectOutcome, KnownConnectStatus, KnownDevice, SourcePreferences,
     },
     domain::{PlannedWorkout, Profile, SessionDetail, SessionSummary, Workout},
+    dual_power::{PowerComparison, compare_session},
     fit::ensure_ride_file,
     formats::{export_zwo, import_zwo},
     intervals::{CyclingSettings, FtpSource, IntervalsClient, ZoneBoundaries},
@@ -1167,6 +1171,61 @@ pub async fn get_session(
 ) -> Result<Option<SessionDetail>, String> {
     let storage = Arc::clone(&state.storage);
     blocking(move || storage.session(id)).await
+}
+
+/// The trainer-versus-meter report for a ride, or `None` when the ride did not
+/// record both power devices (every ride before this feature, and every
+/// single-source ride since).
+#[tauri::command]
+pub async fn get_power_comparison(
+    state: State<'_, AppState>,
+    id: Uuid,
+) -> Result<Option<PowerComparison>, String> {
+    let storage = Arc::clone(&state.storage);
+    blocking(move || {
+        let Some(summary) = storage.session_summary(id)? else {
+            return Ok(None);
+        };
+        let samples = storage.source_samples(id)?;
+        if samples.is_empty() {
+            return Ok(None);
+        }
+        let devices = storage.session_devices(id)?;
+        Ok(compare_session(&summary, &samples, &devices))
+    })
+    .await
+}
+
+/// Header carrying the destination of `export_png`, percent-encoded so any
+/// path survives the ASCII-only header channel.
+pub const EXPORT_PATH_HEADER: &str = "x-export-path";
+const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+
+/// Write a PNG the frontend rendered (the shareable comparison image). The
+/// bytes travel as the raw IPC body rather than JSON, so a large image costs
+/// no encoding; the path comes in `EXPORT_PATH_HEADER`.
+#[tauri::command]
+pub fn export_png(request: Request<'_>) -> Result<(), String> {
+    let encoded = request
+        .headers()
+        .get(EXPORT_PATH_HEADER)
+        .ok_or_else(|| "Export is missing its destination".to_string())?
+        .to_str()
+        .map_err(|_| "Export destination is not readable".to_string())?;
+    let path = PathBuf::from(
+        percent_encoding::percent_decode_str(encoded)
+            .decode_utf8()
+            .map_err(|_| "Export destination is not valid UTF-8".to_string())?
+            .into_owned(),
+    );
+    let InvokeBody::Raw(bytes) = request.body() else {
+        return Err("Export expects binary image data".into());
+    };
+    if !bytes.starts_with(&PNG_SIGNATURE) {
+        return Err("Export data is not a PNG image".into());
+    }
+    tracing::info!(path = %path.display(), bytes = bytes.len(), "Exporting PNG");
+    fs::write(&path, bytes).map_err(|error| format!("Could not write the image: {error}"))
 }
 
 #[tauri::command]

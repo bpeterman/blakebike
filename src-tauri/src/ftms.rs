@@ -1,4 +1,3 @@
-use crate::domain::Telemetry;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -148,23 +147,35 @@ pub fn parse_spin_down_status(data: &[u8]) -> Result<Option<SpinDownStatus>, Ftm
     }))
 }
 
-pub fn parse_indoor_bike_data(data: &[u8], timestamp_ms: i64) -> Result<Telemetry, FtmsError> {
+/// One Indoor Bike Data notification. Every field is optional on the wire and
+/// trainers routinely alternate frames (speed and cadence in one, power in the
+/// next), so a frame without power is *not* a 0 W reading.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct IndoorBikeData {
+    pub timestamp_ms: i64,
+    pub power_watts: Option<u16>,
+    pub cadence_rpm: Option<f32>,
+    pub speed_kph: Option<f32>,
+    pub heart_rate_bpm: Option<u8>,
+}
+
+pub fn parse_indoor_bike_data(data: &[u8], timestamp_ms: i64) -> Result<IndoorBikeData, FtmsError> {
     let mut reader = Reader::new(data);
     let flags = reader.u16()?;
-    let mut telemetry = Telemetry {
+    let mut sample = IndoorBikeData {
         timestamp_ms,
-        ..Telemetry::default()
+        ..IndoorBikeData::default()
     };
 
     // "More Data" being clear means instantaneous speed is present.
     if flags & (1 << 0) == 0 {
-        telemetry.speed_kph = Some(reader.u16()? as f32 / 100.0);
+        sample.speed_kph = Some(reader.u16()? as f32 / 100.0);
     }
     if flags & (1 << 1) != 0 {
         reader.skip(2)?; // average speed
     }
     if flags & (1 << 2) != 0 {
-        telemetry.cadence_rpm = Some(reader.u16()? as f32 / 2.0);
+        sample.cadence_rpm = Some(reader.u16()? as f32 / 2.0);
     }
     if flags & (1 << 3) != 0 {
         reader.skip(2)?; // average cadence
@@ -176,7 +187,7 @@ pub fn parse_indoor_bike_data(data: &[u8], timestamp_ms: i64) -> Result<Telemetr
         reader.skip(2)?; // resistance
     }
     if flags & (1 << 6) != 0 {
-        telemetry.power_watts = reader.i16()?.max(0) as u16;
+        sample.power_watts = Some(reader.i16()?.max(0) as u16);
     }
     if flags & (1 << 7) != 0 {
         reader.skip(2)?; // average power
@@ -185,9 +196,9 @@ pub fn parse_indoor_bike_data(data: &[u8], timestamp_ms: i64) -> Result<Telemetr
         reader.skip(5)?; // total + per-hour energy
     }
     if flags & (1 << 9) != 0 {
-        telemetry.heart_rate_bpm = Some(reader.u8()?);
+        sample.heart_rate_bpm = Some(reader.u8()?);
     }
-    Ok(telemetry)
+    Ok(sample)
 }
 
 struct Reader<'a> {
@@ -292,11 +303,25 @@ mod tests {
             0x00, // 250 W
             150,  // bpm
         ];
-        let telemetry = parse_indoor_bike_data(&data, 123).unwrap();
-        assert_eq!(telemetry.power_watts, 250);
-        assert_eq!(telemetry.cadence_rpm, Some(90.0));
-        assert_eq!(telemetry.speed_kph, Some(23.5));
-        assert_eq!(telemetry.heart_rate_bpm, Some(150));
+        let sample = parse_indoor_bike_data(&data, 123).unwrap();
+        assert_eq!(sample.timestamp_ms, 123);
+        assert_eq!(sample.power_watts, Some(250));
+        assert_eq!(sample.cadence_rpm, Some(90.0));
+        assert_eq!(sample.speed_kph, Some(23.5));
+        assert_eq!(sample.heart_rate_bpm, Some(150));
+    }
+
+    #[test]
+    fn a_frame_without_power_has_no_power_reading() {
+        // Speed + cadence only: the kind of alternate frame some trainers send.
+        let data = [0b0000_0100, 0b0000_0000, 0x2e, 0x09, 0xb4, 0x00];
+        let sample = parse_indoor_bike_data(&data, 0).unwrap();
+        assert_eq!(sample.power_watts, None);
+        assert_eq!(sample.cadence_rpm, Some(90.0));
+        assert_eq!(sample.speed_kph, Some(23.5));
+        // "More Data" set and nothing else: an empty frame, not a 0 W one.
+        let empty = parse_indoor_bike_data(&[0b0000_0001, 0], 0).unwrap();
+        assert_eq!(empty, IndoorBikeData::default());
     }
 
     #[test]

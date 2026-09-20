@@ -64,6 +64,7 @@ vi.mock("./api", () => ({
       lastError: null,
     })),
     session: vi.fn(async () => session),
+    powerComparison: vi.fn(async () => null),
     reportEvent: vi.fn(async () => undefined),
     reportError: vi.fn(async () => undefined),
     onTelemetry: vi.fn(async () => () => undefined),

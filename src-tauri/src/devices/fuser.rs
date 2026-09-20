@@ -7,14 +7,17 @@
 //! over a power meter's crank data over the trainer. Whatever is chosen, a
 //! source whose last reading is stale falls back down the default order.
 
-use std::{collections::HashMap, sync::Mutex};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Mutex,
+};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 use tokio::sync::broadcast;
 
 use super::DeviceRole;
-use crate::domain::Telemetry;
+use crate::{domain::Telemetry, ftms::IndoorBikeData};
 
 /// A metric can come from the device the user picked, or from the best
 /// available one.
@@ -73,8 +76,13 @@ impl Metric {
 /// One device's contribution.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Reading {
-    /// Indoor Bike Data: may carry power, cadence, speed and heart rate.
-    Trainer(Telemetry),
+    /// Indoor Bike Data: may carry power, cadence, speed and heart rate. The
+    /// target is only known to the simulator; a real trainer does not report
+    /// it here.
+    Trainer {
+        data: IndoorBikeData,
+        target_power_watts: Option<u16>,
+    },
     HeartRate {
         bpm: u16,
         sensor_contact: Option<bool>,
@@ -117,6 +125,25 @@ pub struct FusedTelemetry {
     #[serde(flatten)]
     pub telemetry: Telemetry,
     pub sources: TelemetrySources,
+    /// Every power-capable device's fresh reading, keyed by role, so the ride
+    /// screen can show trainer and meter side by side. Repeats the chosen
+    /// role's value that `sources.power` names.
+    pub power_by_source: BTreeMap<DeviceRole, u16>,
+}
+
+/// One device's own reading, on its own arrival clock, before fusion. This is
+/// what the dual-power recording stores and the accuracy analysis reads; the
+/// shape is what a FIT developer field could carry per record.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceSample {
+    pub role: DeviceRole,
+    pub timestamp_ms: i64,
+    /// Absent when the frame carried no power field (see `IndoorBikeData`).
+    pub power_watts: Option<u16>,
+    pub cadence_rpm: Option<f32>,
+    /// Left-pedal share when the meter reports balance.
+    pub balance_left_percent: Option<f32>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -143,14 +170,21 @@ pub struct TelemetryFuser {
     app: Option<AppHandle>,
     inner: Mutex<Inner>,
     telemetry: broadcast::Sender<Telemetry>,
+    /// Every power-capable reading at device rate, untouched by fusion.
+    sources: broadcast::Sender<SourceSample>,
 }
 
 impl TelemetryFuser {
-    pub fn new(app: Option<AppHandle>, telemetry: broadcast::Sender<Telemetry>) -> Self {
+    pub fn new(
+        app: Option<AppHandle>,
+        telemetry: broadcast::Sender<Telemetry>,
+        sources: broadcast::Sender<SourceSample>,
+    ) -> Self {
         Self {
             app,
             inner: Mutex::new(Inner::default()),
             telemetry,
+            sources,
         }
     }
 
@@ -194,32 +228,64 @@ impl TelemetryFuser {
     ) -> Option<FusedTelemetry> {
         let fused = {
             let mut inner = self.lock();
-            match reading {
-                Reading::Trainer(telemetry) => {
-                    inner.record(Metric::Power, role, telemetry.power_watts as f32, now_ms);
-                    if let Some(cadence) = telemetry.cadence_rpm {
+            let source = match reading {
+                Reading::Trainer {
+                    data,
+                    target_power_watts,
+                } => {
+                    if let Some(watts) = data.power_watts {
+                        inner.record(Metric::Power, role, watts as f32, now_ms);
+                    }
+                    if let Some(cadence) = data.cadence_rpm {
                         inner.record(Metric::Cadence, role, cadence, now_ms);
                     }
-                    if let Some(bpm) = telemetry.heart_rate_bpm.filter(|bpm| *bpm > 0) {
+                    if let Some(bpm) = data.heart_rate_bpm.filter(|bpm| *bpm > 0) {
                         inner.record(Metric::HeartRate, role, bpm as f32, now_ms);
                     }
-                    inner.trainer_speed_kph = telemetry.speed_kph;
-                    inner.trainer_target_watts = telemetry.target_power_watts;
+                    inner.trainer_speed_kph = data.speed_kph;
+                    inner.trainer_target_watts = target_power_watts;
+                    (data.power_watts.is_some() || data.cadence_rpm.is_some()).then_some(
+                        SourceSample {
+                            role,
+                            timestamp_ms: now_ms,
+                            power_watts: data.power_watts,
+                            cadence_rpm: data.cadence_rpm,
+                            balance_left_percent: None,
+                        },
+                    )
                 }
                 Reading::HeartRate { bpm, .. } => {
                     if bpm > 0 {
                         inner.record(Metric::HeartRate, role, bpm as f32, now_ms);
                     }
+                    None
                 }
                 Reading::Power {
-                    watts, cadence_rpm, ..
+                    watts,
+                    cadence_rpm,
+                    balance_left_percent,
                 } => {
                     inner.record(Metric::Power, role, watts as f32, now_ms);
                     if let Some(cadence) = cadence_rpm {
                         inner.record(Metric::Cadence, role, cadence, now_ms);
                     }
+                    Some(SourceSample {
+                        role,
+                        timestamp_ms: now_ms,
+                        power_watts: Some(watts),
+                        cadence_rpm,
+                        balance_left_percent,
+                    })
                 }
-                Reading::Cadence { rpm } => inner.record(Metric::Cadence, role, rpm, now_ms),
+                Reading::Cadence { rpm } => {
+                    inner.record(Metric::Cadence, role, rpm, now_ms);
+                    None
+                }
+            };
+            // Source samples go out at device rate, ahead of the fused
+            // throttle: the dual-power recording wants every reading.
+            if let Some(source) = source {
+                let _ = self.sources.send(source);
             }
             if now_ms - inner.last_emit_ms < MIN_EMIT_INTERVAL_MS {
                 return None;
@@ -300,6 +366,13 @@ impl Inner {
         let power = self.pick(Metric::Power, now_ms);
         let cadence = self.pick(Metric::Cadence, now_ms);
         let heart_rate = self.pick(Metric::HeartRate, now_ms);
+        let power_by_source = DeviceRole::POWER_CAPABLE
+            .into_iter()
+            .filter_map(|role| {
+                self.fresh(Metric::Power, role, now_ms)
+                    .map(|value| (role, value.round().max(0.0) as u16))
+            })
+            .collect();
         FusedTelemetry {
             telemetry: Telemetry {
                 timestamp_ms: now_ms,
@@ -316,6 +389,7 @@ impl Inner {
                 cadence: cadence.map(|(_, source)| source),
                 heart_rate: heart_rate.map(|(_, source)| source),
             },
+            power_by_source,
         }
     }
 }
@@ -326,18 +400,27 @@ mod tests {
 
     fn fuser() -> (TelemetryFuser, broadcast::Receiver<Telemetry>) {
         let (tx, rx) = broadcast::channel(16);
-        (TelemetryFuser::new(None, tx), rx)
+        let (sources, _) = broadcast::channel(16);
+        (TelemetryFuser::new(None, tx, sources), rx)
+    }
+
+    fn fuser_with_sources() -> (TelemetryFuser, broadcast::Receiver<SourceSample>) {
+        let (tx, _rx) = broadcast::channel(16);
+        let (sources, sources_rx) = broadcast::channel(64);
+        (TelemetryFuser::new(None, tx, sources), sources_rx)
     }
 
     fn trainer_sample(power: u16, cadence: Option<f32>, hr: Option<u8>, at: i64) -> Reading {
-        Reading::Trainer(Telemetry {
-            timestamp_ms: at,
-            power_watts: power,
-            cadence_rpm: cadence,
-            speed_kph: Some(30.0),
-            heart_rate_bpm: hr,
+        Reading::Trainer {
+            data: IndoorBikeData {
+                timestamp_ms: at,
+                power_watts: Some(power),
+                cadence_rpm: cadence,
+                speed_kph: Some(30.0),
+                heart_rate_bpm: hr,
+            },
             target_power_watts: Some(200),
-        })
+        }
     }
 
     #[test]
@@ -605,6 +688,138 @@ mod tests {
         assert_eq!(parsed, preferences);
         let empty: SourcePreferences = serde_json::from_str("{}").unwrap();
         assert_eq!(empty, SourcePreferences::default());
+    }
+
+    #[test]
+    fn a_trainer_frame_without_power_is_not_a_zero_watt_reading() {
+        let (fuser, _rx) = fuser();
+        fuser.ingest(
+            DeviceRole::Trainer,
+            trainer_sample(210, Some(90.0), None, 1_000),
+            1_000,
+        );
+        // Cadence-only frame: power stays at the last real reading.
+        let fused = fuser
+            .ingest(
+                DeviceRole::Trainer,
+                Reading::Trainer {
+                    data: IndoorBikeData {
+                        timestamp_ms: 1_300,
+                        cadence_rpm: Some(91.0),
+                        ..IndoorBikeData::default()
+                    },
+                    target_power_watts: None,
+                },
+                1_300,
+            )
+            .unwrap();
+        assert_eq!(fused.telemetry.power_watts, 210);
+        assert_eq!(fused.telemetry.cadence_rpm, Some(91.0));
+    }
+
+    #[test]
+    fn every_power_reading_is_published_as_a_source_sample_at_device_rate() {
+        let (fuser, mut sources) = fuser_with_sources();
+        // Three trainer frames inside one 200 ms throttle window, then the
+        // meter: four source samples, whatever the fused throttle did.
+        for at in [1_000, 1_050, 1_100] {
+            fuser.ingest(
+                DeviceRole::Trainer,
+                trainer_sample(200, Some(85.0), None, at),
+                at,
+            );
+        }
+        fuser.ingest(
+            DeviceRole::Power,
+            Reading::Power {
+                watts: 212,
+                cadence_rpm: Some(86.0),
+                balance_left_percent: Some(51.0),
+            },
+            1_120,
+        );
+        // Frames without power or cadence, and non-power devices, publish nothing.
+        fuser.ingest(
+            DeviceRole::Trainer,
+            Reading::Trainer {
+                data: IndoorBikeData {
+                    timestamp_ms: 1_150,
+                    speed_kph: Some(31.0),
+                    ..IndoorBikeData::default()
+                },
+                target_power_watts: None,
+            },
+            1_150,
+        );
+        fuser.ingest(
+            DeviceRole::HeartRate,
+            Reading::HeartRate {
+                bpm: 150,
+                sensor_contact: None,
+            },
+            1_160,
+        );
+        let mut published = Vec::new();
+        while let Ok(sample) = sources.try_recv() {
+            published.push(sample);
+        }
+        assert_eq!(published.len(), 4);
+        assert_eq!(
+            published[0],
+            SourceSample {
+                role: DeviceRole::Trainer,
+                timestamp_ms: 1_000,
+                power_watts: Some(200),
+                cadence_rpm: Some(85.0),
+                balance_left_percent: None,
+            }
+        );
+        assert_eq!(
+            published[3],
+            SourceSample {
+                role: DeviceRole::Power,
+                timestamp_ms: 1_120,
+                power_watts: Some(212),
+                cadence_rpm: Some(86.0),
+                balance_left_percent: Some(51.0),
+            }
+        );
+        let json = serde_json::to_value(published[3]).unwrap();
+        assert_eq!(json["role"], "power");
+        assert_eq!(json["powerWatts"], 212);
+        assert_eq!(json["balanceLeftPercent"], 51.0);
+    }
+
+    #[test]
+    fn fused_sample_carries_every_fresh_power_source() {
+        let (fuser, _rx) = fuser();
+        fuser.ingest(
+            DeviceRole::Trainer,
+            trainer_sample(200, None, None, 1_000),
+            1_000,
+        );
+        let fused = fuser
+            .ingest(
+                DeviceRole::Power,
+                Reading::Power {
+                    watts: 215,
+                    cadence_rpm: None,
+                    balance_left_percent: None,
+                },
+                1_400,
+            )
+            .unwrap();
+        assert_eq!(
+            fused.power_by_source,
+            BTreeMap::from([(DeviceRole::Trainer, 200), (DeviceRole::Power, 215)])
+        );
+        let json = serde_json::to_value(&fused).unwrap();
+        assert_eq!(json["powerBySource"]["trainer"], 200);
+        assert_eq!(json["powerBySource"]["power"], 215);
+        // A stale trainer leaves the map; the meter stays.
+        let later = fuser.current(1_000 + Metric::Power.stale_after_ms() + 1);
+        assert_eq!(later.power_by_source.len(), 1);
+        assert_eq!(later.power_by_source.get(&DeviceRole::Power), Some(&215));
     }
 
     #[test]

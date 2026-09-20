@@ -51,6 +51,20 @@ Today's Intervals.icu plan on the home screen, a mirrored Intervals.icu workout 
 - Your Intervals.icu workout library is mirrored into Workouts. Mirrored workouts are labelled with their Intervals.icu folder and planned load, can be ridden and exported like any other, and are read-only: "Edit a copy" makes a local workout from one, and they disappear again when they leave your library or you turn the mirror off.
 - The Settings card names the athlete the key belongs to, has separate toggles for the calendar and the library, and says when the mirrors last synced. They refresh when blake.bike starts and when you press Sync now; the training-settings sync stays behind its own button because it rewrites your FTP and zones.
 - Saving an Intervals.icu API key now checks it against Intervals.icu first. A rejected key is not saved; being offline says so instead of blaming the key.
+- Trainer versus power meter. Ride with a trainer and a power meter connected
+  and both power streams are recorded, each on its own clock, without changing
+  which one drives ERG or the display. The ride detail then shows the accuracy
+  comparison reviewers build by hand: mean offset in watts and percent, spread
+  and worst case, drift minute by minute as the trainer warms up, difference by
+  power level and by cadence, a Bland-Altman plot, and the lag between the two
+  streams, all after lining the streams up and leaving out coasting and power
+  steps. Export it as a single PNG with both devices, their firmware, the sign
+  convention and the rules it followed printed on it. Neither device is treated
+  as the truth. Stats for nerds shows the live trainer-versus-meter difference
+  with a 30 s mean.
+- The devices that rode with you are now stored with each ride, and a power
+  meter's zero offset remembers the zero it replaced, so drift between zeros
+  survives past the calibration dialog.
 
 ### Changed
 
@@ -70,6 +84,9 @@ Today's Intervals.icu plan on the home screen, a mirrored Intervals.icu workout 
 - Pressing Refresh silently saved whatever you had half-typed in the zone editors. The sync button now waits until unsaved profile or zone edits are saved, and says so.
 - A failed zone request used to be reported as "Intervals.icu did not return usable training zones" while the FTP was written anyway. The sync is now a single request: if it fails nothing changes and the error says why; if it succeeds, missing zones are reported as not configured rather than as a failure.
 - Pausing a ride no longer flashes "Trainer pause not confirmed" every time. The warning now waits to see whether the trainer is actually slow to acknowledge the pause, so it only appears when the trainer really might still be holding resistance.
+- A trainer frame without a power field was read as 0 W. Trainers that
+  alternate frames or omit power intermittently were feeding zeros into fusion;
+  such a frame now leaves power alone.
 
 ## [0.3.0] - 2026-09-19
 

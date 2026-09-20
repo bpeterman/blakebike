@@ -5,6 +5,7 @@ import {
   RideDetailModal,
 } from "./App";
 import { shouldPromptForPostRide } from "./postRide";
+import { readyComparisonFixture } from "./dualPowerFixture";
 import {
   defaultTrainingZoneSettings,
   type Profile,
@@ -156,6 +157,40 @@ describe("post-ride flow", () => {
     expect(screen.getByRole("alert")).toHaveTextContent("Ride ended with a save problem");
     expect(screen.getByRole("alert")).toHaveTextContent("No ride measurements were saved.");
     expect(screen.queryByText("Ride saved")).not.toBeInTheDocument();
+  });
+
+  it("shows the trainer-versus-meter comparison only for rides that recorded both devices", async () => {
+    const onExportComparison = vi.fn(async () => undefined);
+    const { rerender } = render(<RideDetailModal session={session} profile={profile}
+      trainingZones={defaultTrainingZoneSettings} onClose={vi.fn()} onExport={vi.fn()}
+      onExportFit={vi.fn()} onGarmin={vi.fn()} />);
+    expect(screen.queryByText("TRAINER VS POWER METER")).not.toBeInTheDocument();
+
+    const comparison = readyComparisonFixture();
+    rerender(<RideDetailModal session={session} powerComparison={comparison} profile={profile}
+      trainingZones={defaultTrainingZoneSettings} onClose={vi.fn()} onExport={vi.fn()}
+      onExportFit={vi.fn()} onGarmin={vi.fn()} onExportComparison={onExportComparison} />);
+    const card = screen.getByRole("region", { name: "Power accuracy comparison" });
+    expect(card).toHaveTextContent("+5.1 W");
+    expect(card).toHaveTextContent("+2.4% · trainer − meter");
+    expect(card).toHaveTextContent("1.75 s");
+    expect(card).toHaveTextContent("21:52");
+    expect(card).toHaveTextContent("positive means the trainer reads higher");
+    // jsdom has no 2D context; the card says so instead of showing a blank canvas.
+    expect(card).toHaveTextContent("cannot be drawn on this platform");
+    fireEvent.click(screen.getByRole("button", { name: "Export PNG" }));
+    expect(onExportComparison).toHaveBeenCalledOnce();
+
+    rerender(<RideDetailModal session={session} profile={profile} trainingZones={defaultTrainingZoneSettings}
+      onClose={vi.fn()} onExport={vi.fn()} onExportFit={vi.fn()} onGarmin={vi.fn()}
+      powerComparison={{
+        status: "insufficient", sessionId: "session", minOverlapSeconds: 60,
+        reason: "Both devices reported at the same time for only 40 s; at least 60 s are needed.",
+        coverage: { ...comparison.coverage, overlapSeconds: 40 }, a: comparison.a, b: comparison.b,
+        signConvention: comparison.signConvention,
+      }} />);
+    expect(screen.getByRole("status")).toHaveTextContent("only 40 s");
+    expect(screen.queryByRole("button", { name: "Export PNG" })).not.toBeInTheDocument();
   });
 
   it("keeps a recording warning visible when a saved ride is opened from history", () => {

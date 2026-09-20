@@ -140,6 +140,9 @@ import { DevicesPage } from "./DevicesPage";
 import { CalibrationModal } from "./CalibrationModal";
 import { isConnected as slotConnected, sourceNote, zeroOffsetIsDue } from "./devices";
 import { DeviceStatsCard } from "./DeviceStats";
+import { PowerComparisonCard } from "./PowerComparisonCard";
+import type { PowerComparison } from "./dualPower";
+import { renderReportPng } from "./powerComparisonReport";
 import { SourceSelect } from "./SourceSelect";
 import { defaultSourcePreferences, withSourcePreference } from "./sourcePreferences";
 import { shouldPromptForPostRide } from "./postRide";
@@ -218,6 +221,8 @@ function App() {
   const [selectedSession, setSelectedSession] = useState<SessionDetail | null>(
     null,
   );
+  const [selectedComparison, setSelectedComparison] =
+    useState<PowerComparison | null>(null);
   const [postRidePrompt, setPostRidePrompt] =
     useState<PostRidePromptState | null>(null);
   const [feedback, setFeedback] = useState<FeedbackState | null>(null);
@@ -454,6 +459,25 @@ function App() {
       void api.devicesSnapshot().then(setHub).catch(() => undefined);
     }
   }, []);
+
+  // The trainer-versus-meter report for the open ride. Keyed on the id so a
+  // slow answer for one ride cannot land on another.
+  const selectedSessionId = selectedSession?.summary.id ?? null;
+  useEffect(() => {
+    setSelectedComparison(null);
+    if (!selectedSessionId) return;
+    let stale = false;
+    api.powerComparison(selectedSessionId)
+      .then((comparison) => {
+        if (!stale) setSelectedComparison(comparison);
+      })
+      .catch((cause) =>
+        void api.reportError("load power comparison", messageOf(cause)).catch(() => undefined),
+      );
+    return () => {
+      stale = true;
+    };
+  }, [selectedSessionId]);
 
   useEffect(() => {
     if (feedback?.kind !== "success") return;
@@ -734,6 +758,7 @@ function App() {
           <HistoryPage
             sessions={sessions}
             selected={selectedSession}
+            comparison={selectedComparison}
             profile={profile}
             trainingZones={trainingZones}
             onSelect={(session) =>
@@ -748,6 +773,12 @@ function App() {
             }
             onGarmin={(session) =>
               void perform(() => api.prepareGarminUpload(session.id), "prepare Garmin upload")
+            }
+            onExportComparison={(session, comparison) =>
+              perform(
+                async () => api.exportPowerComparisonPng(session, await renderReportPng(comparison)),
+                "export power comparison",
+              )
             }
           />
         )}
@@ -1795,7 +1826,7 @@ export function Ride({
   );
 }
 
-function HistoryPage({ sessions, selected, profile, trainingZones, onSelect, onClose, onExport, onExportFit, onGarmin }: { sessions: SessionSummary[]; selected: SessionDetail | null; profile: Profile; trainingZones: TrainingZoneSettings; onSelect: (session: SessionSummary) => void; onClose: () => void; onExport: (session: SessionSummary) => void; onExportFit: (session: SessionSummary) => void; onGarmin: (session: SessionSummary) => void }) {
+function HistoryPage({ sessions, selected, comparison, profile, trainingZones, onSelect, onClose, onExport, onExportFit, onGarmin, onExportComparison }: { sessions: SessionSummary[]; selected: SessionDetail | null; comparison: PowerComparison | null; profile: Profile; trainingZones: TrainingZoneSettings; onSelect: (session: SessionSummary) => void; onClose: () => void; onExport: (session: SessionSummary) => void; onExportFit: (session: SessionSummary) => void; onGarmin: (session: SessionSummary) => void; onExportComparison: (session: SessionSummary, comparison: PowerComparison) => Promise<unknown> }) {
   return (
     <>
       <PageHeader eyebrow={`${sessions.length} RECORDED RIDES`} title="Ride history" />
@@ -1808,12 +1839,14 @@ function HistoryPage({ sessions, selected, profile, trainingZones, onSelect, onC
       {selected && (
         <RideDetailModal
           session={selected}
+          powerComparison={comparison}
           profile={profile}
           trainingZones={trainingZones}
           onClose={onClose}
           onExport={onExport}
           onExportFit={onExportFit}
           onGarmin={onGarmin}
+          onExportComparison={() => comparison ? onExportComparison(selected.summary, comparison) : Promise.resolve()}
         />
       )}
     </>
@@ -1840,7 +1873,7 @@ export function PostRidePrompt({ errorMessage, saveWarning = null, onView, onDis
   );
 }
 
-export function RideDetailModal({ session, profile, trainingZones, onClose, onExport, onExportFit, onGarmin }: { session: SessionDetail; profile: Profile; trainingZones: TrainingZoneSettings; onClose: () => void; onExport: (session: SessionSummary) => void; onExportFit: (session: SessionSummary) => void; onGarmin: (session: SessionSummary) => void }) {
+export function RideDetailModal({ session, powerComparison = null, profile, trainingZones, onClose, onExport, onExportFit, onGarmin, onExportComparison = () => Promise.resolve() }: { session: SessionDetail; /** The trainer-versus-meter report, for rides that recorded both devices. */ powerComparison?: PowerComparison | null; profile: Profile; trainingZones: TrainingZoneSettings; onClose: () => void; onExport: (session: SessionSummary) => void; onExportFit: (session: SessionSummary) => void; onGarmin: (session: SessionSummary) => void; onExportComparison?: () => Promise<unknown> }) {
   const [range, setRange] = useState<ChartRange | null>(null);
   const clearRange = useCallback(() => setRange(null), []);
   // Escape dismisses the innermost thing: a chart selection first, then the modal.
@@ -1911,6 +1944,9 @@ export function RideDetailModal({ session, profile, trainingZones, onClose, onEx
             <TimeInZoneChart title="Heart-rate zones" zones={heartRateZones} seconds={heartRateSeconds}/>
           </div>
         </div>
+        {powerComparison && (
+          <PowerComparisonCard comparison={powerComparison} onExport={onExportComparison} />
+        )}
       </div>
     </div>
   );

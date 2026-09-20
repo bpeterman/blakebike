@@ -10,7 +10,9 @@ use uuid::Uuid;
 
 use crate::{
     default_workouts::{DEFAULT_WORKOUTS_VERSION, default_workouts, is_legacy_sample},
-    devices::{CalibrationRecord, KnownDevice, SourcePreferences},
+    devices::{
+        CalibrationRecord, DeviceRole, KnownDevice, RideDevice, SourcePreferences, SourceSample,
+    },
     distance::estimate_distance,
     domain::{
         DistanceSource, DistanceUnit, PlannedWorkout, Profile, SessionDetail, SessionSummary,
@@ -566,6 +568,23 @@ impl Storage {
                 );
                 CREATE INDEX IF NOT EXISTS telemetry_session_idx
                   ON telemetry_samples(session_id, timestamp_ms);
+                CREATE TABLE IF NOT EXISTS source_samples (
+                  session_id TEXT NOT NULL,
+                  role TEXT NOT NULL,
+                  timestamp_ms INTEGER NOT NULL,
+                  power_watts INTEGER,
+                  cadence_rpm REAL,
+                  balance_left_percent REAL,
+                  PRIMARY KEY(session_id, role, timestamp_ms),
+                  FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+                );
+                CREATE TABLE IF NOT EXISTS session_devices (
+                  session_id TEXT NOT NULL,
+                  role TEXT NOT NULL,
+                  payload_json TEXT NOT NULL,
+                  PRIMARY KEY(session_id, role),
+                  FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+                );
                 CREATE TABLE IF NOT EXISTS settings (
                   key TEXT PRIMARY KEY,
                   value_json TEXT NOT NULL
@@ -1277,6 +1296,128 @@ impl Storage {
         transaction.commit().map_err(|error| error.to_string())
     }
 
+    /// Insert a batch of per-device readings (the dual-power recording) in one
+    /// transaction. Upsert, so a retried batch cannot duplicate rows.
+    pub fn record_source_samples(
+        &self,
+        session_id: Uuid,
+        samples: &[SourceSample],
+    ) -> Result<(), String> {
+        if samples.is_empty() {
+            return Ok(());
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        {
+            let mut statement = transaction
+                .prepare_cached(
+                    "INSERT OR REPLACE INTO source_samples(session_id, role, timestamp_ms,
+                       power_watts, cadence_rpm, balance_left_percent)
+                     VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+                )
+                .map_err(|error| error.to_string())?;
+            let session = session_id.to_string();
+            for sample in samples {
+                statement
+                    .execute(params![
+                        session,
+                        sample.role.id(),
+                        sample.timestamp_ms,
+                        sample.power_watts,
+                        sample.cadence_rpm,
+                        sample.balance_left_percent,
+                    ])
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        transaction.commit().map_err(|error| error.to_string())
+    }
+
+    /// Every per-device reading of a ride, by role then time. Empty for rides
+    /// recorded with a single power source.
+    pub fn source_samples(&self, session_id: Uuid) -> Result<Vec<SourceSample>, String> {
+        let connection = self.reader()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT role, timestamp_ms, power_watts, cadence_rpm, balance_left_percent
+                 FROM source_samples WHERE session_id = ?1",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([session_id.to_string()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<u16>>(2)?,
+                    row.get::<_, Option<f32>>(3)?,
+                    row.get::<_, Option<f32>>(4)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?;
+        let mut samples = Vec::new();
+        for row in rows {
+            let (role, timestamp_ms, power_watts, cadence_rpm, balance_left_percent) =
+                row.map_err(|error| error.to_string())?;
+            let Some(role) = DeviceRole::from_id(&role) else {
+                tracing::warn!(role, "Skipping source sample with an unknown role");
+                continue;
+            };
+            samples.push(SourceSample {
+                role,
+                timestamp_ms,
+                power_watts,
+                cadence_rpm,
+                balance_left_percent,
+            });
+        }
+        // Role order is the roles' own (trainer first), not the alphabet's.
+        samples.sort_by_key(|sample| (sample.role, sample.timestamp_ms));
+        Ok(samples)
+    }
+
+    /// Remember which device filled a role during a ride. One record per role;
+    /// a later call for the same role replaces it.
+    pub fn record_session_device(
+        &self,
+        session_id: Uuid,
+        device: &RideDevice,
+    ) -> Result<(), String> {
+        let json = serde_json::to_string(device).map_err(|error| error.to_string())?;
+        self.connection()?
+            .execute(
+                "INSERT OR REPLACE INTO session_devices(session_id, role, payload_json)
+                 VALUES(?1, ?2, ?3)",
+                params![session_id.to_string(), device.role.id(), json],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    /// The devices recorded for a ride, in role order.
+    pub fn session_devices(&self, session_id: Uuid) -> Result<Vec<RideDevice>, String> {
+        let connection = self.reader()?;
+        let mut statement = connection
+            .prepare("SELECT payload_json FROM session_devices WHERE session_id = ?1")
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([session_id.to_string()], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?;
+        let mut devices = Vec::new();
+        for row in rows {
+            let json = row.map_err(|error| error.to_string())?;
+            match serde_json::from_str::<RideDevice>(&json) {
+                Ok(device) => devices.push(device),
+                Err(error) => {
+                    tracing::warn!(%session_id, error = %error, "Skipping unreadable ride device")
+                }
+            }
+        }
+        devices.sort_by_key(|device| device.role);
+        Ok(devices)
+    }
+
     pub fn finish_session(&self, summary: &SessionSummary) -> Result<(), String> {
         self.connection()?
             .execute(
@@ -1457,20 +1598,15 @@ impl Storage {
             .collect()
     }
 
+    /// A ride's summary row alone, without its samples.
+    pub fn session_summary(&self, id: Uuid) -> Result<Option<SessionSummary>, String> {
+        let connection = self.reader()?;
+        session_summary_row(&connection, id)
+    }
+
     pub fn session(&self, id: Uuid) -> Result<Option<SessionDetail>, String> {
         let connection = self.reader()?;
-        let summary = connection
-            .query_row(
-                "SELECT id, workout_id, workout_name, started_at, ended_at, elapsed_seconds,
-                 average_power_watts, max_power_watts, average_cadence_rpm, completed,
-                 estimated_distance_meters, distance_source, distance_weight_kg, recording_warning
-                 FROM sessions WHERE id = ?1",
-                [id.to_string()],
-                row_to_session,
-            )
-            .optional()
-            .map_err(|error| error.to_string())?;
-        let Some(summary) = summary else {
+        let Some(summary) = session_summary_row(&connection, id)? else {
             return Ok(None);
         };
         let mut statement = connection
@@ -1489,6 +1625,23 @@ impl Storage {
             .collect::<Result<Vec<Telemetry>, String>>()?;
         Ok(Some(SessionDetail { summary, samples }))
     }
+}
+
+fn session_summary_row(
+    connection: &Connection,
+    id: Uuid,
+) -> Result<Option<SessionSummary>, String> {
+    connection
+        .query_row(
+            "SELECT id, workout_id, workout_name, started_at, ended_at, elapsed_seconds,
+             average_power_watts, max_power_watts, average_cadence_rpm, completed,
+             estimated_distance_meters, distance_source, distance_weight_kg, recording_warning
+             FROM sessions WHERE id = ?1",
+            [id.to_string()],
+            row_to_session,
+        )
+        .optional()
+        .map_err(|error| error.to_string())
 }
 
 fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionSummary> {
@@ -2409,6 +2562,7 @@ mod tests {
             at: Utc::now(),
             kind: CalibrationKind::ZeroOffset,
             offset_raw: Some(1_023),
+            previous_offset_raw: None,
         };
         // Nothing remembered yet: nowhere to keep it, reported as such.
         assert!(!storage.record_calibration("pm", &record).unwrap());
@@ -2433,16 +2587,19 @@ mod tests {
         // A later zero replaces it.
         let newer = CalibrationRecord {
             offset_raw: Some(1_019),
+            previous_offset_raw: Some(1_023),
             ..record.clone()
         };
         storage.record_calibration("pm", &newer).unwrap();
         assert_eq!(
-            storage.known_devices().unwrap()[0]
-                .last_calibration
-                .as_ref()
-                .and_then(|record| record.offset_raw),
-            Some(1_019)
+            storage.known_devices().unwrap()[0].last_calibration,
+            Some(newer)
         );
+        // Records written before drift was kept still load.
+        let legacy = r#"{"at":"2026-09-01T10:00:00Z","kind":"zeroOffset","offsetRaw":1000}"#;
+        let parsed: CalibrationRecord = serde_json::from_str(legacy).unwrap();
+        assert_eq!(parsed.offset_raw, Some(1_000));
+        assert_eq!(parsed.previous_offset_raw, None);
         // Forgetting drops it with the device.
         storage.forget_device("pm").unwrap();
         storage.remember_device(&meter).unwrap();
@@ -2467,6 +2624,112 @@ mod tests {
         let stored = storage.session(session.id).unwrap().unwrap().samples;
         assert_eq!(stored.len(), 5);
         assert_eq!(stored[4].power_watts, 104);
+    }
+
+    #[test]
+    fn source_samples_and_ride_devices_round_trip_and_follow_the_session() {
+        use crate::devices::CalibrationKind;
+        let storage = Storage::in_memory().unwrap();
+        let session = storage.start_session(None, "Dual", 84.0).unwrap();
+        assert!(storage.source_samples(session.id).unwrap().is_empty());
+        let trainer = |index: i64| SourceSample {
+            role: DeviceRole::Trainer,
+            timestamp_ms: 1_700_000_000_000 + index * 250,
+            power_watts: Some(200 + index as u16),
+            cadence_rpm: Some(88.0),
+            balance_left_percent: None,
+        };
+        let meter = SourceSample {
+            role: DeviceRole::Power,
+            timestamp_ms: 1_700_000_000_100,
+            power_watts: Some(196),
+            cadence_rpm: None,
+            balance_left_percent: Some(49.5),
+        };
+        storage
+            .record_source_samples(session.id, &[trainer(0), trainer(1), meter])
+            .unwrap();
+        storage.record_source_samples(session.id, &[]).unwrap();
+        // Re-writing a batch replaces rather than duplicates.
+        storage
+            .record_source_samples(session.id, &[trainer(1), trainer(2)])
+            .unwrap();
+        let stored = storage.source_samples(session.id).unwrap();
+        assert_eq!(stored.len(), 4);
+        assert_eq!(
+            stored[0..3]
+                .iter()
+                .filter(|s| s.role == DeviceRole::Trainer)
+                .count(),
+            3
+        );
+        assert_eq!(stored[3], meter);
+        assert_eq!(stored[2].power_watts, Some(202));
+
+        let device = RideDevice {
+            role: DeviceRole::Power,
+            id: "pm".into(),
+            name: "Assioma DUO".into(),
+            transport: Default::default(),
+            simulated: false,
+            manufacturer: Some("Favero".into()),
+            model: None,
+            firmware: Some("5.14".into()),
+            last_calibration: Some(CalibrationRecord {
+                at: Utc::now(),
+                kind: CalibrationKind::ZeroOffset,
+                offset_raw: Some(1_019),
+                previous_offset_raw: Some(1_023),
+            }),
+        };
+        storage.record_session_device(session.id, &device).unwrap();
+        storage
+            .record_session_device(
+                session.id,
+                &RideDevice {
+                    role: DeviceRole::Trainer,
+                    id: "kickr".into(),
+                    name: "KICKR CORE".into(),
+                    transport: Default::default(),
+                    simulated: false,
+                    manufacturer: Some("Wahoo".into()),
+                    model: None,
+                    firmware: Some("1.2.3".into()),
+                    last_calibration: None,
+                },
+            )
+            .unwrap();
+        // Reconnecting the same role replaces its record.
+        storage
+            .record_session_device(
+                session.id,
+                &RideDevice {
+                    firmware: Some("5.15".into()),
+                    ..device.clone()
+                },
+            )
+            .unwrap();
+        let devices = storage.session_devices(session.id).unwrap();
+        assert_eq!(devices.len(), 2);
+        assert_eq!(devices[0].role, DeviceRole::Trainer);
+        assert_eq!(devices[1].firmware.as_deref(), Some("5.15"));
+        assert_eq!(
+            devices[1]
+                .last_calibration
+                .as_ref()
+                .and_then(|record| record.previous_offset_raw),
+            Some(1_023)
+        );
+        assert_eq!(
+            storage.session_summary(session.id).unwrap().unwrap().id,
+            session.id
+        );
+
+        // Both tables follow the session out.
+        storage.delete_session(session.id).unwrap();
+        assert!(storage.source_samples(session.id).unwrap().is_empty());
+        assert!(storage.session_devices(session.id).unwrap().is_empty());
+        assert!(storage.session_summary(session.id).unwrap().is_none());
     }
 
     #[test]
@@ -2631,5 +2894,8 @@ mod tests {
                 .estimated_distance_meters,
             0.0
         );
+        // Tables added later exist on a database created before them.
+        assert!(storage.source_samples(session.id).unwrap().is_empty());
+        assert!(storage.session_devices(session.id).unwrap().is_empty());
     }
 }
