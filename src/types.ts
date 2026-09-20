@@ -625,20 +625,29 @@ export const manualPowerDeltaForKey = (
 export type RideKeyAction =
   | { kind: "power"; delta: number }
   | { kind: "bias"; delta: number }
-  | { kind: "screen"; delta: number };
+  | { kind: "screen"; delta: number }
+  | { kind: "pause" }
+  | { kind: "skip" }
+  | { kind: "end" };
 
 /**
  * Keyboard shortcuts on the live ride view: ↑/↓ nudge the target by 5 W,
- * Shift+↑/↓ nudge the workout bias by 1 %, ←/→ page between ride screens.
- * Held keys do not repeat.
+ * Shift+↑/↓ nudge the workout bias by 1 %, ←/→ page between ride screens,
+ * Space pauses/resumes, S skips the current workout block, and Escape
+ * brings up the end-ride confirmation. Held keys do not repeat.
  */
 export const rideKeyAction = (
   key: string,
   shift: boolean,
   repeat: boolean,
 ): RideKeyAction | null => {
-  if (!repeat && (key === "ArrowLeft" || key === "ArrowRight")) {
-    return { kind: "screen", delta: key === "ArrowLeft" ? -1 : 1 };
+  if (!repeat) {
+    if (key === "ArrowLeft" || key === "ArrowRight") {
+      return { kind: "screen", delta: key === "ArrowLeft" ? -1 : 1 };
+    }
+    if (key === " ") return { kind: "pause" };
+    if (key === "s" || key === "S") return { kind: "skip" };
+    if (key === "Escape") return { kind: "end" };
   }
   const delta = manualPowerDeltaForKey(key, repeat);
   if (delta === null) return null;
