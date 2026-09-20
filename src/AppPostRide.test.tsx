@@ -1,7 +1,8 @@
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { RunnerState } from "./types";
-import { defaultRideDisplayPreferences, defaultTrainingZoneSettings } from "./types";
+import { defaultRideDisplayPreferences } from "./rideScreens";
+import { defaultTrainingZoneSettings } from "./types";
 
 const listeners = vi.hoisted(() => ({
   runner: null as null | ((state: RunnerState) => void),
@@ -15,6 +16,7 @@ const running: RunnerState = {
   totalSeconds: 60,
   intervalIndex: 0,
   intervalElapsedSeconds: 60,
+  distanceMeters: 0,
   targetPowerWatts: 200,
   plannedTargetWatts: 200,
   manualErg: false,

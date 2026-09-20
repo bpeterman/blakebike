@@ -2,10 +2,6 @@ import { describe, expect, it } from "vitest";
 import {
   biasedWatts,
   compileWorkoutIntervals,
-  defaultRideDisplayPreferences,
-  normalizeRideDisplayPreferences,
-  rideCardDefaultVisible,
-  rideCardIds,
   formatDistance,
   formatDuration,
   formatIntervalTarget,
@@ -26,6 +22,9 @@ import {
   zoneIndex,
   workoutDuration,
   zoneModeLabel,
+  workKilojoules,
+  averagePowerWatts,
+  kilojoulesToKilocalories,
   type TrainingSyncResult,
   type WorkoutStep,
 } from "./types";
@@ -232,6 +231,52 @@ describe("workout helpers", () => {
     ]);
   });
 
+  it("totals work in kilojoules and skips dropouts", () => {
+    const samples = [
+      { timestampMs: 0, powerWatts: 100 },
+      { timestampMs: 1000, powerWatts: 200 },
+      // 10 s gap: the rider stepped off, so it is not billed as 300 W.
+      { timestampMs: 11_000, powerWatts: 300 },
+      { timestampMs: 12_000, powerWatts: 250 },
+    ].map((sample) => ({
+      ...sample,
+      cadenceRpm: null,
+      speedKph: null,
+      heartRateBpm: null,
+      targetPowerWatts: null,
+    }));
+    // 100 W for 1 s + 300 W for 1 s; the trailing sample has no interval yet.
+    expect(workKilojoules(samples)).toBeCloseTo(0.4, 10);
+    expect(workKilojoules([])).toBe(0);
+    expect(workKilojoules(samples.slice(0, 1))).toBe(0);
+  });
+
+  it("averages power over riding time, not sample count", () => {
+    const samples = [
+      { timestampMs: 0, powerWatts: 100 },
+      // One long block at 100 W outweighs the short 300 W samples that follow.
+      { timestampMs: 4000, powerWatts: 300 },
+      { timestampMs: 5000, powerWatts: 300 },
+      // 10 s gap: neither the work nor the time counts.
+      { timestampMs: 15_000, powerWatts: 500 },
+    ].map((sample) => ({
+      ...sample,
+      cadenceRpm: null,
+      speedKph: null,
+      heartRateBpm: null,
+      targetPowerWatts: null,
+    }));
+    expect(averagePowerWatts(samples)).toBeCloseTo(140, 10); // 0.7 kJ over 5 s
+    expect(averagePowerWatts([])).toBeNull();
+    expect(averagePowerWatts(samples.slice(0, 1))).toBeNull();
+  });
+
+  it("converts work to calories at cycling's gross efficiency", () => {
+    expect(kilojoulesToKilocalories(0)).toBe(0);
+    // Close to 1:1, which is why bike computers report the two side by side.
+    expect(kilojoulesToKilocalories(1000)).toBeCloseTo(996, 0);
+  });
+
   it("downsamples while retaining the session endpoints", () => {
     const samples = Array.from({ length: 100 }, (_, timestampMs) => ({
       timestampMs,
@@ -261,44 +306,6 @@ describe("workout helpers", () => {
     ]);
     const aligned = withActiveElapsed(samples, 4);
     expect(aligned[aligned.length - 1].activeElapsedMs).toBe(4000);
-  });
-});
-
-describe("ride display preferences", () => {
-  it("fills a missing card in at its own default, so diagnostics stay off", () => {
-    expect(
-      defaultRideDisplayPreferences.cards.find((card) => card.id === "deviceStats"),
-    ).toEqual({ id: "deviceStats", visible: false });
-    expect(
-      defaultRideDisplayPreferences.cards.every(
-        (card) => card.visible === rideCardDefaultVisible[card.id],
-      ),
-    ).toBe(true);
-
-    // Preferences saved before a card existed: it is appended at its default,
-    // and the rider's own choices are left alone.
-    const saved = normalizeRideDisplayPreferences({
-      version: 2,
-      cards: [{ id: "speed", visible: false }],
-    });
-    expect(saved.cards).toHaveLength(rideCardIds.length);
-    expect(saved.cards[0]).toEqual({ id: "speed", visible: false });
-    expect(saved.cards.find((card) => card.id === "power")?.visible).toBe(true);
-    expect(saved.cards.find((card) => card.id === "deviceStats")?.visible).toBe(false);
-  });
-
-  it("keeps a card the rider turned on, and drops duplicates and unknowns", () => {
-    const chosen = normalizeRideDisplayPreferences({
-      version: 2,
-      cards: [
-        { id: "deviceStats", visible: true },
-        { id: "deviceStats", visible: false },
-        { id: "nonsense" as never, visible: true },
-      ],
-    });
-    expect(chosen.cards[0]).toEqual({ id: "deviceStats", visible: true });
-    expect(chosen.cards).toHaveLength(rideCardIds.length);
-    expect(chosen.cards.filter((card) => card.id === "deviceStats")).toHaveLength(1);
   });
 });
 

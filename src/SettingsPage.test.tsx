@@ -19,10 +19,10 @@ vi.mock("./api", () => ({
 }));
 
 import { api } from "./api";
+import { defaultRideDisplayPreferences } from "./rideScreens";
 import { SettingsPage } from "./App";
 import { latestRelease } from "./releaseNotes";
 import {
-  defaultRideDisplayPreferences,
   defaultTrainingZoneSettings,
   derivedPowerZones,
   type Profile,
@@ -270,37 +270,106 @@ describe("Intervals.icu settings", () => {
     expect(onDevMode).toHaveBeenCalledWith(true);
   });
 
-  it("drafts, reorders, resets, and saves the ride layout", () => {
+  it("edits ride screens: fields, panels, order, size, and saving", () => {
     const onSaveRideDisplayPreferences = vi.fn();
     renderSettings({ onSaveRideDisplayPreferences });
 
-    // Stats for nerds is in the list but off until the rider asks for it.
-    const nerdStats = screen.getByRole("checkbox", { name: "Stats for nerds" });
-    expect(nerdStats).not.toBeChecked();
-    fireEvent.click(nerdStats);
-    fireEvent.click(screen.getByRole("checkbox", { name: "Power" }));
-    fireEvent.click(screen.getByRole("button", { name: "Move Cadence up" }));
+    const first = screen.getByLabelText("Name of screen 1") as HTMLInputElement;
+    expect(first.value).toBe("Ride");
+    fireEvent.change(first, { target: { value: "Main" } });
+    // Editing the draft does not save anything by itself.
     expect(onSaveRideDisplayPreferences).not.toHaveBeenCalled();
 
+    // The first slot is power; make it full width and move it down one.
+    const metrics = screen.getAllByLabelText("Metric") as HTMLSelectElement[];
+    expect(metrics[0].value).toBe("power");
+    const sizes = screen.getAllByLabelText("Size") as HTMLSelectElement[];
+    fireEvent.change(sizes[0], { target: { value: "4" } });
+    fireEvent.click(screen.getByRole("button", { name: "Move slot 1 of Main down" }));
+
     fireEvent.click(screen.getByRole("button", { name: "Save ride layout" }));
-    expect(onSaveRideDisplayPreferences).toHaveBeenLastCalledWith(
-      expect.objectContaining({
-        version: 2,
-        cards: expect.arrayContaining([
-          { id: "power", visible: false },
-          { id: "deviceStats", visible: true },
-        ]),
-      }),
+    const saved = onSaveRideDisplayPreferences.mock.calls[0][0];
+    expect(saved.version).toBe(3);
+    expect(saved.screens[0].name).toBe("Main");
+    expect(saved.screens[0].items[0]).toEqual({
+      kind: "field",
+      field: { metric: "cadence", scope: "ride", aggregate: "current" },
+      span: 1,
+    });
+    expect(saved.screens[0].items[1]).toEqual({
+      kind: "field",
+      field: { metric: "power", scope: "ride", aggregate: "current" },
+      span: 4,
+    });
+  });
+
+  it("only offers scopes and aggregates the chosen metric has", () => {
+    render(
+      <SettingsPage
+        profile={profile}
+        trainingZones={defaultTrainingZoneSettings}
+        rideDisplayPreferences={defaultRideDisplayPreferences}
+        perform={perform}
+        onProfileUpdate={vi.fn()}
+        onTrainingZonesUpdate={vi.fn()}
+        onSave={vi.fn()}
+        onSaveTrainingZones={vi.fn()}
+        onSaveRideDisplayPreferences={vi.fn()}
+        devMode={false}
+        onDevMode={vi.fn()}
+        onForgetDevices={() => Promise.resolve()}
+      />,
     );
-    expect(onSaveRideDisplayPreferences.mock.calls[0][0].cards[0].id).toBe(
-      "cadence",
+    const options = (select: HTMLSelectElement) =>
+      [...select.options].map((option) => option.value);
+
+    const scope = screen.getAllByLabelText("Measured over")[0] as HTMLSelectElement;
+    const shownAs = screen.getAllByLabelText("Shown as")[0] as HTMLSelectElement;
+    expect(options(scope)).toEqual(["ride", "interval"]);
+    expect(options(shownAs)).toEqual(["current", "average", "max"]);
+
+    // The block has no live reading of its own, so the aggregate follows.
+    fireEvent.change(scope, { target: { value: "interval" } });
+    expect(options(screen.getAllByLabelText("Shown as")[0] as HTMLSelectElement)).toEqual([
+      "average",
+      "max",
+    ]);
+
+    // Distance is only ever a whole-ride total, so both pickers lock.
+    fireEvent.change(screen.getAllByLabelText("Metric")[0], { target: { value: "distance" } });
+    expect(screen.getAllByLabelText("Measured over")[0]).toBeDisabled();
+    expect(screen.getAllByLabelText("Shown as")[0]).toBeDisabled();
+  });
+
+  it("adds and removes screens, but never the last one", () => {
+    const onSaveRideDisplayPreferences = vi.fn();
+    render(
+      <SettingsPage
+        profile={profile}
+        trainingZones={defaultTrainingZoneSettings}
+        rideDisplayPreferences={defaultRideDisplayPreferences}
+        perform={perform}
+        onProfileUpdate={vi.fn()}
+        onTrainingZonesUpdate={vi.fn()}
+        onSave={vi.fn()}
+        onSaveTrainingZones={vi.fn()}
+        onSaveRideDisplayPreferences={onSaveRideDisplayPreferences}
+        devMode={false}
+        onDevMode={vi.fn()}
+        onForgetDevices={() => Promise.resolve()}
+      />,
     );
+    fireEvent.click(screen.getByRole("button", { name: "Add screen" }));
+    expect(screen.getByLabelText("Name of screen 3")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove Screen 3" }));
+    fireEvent.click(screen.getByRole("button", { name: "Remove Detail" }));
+    expect(screen.queryByLabelText("Name of screen 2")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Remove Ride" })).toBeDisabled();
 
     fireEvent.click(screen.getByRole("button", { name: "Reset to default" }));
     fireEvent.click(screen.getByRole("button", { name: "Save ride layout" }));
-    expect(onSaveRideDisplayPreferences.mock.calls[1][0]).toEqual(
-      defaultRideDisplayPreferences,
-    );
+    expect(onSaveRideDisplayPreferences).toHaveBeenLastCalledWith(defaultRideDisplayPreferences);
   });
 });
 

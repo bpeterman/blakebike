@@ -235,6 +235,8 @@ export type RunnerState =
       totalSeconds: number | null;
       intervalIndex: number;
       intervalElapsedSeconds: number;
+      /** Distance ridden so far, from the same estimator as the saved ride. */
+      distanceMeters: number;
       /** Target sent to the trainer right now (after bias and any override). */
       targetPowerWatts: number | null;
       /** What the workout plan asks for, before bias/override; null on free ride. */
@@ -255,6 +257,7 @@ export type RunnerState =
       totalSeconds: number | null;
       intervalIndex: number;
       intervalElapsedSeconds: number;
+      distanceMeters: number;
       targetPowerWatts: number | null;
       plannedTargetWatts: number | null;
       manualErg: boolean;
@@ -309,48 +312,6 @@ export type TrainingZoneSettings = {
   heartRateZones: ZoneDefinition[];
 };
 
-export const rideCardIds = [
-  "power",
-  "cadence",
-  "speed",
-  "heartRate",
-  "workoutTimeline",
-  "targetAndBias",
-  "powerChart",
-  "heartRateChart",
-  "timeInZone",
-  "deviceStats",
-] as const;
-
-export type RideCardId = (typeof rideCardIds)[number];
-
-/**
- * Whether a card is shown to a rider who has not chosen for themselves.
- * Diagnostics cards default to hidden. Mirrors `RIDE_CARDS` in storage.rs.
- */
-export const rideCardDefaultVisible: Record<RideCardId, boolean> = {
-  power: true,
-  cadence: true,
-  speed: true,
-  heartRate: true,
-  workoutTimeline: true,
-  targetAndBias: true,
-  powerChart: true,
-  heartRateChart: true,
-  timeInZone: true,
-  deviceStats: false,
-};
-
-export type RideCardPreference = {
-  id: RideCardId;
-  visible: boolean;
-};
-
-export type RideDisplayPreferences = {
-  version: 2;
-  cards: RideCardPreference[];
-};
-
 export const defaultTrainingZoneSettings: TrainingZoneSettings = {
   version: 1,
   syncPowerZonesFromIntervals: false,
@@ -361,26 +322,6 @@ export const defaultTrainingZoneSettings: TrainingZoneSettings = {
   heartRateZones: [],
 };
 
-export const defaultRideDisplayPreferences: RideDisplayPreferences = {
-  version: 2,
-  cards: rideCardIds.map((id) => ({ id, visible: rideCardDefaultVisible[id] })),
-};
-
-export function normalizeRideDisplayPreferences(
-  preferences: RideDisplayPreferences,
-): RideDisplayPreferences {
-  const known = new Set<RideCardId>(rideCardIds);
-  const seen = new Set<RideCardId>();
-  const cards = preferences.cards.filter((card) => {
-    if (!known.has(card.id) || seen.has(card.id)) return false;
-    seen.add(card.id);
-    return true;
-  });
-  for (const id of rideCardIds) {
-    if (!seen.has(id)) cards.push({ id, visible: rideCardDefaultVisible[id] });
-  }
-  return { version: 2, cards };
-}
 
 const zoneNames = (count: number) =>
   Array.from({ length: count }, (_, index) => `Zone ${index + 1}`);
@@ -486,6 +427,87 @@ export const describeTrainingSync = (result: TrainingSyncResult): string => {
 
 export const zoneIndex = (value: number, zones: readonly ZoneDefinition[]): number =>
   zones.findIndex((zone) => zone.upperBound === null || value <= zone.upperBound);
+
+/**
+ * Visits every gap-valid step between samples: the sample the step starts at
+ * and how long it lasts. Steps longer than `maxGapMs` are skipped, so a
+ * dropout is billed as neither work nor riding time. This gap rule is shared
+ * by everything that totals or averages a ride, including `timeInZones`.
+ */
+const eachStep = (
+  samples: readonly Pick<Telemetry, "timestampMs">[],
+  maxGapMs: number,
+  visit: (index: number, durationMs: number) => void,
+): void => {
+  for (let index = 0; index < samples.length - 1; index += 1) {
+    const durationMs = samples[index + 1].timestampMs - samples[index].timestampMs;
+    if (durationMs <= 0 || durationMs > maxGapMs) continue;
+    visit(index, durationMs);
+  }
+};
+
+/** Mechanical work in kilojoules over a sample series. */
+export const workKilojoules = (
+  samples: readonly Pick<Telemetry, "timestampMs" | "powerWatts">[],
+  maxGapMs = 5_000,
+): number => {
+  let joules = 0;
+  eachStep(samples, maxGapMs, (index, durationMs) => {
+    joules += (samples[index].powerWatts * durationMs) / 1000;
+  });
+  return joules / 1000;
+};
+
+/**
+ * Mean of `value` weighted by the time each sample was on screen, or null when
+ * no step carried a value. Weighted by time rather than sample count so an
+ * uneven sample rate cannot skew it.
+ */
+export const timeWeightedMean = <T extends Pick<Telemetry, "timestampMs">>(
+  samples: readonly T[],
+  value: (sample: T) => number | null,
+  maxGapMs = 5_000,
+): number | null => {
+  let total = 0;
+  let weightMs = 0;
+  eachStep(samples, maxGapMs, (index, durationMs) => {
+    const sampled = value(samples[index]);
+    if (sampled === null) return;
+    total += sampled * durationMs;
+    weightMs += durationMs;
+  });
+  return weightMs === 0 ? null : total / weightMs;
+};
+
+/** Time-weighted mean power over a sample series, or null before there is any. */
+export const averagePowerWatts = (
+  samples: readonly Pick<Telemetry, "timestampMs" | "powerWatts">[],
+  maxGapMs = 5_000,
+): number | null => timeWeightedMean(samples, (sample) => sample.powerWatts, maxGapMs);
+
+/** Largest reading of `value` in the series, or null when nothing was read. */
+export const peak = <T>(samples: readonly T[], value: (sample: T) => number | null): number | null => {
+  let highest: number | null = null;
+  for (const sample of samples) {
+    const sampled = value(sample);
+    if (sampled === null) continue;
+    highest = highest === null ? sampled : Math.max(highest, sampled);
+  }
+  return highest;
+};
+
+/**
+ * Gross mechanical efficiency of a cyclist: the share of the energy burned
+ * that reaches the pedals. Measured values sit near a quarter, which is why
+ * kilojoules of work and dietary calories burned come out close to 1:1.
+ */
+export const GROSS_EFFICIENCY = 0.24;
+
+const KILOJOULES_PER_KILOCALORIE = 4.184;
+
+/** Dietary calories (kcal) burned to produce `kilojoules` of work at the pedals. */
+export const kilojoulesToKilocalories = (kilojoules: number): number =>
+  kilojoules / (KILOJOULES_PER_KILOCALORIE * GROSS_EFFICIENCY);
 
 export const timeInZones = (
   samples: Telemetry[],
@@ -669,17 +691,22 @@ export const manualPowerDeltaForKey = (
 
 export type RideKeyAction =
   | { kind: "power"; delta: number }
-  | { kind: "bias"; delta: number };
+  | { kind: "bias"; delta: number }
+  | { kind: "screen"; delta: number };
 
 /**
  * Keyboard shortcuts on the live ride view: ↑/↓ nudge the target by 5 W,
- * Shift+↑/↓ nudge the workout bias by 1 %. Held keys do not repeat.
+ * Shift+↑/↓ nudge the workout bias by 1 %, ←/→ page between ride screens.
+ * Held keys do not repeat.
  */
 export const rideKeyAction = (
   key: string,
   shift: boolean,
   repeat: boolean,
 ): RideKeyAction | null => {
+  if (!repeat && (key === "ArrowLeft" || key === "ArrowRight")) {
+    return { kind: "screen", delta: key === "ArrowLeft" ? -1 : 1 };
+  }
   const delta = manualPowerDeltaForKey(key, repeat);
   if (delta === null) return null;
   return shift

@@ -173,10 +173,17 @@ p { color: #8d9587; font-size: 13px; }
 .preview-stats { display: flex; gap: 40px; margin-top: 20px; }
 .metrics-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
 .live-ride-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px 10px; }
-.ride-card-cell { min-width: 0; }
-.ride-card-cell.compact { grid-column: span 1; }
-.ride-card-cell.wide { grid-column: 1 / -1; }
+.ride-slot { min-width: 0; }
+.ride-slot[data-span="1"] { grid-column: span 1; }
+.ride-slot[data-span="2"] { grid-column: span 2; }
+.ride-slot[data-span="4"] { grid-column: 1 / -1; }
 .ride-card-compact, .ride-card-compact .live-metric { height: 100%; }
+/* A wider tile carries a bigger number, the way a Garmin field does. */
+.ride-slot[data-span="2"] .live-metric > strong { font-size: 46px; }
+.ride-slot[data-span="4"] .live-metric > strong { font-size: 56px; }
+.ride-screen-tabs { display: flex; gap: 6px; margin-bottom: 12px; }
+.ride-screen-tabs button { min-height: 30px; padding: 0 14px; border: 1px solid #2d322b; border-radius: 999px; color: #9aa394; background: #151814; font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; cursor: pointer; }
+.ride-screen-tabs button.selected { border-color: #566d26; color: #c8ff32; background: #1e2518; }
 .live-ride-grid .workout-timeline,
 .live-ride-grid .workout-controls-card,
 .live-ride-grid .live-chart,
@@ -285,6 +292,16 @@ textarea { min-height: 70px; resize: vertical; }
 .ride-card-setting > label { display: flex; align-items: center; gap: 10px; flex: 1; cursor: pointer; }
 .ride-card-setting input { width: 16px; height: 16px; accent-color: #c8ff32; }
 .ride-card-setting label span { color: #dce5d3; }
+.ride-screen-setting { display: grid; gap: 8px; padding: 12px; border: 1px solid #2d322b; border-radius: 11px; background: #131612; }
+.ride-screen-head { display: flex; align-items: center; gap: 12px; }
+.ride-screen-head > label { flex: 1; }
+.ride-screen-head input { width: 100%; height: 32px; padding: 0 10px; border: 1px solid #2d322b; border-radius: 7px; color: #e8ede3; background: #191c18; font-size: 13px; }
+.ride-screen-add { display: flex; gap: 8px; }
+.ride-screen-add .secondary { min-height: 32px; padding: 0 12px; font-size: 11px; }
+.ride-slot-controls { display: flex; align-items: center; gap: 8px; flex: 1; flex-wrap: wrap; }
+.ride-slot-kind { min-width: 44px; color: #768071; font-size: 9px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+.ride-slot-controls select { height: 30px; padding: 0 8px; border: 1px solid #2d322b; border-radius: 7px; color: #dce5d3; background: #191c18; font-size: 12px; }
+.ride-slot-controls select:disabled { opacity: .5; }
 .ride-card-order { display: flex; gap: 4px; }
 .ride-card-order .icon-button { width: 32px; height: 30px; }
 .ride-card-order .icon-button:disabled { opacity: .28; cursor: default; }
@@ -405,6 +422,7 @@ textarea { min-height: 70px; resize: vertical; }
   .workout-row .workout-card:last-child { display: none; }
   .metrics-grid { grid-template-columns: repeat(2, 1fr); }
   .live-ride-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .ride-slot[data-span="2"], .ride-slot[data-span="4"] { grid-column: 1 / -1; }
   .timeline-heading { align-items: start; }
   .timeline-countdowns { gap: 18px; }
   .zone-chart-grid { grid-template-columns: 1fr; }
@@ -635,3 +653,9 @@ textarea { min-height: 70px; resize: vertical; }
 .notice.soft strong { color: #edf2e8; }
 .notice.soft svg { color: #c8ff32; }
 .calibration-gauge.meter-reading strong { font-size: 26px; text-align: center; }
+
+@media (max-width: 620px) {
+  .live-ride-grid { grid-template-columns: minmax(0, 1fr); }
+  .ride-slot[data-span="1"] { grid-column: 1 / -1; }
+  .ride-screen-tabs { overflow-x: auto; }
+}

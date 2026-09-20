@@ -10,14 +10,30 @@ the About card in Settings.
 
 Conventions:
 
-- Add entries under `## [Unreleased]` as you work. `pnpm release` turns that
-  section into a dated version heading.
-- The paragraph directly under a version heading is the **summary** shown on the
-  About card. Keep it to one sentence, written for a rider, not a developer.
-- Group the details under `### Added`, `### Changed`, `### Fixed`, or
-  `### Removed`.
+- Add entries under `## [Unreleased]
 
-## [Unreleased]
+### Added
+
+- Ride screens. The live ride view is now several screens you page between with
+  the tabs at the top or the ← and → keys, and each screen is a grid of fields
+  you choose. A field is a metric (power, cadence, heart rate, speed, watts per
+  kilogram, distance, energy, calories, time, target) measured over the whole
+  ride or just the block you are riding, shown live, averaged or at its maximum
+  — so average power, block average power and max power are all there without
+  each being its own card. Fields can be small, wide or full width, and the
+  charts, workout timeline, target & bias, time in zone and stats for nerds sit
+  alongside them as panels. Build it all under Settings → Ride screens.
+- Distance is now estimated live while you ride, by the same model that saves it
+  with the session.
+- New numbers to put on a screen: energy in kilojoules and the calories that
+  burned, average and maximum power, cadence, heart rate and speed, watts per
+  kilogram, distance, elapsed time and time remaining.
+
+### Changed
+
+- The old "Live ride cards" list becomes the ride-screen editor. Layouts saved
+  before this release are carried over as a single screen holding the cards you
+  had switched on, in the order you had them.
 
 Syncing from Intervals.icu now says exactly what it changes, imports heart-rate zones only when you ask, and never overwrites zones you edited by hand without warning.
 

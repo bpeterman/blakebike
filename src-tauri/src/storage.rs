@@ -139,71 +139,309 @@ pub(crate) fn validate_zones(
     Ok(())
 }
 
-/// Every ride card, in default order, with whether it is shown to a rider who
-/// has not chosen for themselves. Diagnostics cards default to hidden.
-const RIDE_CARDS: [(&str, bool); 10] = [
-    ("power", true),
-    ("cadence", true),
-    ("speed", true),
-    ("heartRate", true),
-    ("workoutTimeline", true),
-    ("targetAndBias", true),
-    ("powerChart", true),
-    ("heartRateChart", true),
-    ("timeInZone", true),
-    ("deviceStats", false),
+/// The panels a ride screen can hold — the cards that are not a single
+/// number. Mirrors `ridePanelIds` in `src/rideFields.ts`.
+const RIDE_PANELS: [&str; 6] = [
+    "workoutTimeline",
+    "targetAndBias",
+    "powerChart",
+    "heartRateChart",
+    "timeInZone",
+    "deviceStats",
 ];
+
+/// Every field a rider can put on a screen, as `metric:scope:aggregate`.
+/// Mirrors the table built in `src/rideFields.ts`; a field missing from here
+/// is dropped on load, so the two lists have to agree.
+const RIDE_FIELDS: [&str; 33] = [
+    "power:ride:current",
+    "power:ride:average",
+    "power:ride:max",
+    "power:interval:average",
+    "power:interval:max",
+    "cadence:ride:current",
+    "cadence:ride:average",
+    "cadence:ride:max",
+    "cadence:interval:average",
+    "cadence:interval:max",
+    "heartRate:ride:current",
+    "heartRate:ride:average",
+    "heartRate:ride:max",
+    "heartRate:interval:average",
+    "heartRate:interval:max",
+    "speed:ride:current",
+    "speed:ride:average",
+    "speed:ride:max",
+    "speed:interval:average",
+    "speed:interval:max",
+    "wattsPerKilogram:ride:current",
+    "wattsPerKilogram:ride:average",
+    "wattsPerKilogram:interval:average",
+    "energy:ride:total",
+    "energy:interval:total",
+    "calories:ride:total",
+    "calories:interval:total",
+    "time:ride:total",
+    "time:ride:remaining",
+    "time:interval:total",
+    "time:interval:remaining",
+    "distance:ride:total",
+    "targetPower:ride:current",
+];
+
+const MAX_RIDE_SCREENS: usize = 8;
+const MAX_RIDE_SCREEN_ITEMS: usize = 24;
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum RideScreenItem {
+    #[serde(rename_all = "camelCase")]
+    Field {
+        field: RideFieldSpec,
+        #[serde(default = "one_span")]
+        span: u8,
+    },
+    #[serde(rename_all = "camelCase")]
+    Panel { panel: String },
+}
+
+fn one_span() -> u8 {
+    1
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct RideCardPreference {
+pub struct RideFieldSpec {
+    pub metric: String,
+    pub scope: String,
+    pub aggregate: String,
+}
+
+impl RideFieldSpec {
+    fn key(&self) -> String {
+        format!("{}:{}:{}", self.metric, self.scope, self.aggregate)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RideScreen {
     pub id: String,
-    pub visible: bool,
+    pub name: String,
+    pub items: Vec<RideScreenItem>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct RideDisplayPreferences {
     pub version: u8,
-    pub cards: Vec<RideCardPreference>,
+    pub screens: Vec<RideScreen>,
+}
+
+/// One screen's worth of the default layout: `(metric, scope, aggregate, span)`
+/// fields and panels, in order. Mirrors `defaultRideDisplayPreferences`.
+fn default_screens() -> Vec<RideScreen> {
+    let field = |key: &str, span: u8| {
+        let mut parts = key.split(':');
+        RideScreenItem::Field {
+            field: RideFieldSpec {
+                metric: parts.next().unwrap_or_default().to_owned(),
+                scope: parts.next().unwrap_or_default().to_owned(),
+                aggregate: parts.next().unwrap_or_default().to_owned(),
+            },
+            span,
+        }
+    };
+    let panel = |id: &str| RideScreenItem::Panel {
+        panel: id.to_owned(),
+    };
+    vec![
+        RideScreen {
+            id: "ride".into(),
+            name: "Ride".into(),
+            items: vec![
+                field("power:ride:current", 2),
+                field("cadence:ride:current", 1),
+                field("heartRate:ride:current", 1),
+                field("speed:ride:current", 1),
+                field("power:ride:average", 1),
+                field("wattsPerKilogram:ride:current", 1),
+                field("distance:ride:total", 1),
+                field("time:ride:total", 1),
+                field("time:ride:remaining", 1),
+                panel("workoutTimeline"),
+                panel("targetAndBias"),
+                panel("powerChart"),
+            ],
+        },
+        RideScreen {
+            id: "detail".into(),
+            name: "Detail".into(),
+            items: vec![
+                field("energy:ride:total", 1),
+                field("calories:ride:total", 1),
+                field("power:interval:average", 1),
+                field("heartRate:ride:average", 1),
+                panel("heartRateChart"),
+                panel("timeInZone"),
+            ],
+        },
+    ]
 }
 
 impl Default for RideDisplayPreferences {
     fn default() -> Self {
         Self {
-            version: 2,
-            cards: RIDE_CARDS
-                .iter()
-                .map(|(id, visible)| RideCardPreference {
-                    id: (*id).to_owned(),
-                    visible: *visible,
-                })
-                .collect(),
+            version: 3,
+            screens: default_screens(),
         }
     }
 }
 
+/// The v2 cards, each as the field or panel that replaced it.
+fn v2_item(id: &str) -> Option<RideScreenItem> {
+    let field = |key: &str, span: u8| {
+        let mut parts = key.split(':');
+        Some(RideScreenItem::Field {
+            field: RideFieldSpec {
+                metric: parts.next().unwrap_or_default().to_owned(),
+                scope: parts.next().unwrap_or_default().to_owned(),
+                aggregate: parts.next().unwrap_or_default().to_owned(),
+            },
+            span,
+        })
+    };
+    match id {
+        "power" => field("power:ride:current", 2),
+        "cadence" => field("cadence:ride:current", 1),
+        "speed" => field("speed:ride:current", 1),
+        "heartRate" => field("heartRate:ride:current", 1),
+        "energy" => field("energy:ride:total", 1),
+        "averagePower" => field("power:ride:average", 1),
+        "wattsPerKilogram" => field("wattsPerKilogram:ride:current", 1),
+        "distance" => field("distance:ride:total", 1),
+        "elapsedTime" => field("time:ride:total", 1),
+        "remainingTime" => field("time:ride:remaining", 1),
+        other if RIDE_PANELS.contains(&other) => Some(RideScreenItem::Panel {
+            panel: other.to_owned(),
+        }),
+        _ => None,
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct V2Card {
+    id: String,
+    visible: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct V2Preferences {
+    cards: Vec<V2Card>,
+}
+
 impl RideDisplayPreferences {
-    fn normalized(self) -> Self {
-        let mut cards = Vec::with_capacity(RIDE_CARDS.len());
-        for card in self.cards {
-            if RIDE_CARDS.iter().any(|(id, _)| *id == card.id)
-                && !cards
-                    .iter()
-                    .any(|existing: &RideCardPreference| existing.id == card.id)
-            {
-                cards.push(card);
-            }
+    /// Reads whatever is stored: a v3 document, a v2 card list (migrated to a
+    /// single screen holding the cards the rider had switched on), or anything
+    /// else, which falls back to the defaults.
+    fn from_stored(value: serde_json::Value) -> Self {
+        // `screens` has to be present: the struct's serde default would
+        // otherwise turn a v2 card list into the default layout and lose it.
+        if value.get("screens").is_some()
+            && let Ok(preferences) = serde_json::from_value::<Self>(value.clone())
+        {
+            return preferences.normalized();
         }
-        for (id, visible) in RIDE_CARDS {
-            if !cards.iter().any(|card| card.id == id) {
-                cards.push(RideCardPreference {
-                    id: id.to_owned(),
-                    visible,
+        if let Ok(v2) = serde_json::from_value::<V2Preferences>(value) {
+            let items = v2
+                .cards
+                .iter()
+                .filter(|card| card.visible)
+                .filter_map(|card| v2_item(&card.id))
+                .collect();
+            return Self {
+                version: 3,
+                screens: vec![RideScreen {
+                    id: "ride".into(),
+                    name: "Ride".into(),
+                    items,
+                }],
+            }
+            .normalized();
+        }
+        Self::default()
+    }
+
+    /// Drops fields and panels this version does not know, screens with
+    /// nothing left on them, and anything past the caps. Mirrors
+    /// `normalizeRideDisplayPreferences` in `src/rideScreens.ts`.
+    fn normalized(self) -> Self {
+        let mut screens: Vec<RideScreen> = Vec::new();
+        let mut ids: Vec<String> = Vec::new();
+        for screen in self.screens {
+            if screens.len() == MAX_RIDE_SCREENS {
+                break;
+            }
+            let mut items: Vec<RideScreenItem> = Vec::new();
+            let mut keys: Vec<String> = Vec::new();
+            for item in screen.items {
+                if items.len() == MAX_RIDE_SCREEN_ITEMS {
+                    break;
+                }
+                let key = match &item {
+                    RideScreenItem::Field { field, .. } => {
+                        if !RIDE_FIELDS.contains(&field.key().as_str()) {
+                            continue;
+                        }
+                        format!("field:{}", field.key())
+                    }
+                    RideScreenItem::Panel { panel } => {
+                        if !RIDE_PANELS.contains(&panel.as_str()) {
+                            continue;
+                        }
+                        format!("panel:{panel}")
+                    }
+                };
+                if keys.contains(&key) {
+                    continue;
+                }
+                keys.push(key);
+                items.push(match item {
+                    RideScreenItem::Field { field, span } => RideScreenItem::Field {
+                        field,
+                        span: if [1, 2, 4].contains(&span) { span } else { 1 },
+                    },
+                    panel => panel,
                 });
             }
+            if items.is_empty() {
+                continue;
+            }
+            let mut id = if screen.id.trim().is_empty() {
+                format!("screen-{}", screens.len() + 1)
+            } else {
+                screen.id
+            };
+            while ids.contains(&id) {
+                id = format!("{id}-{}", screens.len() + 1);
+            }
+            ids.push(id.clone());
+            let name = if screen.name.trim().is_empty() {
+                format!("Screen {}", screens.len() + 1)
+            } else {
+                screen.name
+            };
+            screens.push(RideScreen { id, name, items });
         }
-        Self { version: 2, cards }
+        if screens.is_empty() {
+            screens = default_screens();
+        }
+        Self {
+            version: 3,
+            screens,
+        }
     }
 }
 
@@ -586,9 +824,9 @@ impl Storage {
 
     pub fn ride_display_preferences(&self) -> Result<RideDisplayPreferences, String> {
         Ok(self
-            .setting::<RideDisplayPreferences>(RIDE_DISPLAY_PREFERENCES_KEY)?
-            .unwrap_or_default()
-            .normalized())
+            .setting::<serde_json::Value>(RIDE_DISPLAY_PREFERENCES_KEY)?
+            .map(RideDisplayPreferences::from_stored)
+            .unwrap_or_default())
     }
 
     pub fn save_ride_display_preferences(
@@ -1487,14 +1725,14 @@ mod tests {
         assert!(loaded.sync_power_zones_from_intervals);
         assert!(!loaded.sync_heart_rate_zones_from_intervals);
         let mut display = RideDisplayPreferences::default();
-        display.cards.swap(0, 1);
-        display.cards[0].visible = false;
+        display.screens.swap(0, 1);
+        display.screens[0].items.truncate(2);
         storage.save_ride_display_preferences(&display).unwrap();
         assert_eq!(storage.ride_display_preferences().unwrap(), display);
     }
 
     #[test]
-    fn ride_display_preferences_migrate_and_normalize() {
+    fn ride_display_preferences_fall_back_and_normalize() {
         let storage = Storage::in_memory().unwrap();
         storage
             .save_setting(
@@ -1507,60 +1745,104 @@ mod tests {
             RideDisplayPreferences::default()
         );
 
-        let partial = RideDisplayPreferences {
-            version: 1,
-            cards: vec![
-                RideCardPreference {
-                    id: "speed".into(),
-                    visible: false,
+        // A field this build does not know, a duplicate, an impossible span
+        // and a screen left with nothing on it are all cleaned up on load.
+        storage
+            .save_setting(
+                RIDE_DISPLAY_PREFERENCES_KEY,
+                &serde_json::json!({
+                    "version": 3,
+                    "screens": [
+                        {
+                            "id": "main",
+                            "name": "",
+                            "items": [
+                                { "kind": "field", "field": { "metric": "power", "scope": "ride", "aggregate": "current" }, "span": 3 },
+                                { "kind": "field", "field": { "metric": "power", "scope": "ride", "aggregate": "current" }, "span": 1 },
+                                { "kind": "field", "field": { "metric": "vo2max", "scope": "ride", "aggregate": "current" }, "span": 1 },
+                                { "kind": "panel", "panel": "spaceship" }
+                            ]
+                        },
+                        { "id": "empty", "name": "Empty", "items": [] }
+                    ]
+                }),
+            )
+            .unwrap();
+        let loaded = storage.ride_display_preferences().unwrap();
+        assert_eq!(loaded.version, 3);
+        assert_eq!(loaded.screens.len(), 1);
+        assert_eq!(loaded.screens[0].name, "Screen 1");
+        assert_eq!(
+            loaded.screens[0].items,
+            vec![RideScreenItem::Field {
+                field: RideFieldSpec {
+                    metric: "power".into(),
+                    scope: "ride".into(),
+                    aggregate: "current".into(),
                 },
-                RideCardPreference {
-                    id: "speed".into(),
-                    visible: true,
-                },
-                RideCardPreference {
-                    id: "unknown".into(),
-                    visible: true,
-                },
-            ],
-        };
-        storage.save_ride_display_preferences(&partial).unwrap();
-        let normalized = storage.ride_display_preferences().unwrap();
-        assert_eq!(normalized.version, 2);
-        assert_eq!(normalized.cards.len(), RIDE_CARDS.len());
-        assert_eq!(normalized.cards[0].id, "speed");
-        assert!(!normalized.cards[0].visible);
-        // A card the saved preferences never heard of is filled in at its own
-        // default, so a diagnostics card stays off for existing riders.
-        let filled = |id: &str| {
-            normalized
-                .cards
-                .iter()
-                .find(|card| card.id == id)
-                .unwrap()
-                .visible
-        };
-        assert!(filled("power"));
-        assert!(!filled("deviceStats"));
+                span: 1,
+            }]
+        );
     }
 
     #[test]
-    fn device_stats_card_defaults_off_and_can_be_turned_on() {
+    fn a_v2_card_layout_becomes_one_ride_screen() {
         let storage = Storage::in_memory().unwrap();
-        let defaults = storage.ride_display_preferences().unwrap();
-        let nerd = defaults
-            .cards
-            .iter()
-            .find(|card| card.id == "deviceStats")
-            .expect("deviceStats is a ride card");
-        assert!(!nerd.visible);
+        storage
+            .save_setting(
+                RIDE_DISPLAY_PREFERENCES_KEY,
+                &serde_json::json!({
+                    "version": 2,
+                    "cards": [
+                        { "id": "speed", "visible": true },
+                        { "id": "power", "visible": true },
+                        { "id": "deviceStats", "visible": false },
+                        { "id": "timeInZone", "visible": true },
+                        { "id": "unknown", "visible": true }
+                    ]
+                }),
+            )
+            .unwrap();
+        let migrated = storage.ride_display_preferences().unwrap();
+        assert_eq!(migrated.version, 3);
+        assert_eq!(migrated.screens.len(), 1);
+        assert_eq!(migrated.screens[0].name, "Ride");
+        // The rider's order is kept, hidden cards are dropped, and the power
+        // card keeps the double width it has on the ride screen.
+        assert_eq!(
+            migrated.screens[0].items,
+            vec![
+                RideScreenItem::Field {
+                    field: RideFieldSpec {
+                        metric: "speed".into(),
+                        scope: "ride".into(),
+                        aggregate: "current".into(),
+                    },
+                    span: 1,
+                },
+                RideScreenItem::Field {
+                    field: RideFieldSpec {
+                        metric: "power".into(),
+                        scope: "ride".into(),
+                        aggregate: "current".into(),
+                    },
+                    span: 2,
+                },
+                RideScreenItem::Panel {
+                    panel: "timeInZone".into(),
+                },
+            ]
+        );
+    }
 
-        let mut chosen = defaults.clone();
-        for card in &mut chosen.cards {
-            if card.id == "deviceStats" {
-                card.visible = true;
-            }
-        }
+    #[test]
+    fn ride_screens_round_trip() {
+        let storage = Storage::in_memory().unwrap();
+        let mut chosen = RideDisplayPreferences::default();
+        chosen.screens.truncate(1);
+        chosen.screens[0].items.push(RideScreenItem::Panel {
+            panel: "deviceStats".into(),
+        });
         storage.save_ride_display_preferences(&chosen).unwrap();
         assert_eq!(storage.ride_display_preferences().unwrap(), chosen);
     }
