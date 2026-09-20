@@ -6,6 +6,10 @@ use quick_xml::{
 
 use crate::domain::{PowerTarget, Workout, WorkoutStep};
 
+/// Parse a Zwift workout file. Every direct child of `<workout>` must be a
+/// step we understand; an unknown one fails the import rather than silently
+/// shortening the workout. Children of steps (`textevent` cues) and the
+/// metadata outside `<workout>` other than name and description are ignored.
 pub fn import_zwo(xml: &str) -> Result<Workout, String> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
@@ -13,31 +17,33 @@ pub fn import_zwo(xml: &str) -> Result<Workout, String> {
     let mut description = String::new();
     let mut steps = Vec::new();
     let mut current_text = None::<String>;
+    // Nesting depth of the element being read, and the depth at which the
+    // children of `<workout>` sit while inside it.
+    let mut depth = 0_usize;
+    let mut step_depth = None::<usize>;
     loop {
         match reader.read_event().map_err(|error| error.to_string())? {
             Event::Start(element) => {
-                let tag = String::from_utf8_lossy(element.name().as_ref()).to_string();
-                match tag.as_str() {
-                    "name" | "description" => current_text = Some(tag),
-                    "SteadyState" => steps.push(steady(&element)?),
-                    "Warmup" | "Cooldown" | "Ramp" => steps.push(ramp(&element)?),
-                    "FreeRide" => steps.push(WorkoutStep::FreeRide {
-                        duration_seconds: required_u32(&element, b"Duration")?,
-                    }),
-                    "IntervalsT" => steps.push(intervals(&element)?),
-                    _ => {}
+                let tag = element.name();
+                let tag = tag.as_ref();
+                if step_depth == Some(depth) {
+                    steps.push(step(tag, &element)?);
+                } else if tag == b"workout" {
+                    step_depth = Some(depth + 1);
+                } else if tag == b"name" || tag == b"description" {
+                    current_text = Some(String::from_utf8_lossy(tag).into_owned());
                 }
+                depth += 1;
             }
             Event::Empty(element) => {
-                let tag = element.name();
-                match tag.as_ref() {
-                    b"SteadyState" => steps.push(steady(&element)?),
-                    b"Warmup" | b"Cooldown" | b"Ramp" => steps.push(ramp(&element)?),
-                    b"FreeRide" => steps.push(WorkoutStep::FreeRide {
-                        duration_seconds: required_u32(&element, b"Duration")?,
-                    }),
-                    b"IntervalsT" => steps.push(intervals(&element)?),
-                    _ => {}
+                if step_depth == Some(depth) {
+                    steps.push(step(element.name().as_ref(), &element)?);
+                }
+            }
+            Event::End(_) => {
+                depth = depth.saturating_sub(1);
+                if step_depth == Some(depth + 1) {
+                    step_depth = None;
                 }
             }
             Event::Text(text) => {
@@ -64,6 +70,23 @@ pub fn import_zwo(xml: &str) -> Result<Workout, String> {
     workout.updated_at = workout.created_at;
     workout.validate()?;
     Ok(workout)
+}
+
+/// One direct child of `<workout>`. `SolidState` is the pre-2015 spelling of
+/// `SteadyState`; `MaxEffort` has no target and rides like free ride.
+fn step(tag: &[u8], element: &BytesStart<'_>) -> Result<WorkoutStep, String> {
+    match tag {
+        b"SteadyState" | b"SolidState" => steady(element),
+        b"Warmup" | b"Cooldown" | b"Ramp" => ramp(element),
+        b"FreeRide" | b"MaxEffort" => Ok(WorkoutStep::FreeRide {
+            duration_seconds: required_u32(element, b"Duration")?,
+        }),
+        b"IntervalsT" => intervals(element),
+        other => Err(format!(
+            "Unsupported workout element <{}>",
+            String::from_utf8_lossy(other)
+        )),
+    }
 }
 
 fn steady(element: &BytesStart<'_>) -> Result<WorkoutStep, String> {
@@ -189,6 +212,53 @@ mod tests {
         let workout = import_zwo(xml).unwrap();
         assert_eq!(workout.name, "Intervals");
         assert_eq!(workout.duration_seconds(), 240);
+        assert_eq!(workout.source, "zwo");
+        assert!(!workout.is_mirrored());
+    }
+
+    #[test]
+    fn maps_legacy_and_effort_steps_and_ignores_step_children() {
+        let xml = r#"<workout_file>
+          <author>Someone</author><name>Mixed</name><sportType>bike</sportType>
+          <tags><tag name="INTERVALS"/></tags>
+          <workout>
+            <SolidState Duration="120" Power="0.6"/>
+            <SteadyState Duration="300" Power="0.9" Cadence="90">
+              <textevent timeoffset="0" message="Settle in"/>
+            </SteadyState>
+            <MaxEffort Duration="30"/>
+            <Cooldown Duration="60" PowerLow="0.7" PowerHigh="0.4"/>
+          </workout>
+        </workout_file>"#;
+        let workout = import_zwo(xml).unwrap();
+        assert_eq!(workout.name, "Mixed");
+        assert_eq!(workout.steps.len(), 4);
+        assert!(matches!(
+            workout.steps[0],
+            WorkoutStep::Steady {
+                duration_seconds: 120,
+                target: PowerTarget::PercentFtp(60)
+            }
+        ));
+        assert!(matches!(
+            workout.steps[2],
+            WorkoutStep::FreeRide {
+                duration_seconds: 30
+            }
+        ));
+        assert!(matches!(workout.steps[3], WorkoutStep::Ramp { .. }));
+    }
+
+    #[test]
+    fn refuses_unknown_step_elements_instead_of_dropping_them() {
+        let xml = r#"<workout_file><name>Odd</name><workout>
+          <SteadyState Duration="300" Power="0.7"/>
+          <Sprint Duration="15"/>
+        </workout></workout_file>"#;
+        assert_eq!(
+            import_zwo(xml).unwrap_err(),
+            "Unsupported workout element <Sprint>"
+        );
     }
 
     #[test]

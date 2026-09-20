@@ -14,8 +14,12 @@ import type {
   DeviceSlot,
   DeviceState,
   DevicesSnapshot,
+  IntervalsStatus,
+  IntervalsSyncReport,
+  IntervalsSyncSettings,
   KnownConnectOutcome,
   KnownDevice,
+  PlannedWorkout,
   PowerSmoothing,
   SourcePreferences,
   Profile,
@@ -66,12 +70,15 @@ export const api = {
   profile: () => invoke<Profile>("get_profile"),
   saveProfile: (profile: Profile) =>
     invoke<void>("save_profile", { profile }),
-  intervalsApiKeyConfigured: () =>
-    invoke<boolean>("intervals_api_key_configured"),
+  intervalsStatus: () => invoke<IntervalsStatus>("intervals_status"),
   saveIntervalsApiKey: (apiKey: string) =>
-    invoke<void>("save_intervals_api_key", { apiKey }),
+    invoke<IntervalsStatus>("save_intervals_api_key", { apiKey }),
   clearIntervalsApiKey: () =>
-    invoke<void>("clear_intervals_api_key"),
+    invoke<IntervalsStatus>("clear_intervals_api_key"),
+  saveIntervalsSyncSettings: (settings: IntervalsSyncSettings) =>
+    invoke<IntervalsStatus>("set_intervals_sync_settings", { settings }),
+  syncIntervals: () => invoke<IntervalsSyncReport>("sync_intervals"),
+  plannedWorkouts: () => invoke<PlannedWorkout[]>("planned_workouts"),
   syncTrainingSettings: () =>
     invoke<TrainingSyncResult>("sync_training_settings"),
   workouts: () => invoke<Workout[]>("list_workouts"),

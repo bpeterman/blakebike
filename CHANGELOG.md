@@ -10,7 +10,16 @@ the About card in Settings.
 
 Conventions:
 
-- Add entries under `## [Unreleased]
+- Add entries under `## [Unreleased]` as you work. `pnpm release` turns that
+  section into a dated version heading.
+- The paragraph directly under a version heading is the **summary** shown on the
+  About card. Keep it to one sentence, written for a rider, not a developer.
+- Group the details under `### Added`, `### Changed`, `### Fixed`, or
+  `### Removed`.
+
+## [Unreleased]
+
+Today's Intervals.icu plan on the home screen, a mirrored Intervals.icu workout library, an honest training-settings sync, and ride screens you build from fields.
 
 ### Added
 
@@ -28,17 +37,17 @@ Conventions:
 - New numbers to put on a screen: energy in kilojoules and the calories that
   burned, average and maximum power, cadence, heart rate and speed, watts per
   kilogram, distance, elapsed time and time remaining.
+- Today's planned workout from your Intervals.icu calendar on the home screen: its name, structure, duration and planned load, with Start. With a trainer connected it starts at once; otherwise the Ride page opens with it selected, and it sits at the top of the ride picker marked "Today". A plan without structured steps offers a free ride instead. The next seven days are cached, so the card works offline and says how old the cache is.
+- Your Intervals.icu workout library is mirrored into Workouts. Mirrored workouts are labelled with their Intervals.icu folder and planned load, can be ridden and exported like any other, and are read-only: "Edit a copy" makes a local workout from one, and they disappear again when they leave your library or you turn the mirror off.
+- The Settings card names the athlete the key belongs to, has separate toggles for the calendar and the library, and says when the mirrors last synced. They refresh when blake.bike starts and when you press Sync now; the training-settings sync stays behind its own button because it rewrites your FTP and zones.
+- Saving an Intervals.icu API key now checks it against Intervals.icu first. A rejected key is not saved; being offline says so instead of blaming the key.
 
 ### Changed
 
+- Importing a ZWO file now refuses workouts with step elements blake.bike does not understand instead of silently dropping them, and reads the older `SolidState` and `MaxEffort` steps.
 - The old "Live ride cards" list becomes the ride-screen editor. Layouts saved
   before this release are carried over as a single screen holding the cards you
   had switched on, in the order you had them.
-
-Syncing from Intervals.icu now says exactly what it changes, imports heart-rate zones only when you ask, and never overwrites zones you edited by hand without warning.
-
-### Changed
-
 - The Intervals.icu sync pulls your FTP and maximum heart rate from your cycling sport settings, preferring the indoor FTP when you have set one, and no longer uses the modeled eFTP. Power zones scale from that same number, so the FTP you see and the FTP behind your zones always agree, and the status line names which one was used.
 - Heart-rate zones now have their own "Import from Intervals.icu" toggle, next to the power zones toggle in each zone editor. Both are off by default and both are saved with your zone settings.
 - After a sync the Settings card reports each item: the new FTP and max heart rate with their previous values, and for each zone set whether it was imported, already up to date, left alone because import is off, not configured on Intervals.icu, or unusable and why.
@@ -50,9 +59,6 @@ Syncing from Intervals.icu now says exactly what it changes, imports heart-rate 
 - Heart-rate zones were imported on every refresh whether or not you wanted them, replacing hand-edited zones without warning. They are now imported only when their toggle is on, and turning the toggle on over custom zones asks first.
 - Pressing Refresh silently saved whatever you had half-typed in the zone editors. The sync button now waits until unsaved profile or zone edits are saved, and says so.
 - A failed zone request used to be reported as "Intervals.icu did not return usable training zones" while the FTP was written anyway. The sync is now a single request: if it fails nothing changes and the error says why; if it succeeds, missing zones are reported as not configured rather than as a failure.
-
-### Fixed
-
 - Pausing a ride no longer flashes "Trainer pause not confirmed" every time. The warning now waits to see whether the trainer is actually slow to acknowledge the pause, so it only appears when the trainer really might still be holding resistance.
 
 ## [0.3.0] - 2026-09-19

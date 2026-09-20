@@ -15,14 +15,15 @@ use crate::{
         CalibrationRecord, DeviceInfo, DeviceLogLine, DeviceRole, DeviceState, DevicesSnapshot,
         KnownConnectOutcome, KnownConnectStatus, KnownDevice, SourcePreferences,
     },
-    domain::{Profile, SessionDetail, SessionSummary, Workout},
+    domain::{PlannedWorkout, Profile, SessionDetail, SessionSummary, Workout},
     fit::ensure_ride_file,
     formats::{export_zwo, import_zwo},
     intervals::{CyclingSettings, FtpSource, IntervalsClient, ZoneBoundaries},
+    intervals_sync::{self, IntervalsStatus, IntervalsSyncReport, resolve_athlete},
     runner::RunnerState,
     storage::{
-        PowerSmoothing, RideDisplayPreferences, Storage, TrainingZoneSettings, ZoneDefinition,
-        ZoneMode, validate_zones,
+        IntervalsSyncSettings, PowerSmoothing, RideDisplayPreferences, Storage,
+        TrainingZoneSettings, ZoneDefinition, ZoneMode, validate_zones,
     },
 };
 
@@ -320,18 +321,54 @@ pub fn save_profile(state: State<'_, AppState>, profile: Profile) -> Result<(), 
 }
 
 #[tauri::command]
-pub fn intervals_api_key_configured(state: State<'_, AppState>) -> Result<bool, String> {
-    Ok(state.storage.intervals_api_key()?.is_some())
+pub fn intervals_status(state: State<'_, AppState>) -> Result<IntervalsStatus, String> {
+    intervals_sync::status(&state.storage)
+}
+
+/// Validate the key against Intervals.icu (which also tells us the athlete
+/// id every later call needs), then store both.
+#[tauri::command]
+pub async fn save_intervals_api_key(
+    state: State<'_, AppState>,
+    api_key: String,
+) -> Result<IntervalsStatus, String> {
+    let athlete = intervals_sync::save_api_key(&state.storage, &api_key).await?;
+    tracing::info!(athlete = %athlete.id, "Intervals.icu API key saved");
+    intervals_sync::status(&state.storage)
+}
+
+/// Forget the key and everything that depends on it: athlete, sync state,
+/// the calendar cache and the mirrored library workouts.
+#[tauri::command]
+pub fn clear_intervals_api_key(state: State<'_, AppState>) -> Result<IntervalsStatus, String> {
+    let removed = state.storage.clear_intervals()?;
+    tracing::info!(
+        removed_mirrored_workouts = removed,
+        "Intervals.icu key cleared"
+    );
+    intervals_sync::status(&state.storage)
 }
 
 #[tauri::command]
-pub fn save_intervals_api_key(state: State<'_, AppState>, api_key: String) -> Result<(), String> {
-    state.storage.save_intervals_api_key(&api_key)
+pub fn set_intervals_sync_settings(
+    state: State<'_, AppState>,
+    settings: IntervalsSyncSettings,
+) -> Result<IntervalsStatus, String> {
+    tracing::info!(?settings, "command set_intervals_sync_settings");
+    intervals_sync::update_settings(&state.storage, settings)
+}
+
+/// Refresh the calendar cache and the mirrored library, whichever are on.
+#[tauri::command]
+pub async fn sync_intervals(state: State<'_, AppState>) -> Result<IntervalsSyncReport, String> {
+    tracing::info!("command sync_intervals");
+    intervals_sync::sync_intervals(&state.storage).await
 }
 
 #[tauri::command]
-pub fn clear_intervals_api_key(state: State<'_, AppState>) -> Result<(), String> {
-    state.storage.clear_intervals_api_key()
+pub async fn planned_workouts(state: State<'_, AppState>) -> Result<Vec<PlannedWorkout>, String> {
+    let storage = Arc::clone(&state.storage);
+    blocking(move || storage.planned_workouts()).await
 }
 
 /// Pull FTP, max HR and (when the rider has asked for them) the power and
@@ -346,7 +383,8 @@ pub async fn sync_training_settings(
         .intervals_api_key()?
         .ok_or_else(|| "Save an Intervals.icu API key before syncing".to_string())?;
     let client = IntervalsClient::new(&api_key)?;
-    let settings = client.cycling_settings("0").await?.ok_or_else(|| {
+    let athlete = resolve_athlete(&state.storage, &client).await?;
+    let settings = client.cycling_settings(&athlete.id).await?.ok_or_else(|| {
         "Intervals.icu has no cycling (Ride) settings for this athlete".to_string()
     })?;
     let profile = state.storage.profile()?;
@@ -752,7 +790,11 @@ pub async fn get_workout(state: State<'_, AppState>, id: Uuid) -> Result<Option<
 pub async fn delete_workout(state: State<'_, AppState>, id: Uuid) -> Result<(), String> {
     tracing::info!(workout_id = %id, "Deleting workout");
     let storage = Arc::clone(&state.storage);
-    blocking(move || storage.delete_workout(id)).await
+    blocking(move || {
+        intervals_sync::ensure_editable(&storage, id, None)?;
+        storage.delete_workout(id)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -763,6 +805,7 @@ pub async fn save_workout(
     workout.updated_at = Utc::now();
     let storage = Arc::clone(&state.storage);
     blocking(move || {
+        intervals_sync::ensure_editable(&storage, workout.id, Some(&workout))?;
         if let Err(error) = storage.save_workout(&workout) {
             tracing::error!(
                 workout_id = %workout.id,
@@ -910,7 +953,7 @@ pub async fn start_workout(
     tracing::debug!(workout_id = %workout_id, "command start_workout");
     let workout = state
         .storage
-        .workout(workout_id)?
+        .rideable_workout(workout_id)?
         .ok_or_else(|| "Workout not found".to_string())?;
     let profile = state.storage.profile()?;
     state

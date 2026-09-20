@@ -310,6 +310,20 @@ textarea { min-height: 70px; resize: vertical; }
 .zone-editor-head > span { padding: 2px 7px; border: 1px solid #3a4137; border-radius: 99px; color: #8f9988; font-size: 9px; text-transform: uppercase; letter-spacing: .07em; }
 .zone-editor-head .text-button { margin-left: auto; }
 .zone-sync-toggle { padding: 8px 10px; }
+.settings-note.warn { color: #f4d35e; }
+
+/* Today's plan from Intervals.icu on the home screen. */
+.today-card { display: grid; gap: 12px; margin-bottom: 18px; }
+.today-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.today-head h2 { margin: 4px 0 0; }
+.today-entry { display: grid; gap: 10px; }
+.today-entry h3 { margin: 0; }
+.today-visual { height: 96px; }
+.today-stats { display: flex; gap: 22px; }
+.today-description { margin: 0; color: #a4ad9f; font-size: 12px; white-space: pre-line; }
+.today-entry > button { justify-self: start; }
+.today-sync { margin: 0; }
+.today-chip { display: inline-block; margin-right: 7px; padding: 1px 7px; border-radius: 99px; background: #c8ff32; color: #101410; font-size: 9px; font-style: normal; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; vertical-align: middle; }
 .zone-boundaries { display: grid; gap: 5px; }
 .zone-boundary { display: grid; grid-template-columns: 5px minmax(90px, 1fr) minmax(135px, auto); align-items: center; gap: 8px; padding: 6px 8px; border: 1px solid #2d322b; border-radius: 7px; background: #151814; }
 .zone-boundary > i { width: 5px; height: 28px; border-radius: 4px; }
