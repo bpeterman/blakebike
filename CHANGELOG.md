@@ -19,6 +19,10 @@ Conventions:
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-20
+
+Pick which Intervals.icu FTP your power zones sync from.
+
 ### Added
 
 - An FTP source setting on the Intervals.icu card: sync your FTP from your indoor FTP (the default), your FTP, or the eFTP Intervals.icu models from your recent rides. Power zones scale from whichever one you pick, and if Intervals.icu has no number there the sync falls back to one it does have and the status line names it.
