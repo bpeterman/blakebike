@@ -65,6 +65,10 @@ const RETRY_AFTER: Duration = Duration::from_secs(2);
 const FAILURES_BEFORE_LOST: u8 = 3;
 /// How long the writer waits for the trainer to acknowledge Stop at the end.
 const STOP_GRACE: Duration = Duration::from_secs(3);
+/// How long a pause may go unacknowledged before the rider is told that the
+/// trainer might still be holding resistance. A healthy trainer answers well
+/// inside this, so an ordinary pause never raises the warning.
+const PAUSE_ACK_GRACE: Duration = Duration::from_millis(500);
 /// How long the ride waits for the recorder to write the last samples.
 const FLUSH_GRACE: Duration = Duration::from_secs(5);
 /// Samples the recorder keeps while the database stays unwritable (about ten
@@ -1186,10 +1190,19 @@ async fn target_writer(
                 Phase::Paused => {
                     if !pause_acknowledged {
                         attempted = true;
-                        // Until the acknowledgement arrives, the trainer may
-                        // still be applying the previous resistance.
-                        status_tx.send_replace(ControlStatus::Degraded);
-                        result = devices.pause().await;
+                        // A normal pause is acknowledged within a round trip,
+                        // so saying so would only flash a warning at the rider.
+                        // Past the grace the trainer may really still be
+                        // applying the previous resistance: then say it.
+                        let pause = devices.pause();
+                        tokio::pin!(pause);
+                        result = match tokio::time::timeout(PAUSE_ACK_GRACE, &mut pause).await {
+                            Ok(result) => result,
+                            Err(_) => {
+                                report(&status_tx, ControlStatus::Degraded);
+                                pause.await
+                            }
+                        };
                         if result.is_ok() {
                             pause_acknowledged = true;
                             started = false;
@@ -1240,15 +1253,7 @@ async fn target_writer(
                 };
             }
         }
-        status_tx.send_if_modified(|current| {
-            if *current == status {
-                false
-            } else {
-                tracing::info!(from = ?*current, to = ?status, "Trainer control status changed");
-                *current = status;
-                true
-            }
-        });
+        report(&status_tx, status);
 
         // Wait for a reason to act again: a new intent, a link state change,
         // or the retry / keepalive timer.
@@ -1283,6 +1288,19 @@ async fn target_writer(
             }
         }
     }
+}
+
+/// Publish a control status, logging only the real transitions.
+fn report(status_tx: &watch::Sender<ControlStatus>, status: ControlStatus) {
+    status_tx.send_if_modified(|current| {
+        if *current == status {
+            false
+        } else {
+            tracing::info!(from = ?*current, to = ?status, "Trainer control status changed");
+            *current = status;
+            true
+        }
+    });
 }
 
 async fn classify_failure(
@@ -2424,6 +2442,48 @@ mod tests {
         if failures >= 3 {
             assert!(rig.hub.slot(DeviceRole::Trainer).stats().drops > 0);
         }
+        rig.runner.stop_and_wait(Duration::from_secs(5)).await;
+        rig.hub.disconnect().await;
+    }
+
+    /// A pause that the trainer acknowledges normally must never flash the
+    /// "pause not confirmed" warning, however long the round trip takes.
+    #[tokio::test]
+    async fn an_acknowledged_pause_never_reports_degraded() {
+        let rig = rig().await;
+        rig.runner
+            .start_free_ride(None, 800, 84.0, rig.hub.clone(), rig.storage.clone())
+            .await
+            .unwrap();
+        wait_for(&rig.runner, |s| matches!(s, RunnerState::Running { .. })).await;
+        rig.hub
+            .simulated_faults()
+            .ack_delay_ms
+            .store(200, Ordering::Relaxed);
+        rig.runner.pause_or_resume().await.unwrap();
+        // While the acknowledgement is still in flight the rider sees a plain
+        // paused ride, not a warning.
+        for _ in 0..4 {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            assert_eq!(
+                control_of(&rig.runner.state().await),
+                Some(ControlStatus::Ok)
+            );
+        }
+        wait_for(&rig.runner, |s| {
+            matches!(
+                s,
+                RunnerState::Paused {
+                    control: ControlStatus::Ok,
+                    ..
+                }
+            )
+        })
+        .await;
+        rig.hub
+            .simulated_faults()
+            .ack_delay_ms
+            .store(0, Ordering::Relaxed);
         rig.runner.stop_and_wait(Duration::from_secs(5)).await;
         rig.hub.disconnect().await;
     }

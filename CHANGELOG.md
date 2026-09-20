@@ -51,6 +51,10 @@ Syncing from Intervals.icu now says exactly what it changes, imports heart-rate 
 - Pressing Refresh silently saved whatever you had half-typed in the zone editors. The sync button now waits until unsaved profile or zone edits are saved, and says so.
 - A failed zone request used to be reported as "Intervals.icu did not return usable training zones" while the FTP was written anyway. The sync is now a single request: if it fails nothing changes and the error says why; if it succeeds, missing zones are reported as not configured rather than as a failure.
 
+### Fixed
+
+- Pausing a ride no longer flashes "Trainer pause not confirmed" every time. The warning now waits to see whether the trainer is actually slow to acknowledge the pause, so it only appears when the trainer really might still be holding resistance.
+
 ## [0.3.0] - 2026-09-19
 
 A "Stats for nerds" card for diagnosing your connected devices, and zeroing power meters and trainer spin-downs right from the app.

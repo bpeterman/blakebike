@@ -163,8 +163,12 @@ describe("connect all", () => {
 });
 
 describe("calibration", () => {
+  // A fixed clock: ages are read back against exactly the base they were
+  // built from, so a millisecond ticking mid-test cannot move an age across
+  // a boundary like "2 h ago".
+  const now = Date.parse("2026-09-18T12:00:00Z");
   const zero = (offsetRaw: number | null, ageMs = 0): CalibrationRecord => ({
-    at: new Date(Date.now() - ageMs).toISOString(),
+    at: new Date(now - ageMs).toISOString(),
     kind: "zeroOffset",
     offsetRaw,
   });
@@ -184,7 +188,6 @@ describe("calibration", () => {
   });
 
   it("summarises the last calibration for a card line", () => {
-    const now = Date.now();
     expect(calibrationSummary(null, now)).toBeNull();
     expect(calibrationSummary(zero(1023, 2 * 3_600_000), now)).toBe("Zeroed 2 h ago · offset 1023");
     expect(calibrationSummary(zero(null, 30_000), now)).toBe("Zeroed just now");
@@ -211,7 +214,6 @@ describe("calibration", () => {
   });
 
   it("nudges for a zero when there is no record or it is older than a day", () => {
-    const now = Date.now();
     expect(zeroOffsetIsDue(null, now)).toBe(true);
     expect(zeroOffsetIsDue(zero(1000, 3_600_000), now)).toBe(false);
     expect(zeroOffsetIsDue(zero(1000, 25 * 3_600_000), now)).toBe(true);
