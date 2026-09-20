@@ -309,6 +309,7 @@ textarea { min-height: 70px; resize: vertical; }
 .zone-editor-head { display: flex; align-items: center; gap: 9px; }
 .zone-editor-head > span { padding: 2px 7px; border: 1px solid #3a4137; border-radius: 99px; color: #8f9988; font-size: 9px; text-transform: uppercase; letter-spacing: .07em; }
 .zone-editor-head .text-button { margin-left: auto; }
+.zone-sync-toggle { padding: 8px 10px; }
 .zone-boundaries { display: grid; gap: 5px; }
 .zone-boundary { display: grid; grid-template-columns: 5px minmax(90px, 1fr) minmax(135px, auto); align-items: center; gap: 8px; padding: 6px 8px; border: 1px solid #2d322b; border-radius: 7px; background: #151814; }
 .zone-boundary > i { width: 5px; height: 28px; border-radius: 4px; }

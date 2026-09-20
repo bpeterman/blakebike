@@ -83,12 +83,14 @@ import type {
   WorkoutInterval,
   WorkoutStep,
   ZoneDefinition,
+  ZoneMode,
 } from "./types";
 import {
   BIAS_STEP_PERCENT,
   clampBias,
   compileWorkoutIntervals,
   defaultTrainingZoneSettings,
+  describeTrainingSync,
   deviceRoleLabel,
   deviceRoles,
   formatDistance,
@@ -104,6 +106,7 @@ import {
   withActiveElapsed,
   withSmoothedPower,
   workoutDuration,
+  zoneModeLabel,
 } from "./types";
 import {
   resolveRideField,
@@ -569,12 +572,12 @@ function App() {
             onConnect={() => setDevicePicker("trainer")}
             onRide={openRide}
             onNavigate={setPage}
-            onRefreshFtp={() =>
+            onSyncTrainingSettings={() =>
               perform(async () => {
-                const result = await api.refreshEstimatedFtp();
+                const result = await api.syncTrainingSettings();
                 setProfile(result.profile);
                 setTrainingZones(result.zones);
-              }, "refresh training settings")
+              }, "sync training settings")
             }
           />
         )}
@@ -843,7 +846,7 @@ function Overview({
   onConnect,
   onRide,
   onNavigate,
-  onRefreshFtp,
+  onSyncTrainingSettings,
 }: {
   profile: Profile;
   powerZones: readonly ZoneDefinition[];
@@ -854,16 +857,16 @@ function Overview({
   onConnect: () => void;
   onRide: (id: string) => void;
   onNavigate: (page: Page) => void;
-  onRefreshFtp: () => Promise<void>;
+  onSyncTrainingSettings: () => Promise<void>;
 }) {
   const latest = sessions[0];
-  const [refreshingFtp, setRefreshingFtp] = useState(false);
-  const refreshFtp = async () => {
-    setRefreshingFtp(true);
+  const [syncingTraining, setSyncingTraining] = useState(false);
+  const syncTraining = async () => {
+    setSyncingTraining(true);
     try {
-      await onRefreshFtp();
+      await onSyncTrainingSettings();
     } finally {
-      setRefreshingFtp(false);
+      setSyncingTraining(false);
     }
   };
   return (
@@ -880,12 +883,12 @@ function Overview({
         <article className="card ftp-card">
           <button
             className="icon-button ftp-refresh"
-            title="Refresh from Intervals.icu"
-            aria-label="Refresh from Intervals.icu"
-            disabled={refreshingFtp}
-            onClick={() => void refreshFtp()}
+            title="Sync from Intervals.icu"
+            aria-label="Sync from Intervals.icu"
+            disabled={syncingTraining}
+            onClick={() => void syncTraining()}
           >
-            <RefreshCw size={16} className={refreshingFtp ? "spinning" : ""} />
+            <RefreshCw size={16} className={syncingTraining ? "spinning" : ""} />
           </button>
           <span className="label">CURRENT FTP</span>
           <div className="big-number">{profile.ftpWatts}<small> W</small></div>
@@ -1698,8 +1701,9 @@ export function SettingsPage({
   const [rideFilesPath, setRideFilesPath] = useState("Loading ride files location…");
   const [apiKey, setApiKey] = useState("");
   const [intervalsConfigured, setIntervalsConfigured] = useState(false);
-  const [intervalsBusy, setIntervalsBusy] = useState<"save" | "clear" | "refresh" | null>(null);
-  const [intervalsRefreshStatus, setIntervalsRefreshStatus] = useState<string | null>(null);
+  const [intervalsBusy, setIntervalsBusy] = useState<"save" | "clear" | "sync" | null>(null);
+  const [intervalsSyncStatus, setIntervalsSyncStatus] = useState<string | null>(null);
+  const [zoneSyncConfirm, setZoneSyncConfirm] = useState<"power" | "heartRate" | null>(null);
   useEffect(() => {
     void api.logFilePath().then(setLogPath);
     void api.rideFilesPath().then(setRideFilesPath);
@@ -1730,22 +1734,43 @@ export function SettingsPage({
     setIntervalsBusy(null);
   };
 
-  const refreshEstimatedFtp = async () => {
-    setIntervalsBusy("refresh");
+  const syncTrainingSettings = async () => {
+    setIntervalsBusy("sync");
     await perform(async () => {
-      await api.saveTrainingZones(zoneDraft);
-      const result = await api.refreshEstimatedFtp();
+      const result = await api.syncTrainingSettings();
       onProfileUpdate(result.profile);
       onTrainingZonesUpdate(result.zones);
-      setIntervalsRefreshStatus(
-        result.powerZonesImported
-          ? "FTP, heart-rate zones, and power zones updated."
-          : result.heartRateZonesImported
-            ? "FTP and heart-rate zones updated. Power zones were not imported."
-            : "FTP updated. Intervals.icu did not return usable training zones.",
-      );
-    }, "refresh training settings");
+      setIntervalsSyncStatus(describeTrainingSync(result));
+    }, "sync training settings");
     setIntervalsBusy(null);
+  };
+
+  // A sync result replaces both drafts, so unsaved edits would be lost: the
+  // button waits until they are saved (or discarded) rather than saving them
+  // behind the rider's back.
+  const profileDirty = JSON.stringify(draft) !== JSON.stringify(profile);
+  const zonesDirty = JSON.stringify(zoneDraft) !== JSON.stringify(trainingZones);
+  const unsavedHint =
+    profileDirty && zonesDirty
+      ? "Save your rider profile and zone settings first."
+      : profileDirty
+        ? "Save your rider profile first."
+        : zonesDirty
+          ? "Save your zone settings first."
+          : null;
+
+  const setZoneSync = (set: "power" | "heartRate", enabled: boolean) =>
+    setZoneDraft(
+      set === "power"
+        ? { ...zoneDraft, syncPowerZonesFromIntervals: enabled }
+        : { ...zoneDraft, syncHeartRateZonesFromIntervals: enabled },
+    );
+  // Turning import on over hand-edited zones destroys them on the next sync,
+  // so that one transition asks first.
+  const requestZoneSync = (set: "power" | "heartRate", enabled: boolean) => {
+    const mode = set === "power" ? zoneDraft.powerMode : zoneDraft.heartRateMode;
+    if (enabled && mode === "custom") setZoneSyncConfirm(set);
+    else setZoneSync(set, enabled);
   };
 
   return (
@@ -1767,30 +1792,16 @@ export function SettingsPage({
         <div>
           <span className="label">TRAINING ZONES</span>
           <h2>Power and heart rate</h2>
-          <p>Defaults follow your FTP and maximum heart rate. Editing a boundary switches that set to custom values.</p>
+          <p>Defaults follow your FTP and maximum heart rate. Editing a boundary switches that set to custom values. Turn on import for a set to replace it with your Intervals.icu zones whenever you sync.</p>
         </div>
         <div className="zone-settings">
-          <label className="settings-toggle">
-            <input
-              type="checkbox"
-              checked={zoneDraft.syncPowerZonesFromIntervals}
-              onChange={(event) =>
-                setZoneDraft({
-                  ...zoneDraft,
-                  syncPowerZonesFromIntervals: event.target.checked,
-                })
-              }
-            />
-            <span>
-              Import power zones from Intervals.icu
-              <small>Applied when training settings are refreshed below.</small>
-            </span>
-          </label>
           <ZoneEditor
             title="Power"
             unit="W"
             mode={zoneDraft.powerMode}
             zones={effectivePowerZones(zoneDraft, draft.ftpWatts)}
+            syncFromIntervals={zoneDraft.syncPowerZonesFromIntervals}
+            onSyncFromIntervals={(enabled) => requestZoneSync("power", enabled)}
             onChange={(zones) => setZoneDraft({ ...zoneDraft, powerMode: "custom", powerZones: zones })}
             onReset={() => setZoneDraft({ ...zoneDraft, powerMode: "derived", powerZones: [] })}
           />
@@ -1799,17 +1810,31 @@ export function SettingsPage({
             unit="bpm"
             mode={zoneDraft.heartRateMode}
             zones={effectiveHeartRateZones(zoneDraft, draft.maxHeartRateBpm)}
+            syncFromIntervals={zoneDraft.syncHeartRateZonesFromIntervals}
+            onSyncFromIntervals={(enabled) => requestZoneSync("heartRate", enabled)}
             onChange={(zones) => setZoneDraft({ ...zoneDraft, heartRateMode: "custom", heartRateZones: zones })}
             onReset={() => setZoneDraft({ ...zoneDraft, heartRateMode: "derived", heartRateZones: [] })}
           />
           <button className="primary" type="button" onClick={() => onSaveTrainingZones(zoneDraft)}>Save zone settings</button>
         </div>
       </section>
+      {zoneSyncConfirm && (
+        <ConfirmDialog
+          title={`Replace your custom ${zoneSyncConfirm === "power" ? "power" : "heart-rate"} zones?`}
+          description="The next sync from Intervals.icu overwrites the boundaries you set by hand. Nothing changes until you sync."
+          confirmLabel="Replace on sync"
+          onClose={() => setZoneSyncConfirm(null)}
+          onConfirm={() => {
+            setZoneSync(zoneSyncConfirm, true);
+            setZoneSyncConfirm(null);
+          }}
+        />
+      )}
       <section className="card settings-card">
         <div>
           <span className="label">INTERVALS.ICU</span>
-          <h2>FTP and training zones</h2>
-          <p>Connect your Intervals.icu account to import modeled eFTP, cycling heart-rate zones, and power zones when enabled above.</p>
+          <h2>Intervals.icu</h2>
+          <p>Sync pulls your FTP and maximum heart rate from your Intervals.icu cycling settings. Power and heart-rate zones are imported only when you turn them on in Training zones above.</p>
           <span className={`integration-status ${intervalsConfigured ? "configured" : ""}`}>
             {intervalsConfigured ? "API key saved" : "API key not configured"}
           </span>
@@ -1846,12 +1871,13 @@ export function SettingsPage({
           </div>
           <button
             className="primary"
-            disabled={!intervalsConfigured || intervalsBusy !== null}
-            onClick={() => void refreshEstimatedFtp()}
+            disabled={!intervalsConfigured || intervalsBusy !== null || unsavedHint !== null}
+            onClick={() => void syncTrainingSettings()}
           >
-            {intervalsBusy === "refresh" ? "Refreshing…" : "Refresh training settings"}
+            {intervalsBusy === "sync" ? "Syncing…" : "Sync from Intervals.icu"}
           </button>
-          {intervalsRefreshStatus && <p className="integration-result">{intervalsRefreshStatus}</p>}
+          {intervalsConfigured && unsavedHint && <p className="settings-note">{unsavedHint}</p>}
+          {intervalsSyncStatus && <p className="integration-result">{intervalsSyncStatus}</p>}
         </div>
       </section>
       <section className="card settings-card"><div><span className="label">DATA & DIAGNOSTICS</span><h2>Local-first by design</h2><p>Every finalized ride is stored in SQLite and as a persistent Garmin-compatible FIT file. Missing FIT files are regenerated automatically.</p></div><div className="data-locations"><div className="log-location"><span>Ride Files</span><code>{rideFilesPath}</code><button className="secondary" onClick={() => void api.revealRideFiles().catch(() => undefined)}>Show Ride Files</button></div><div className="log-location"><span>Log file</span><code>{logPath}</code><button className="secondary" onClick={() => void api.revealLogFile().catch(() => undefined)}>Show in folder</button><button className="secondary" onClick={() => void navigator.clipboard.writeText(logPath)}>Copy path</button></div><div className="log-location"><span>Known devices</span><p className="settings-note">Devices you have connected are remembered on this computer so they can be reconnected without scanning. Forgetting them does not disconnect anything.</p><button className="danger-button" onClick={() => void onForgetDevices()}>Forget all devices</button></div></div></section>
@@ -2149,13 +2175,18 @@ function ZoneEditor({
   unit,
   mode,
   zones,
+  syncFromIntervals,
+  onSyncFromIntervals,
   onChange,
   onReset,
 }: {
   title: string;
   unit: string;
-  mode: "derived" | "custom";
+  mode: ZoneMode;
   zones: ReturnType<typeof effectivePowerZones>;
+  /** Whether a sync from Intervals.icu replaces this set. */
+  syncFromIntervals: boolean;
+  onSyncFromIntervals: (enabled: boolean) => void;
   onChange: (zones: ReturnType<typeof effectivePowerZones>) => void;
   onReset: () => void;
 }) {
@@ -2165,9 +2196,24 @@ function ZoneEditor({
     <div className="zone-editor">
       <div className="zone-editor-head">
         <strong>{title}</strong>
-        <span>{mode === "derived" ? "Derived" : "Custom"}</span>
-        {mode === "custom" && <button type="button" className="text-button" onClick={onReset}>Reset defaults</button>}
+        <span>{zoneModeLabel[mode]}</span>
+        {mode !== "derived" && <button type="button" className="text-button" onClick={onReset}>Reset defaults</button>}
       </div>
+      <label className="settings-toggle zone-sync-toggle">
+        <input
+          type="checkbox"
+          checked={syncFromIntervals}
+          onChange={(event) => onSyncFromIntervals(event.target.checked)}
+        />
+        <span>
+          Import {title.toLowerCase()} zones from Intervals.icu
+          <small>
+            {syncFromIntervals && mode === "custom"
+              ? "Import is on: the next sync replaces the boundaries you edited by hand."
+              : "Applied when you sync from Intervals.icu below."}
+          </small>
+        </span>
+      </label>
       <div className="zone-boundaries">
         {zones.map((zone, index) => (
           <div className="zone-boundary" key={`${title}-${index}`}>
@@ -2313,7 +2359,7 @@ function workingCopy(label: string) {
   if (label.includes("connect")) return "Connecting…";
   if (label.includes("scan")) return "Looking for devices…";
   if (label.includes("export")) return "Preparing export…";
-  if (label.includes("refresh")) return "Refreshing training settings…";
+  if (label.includes("sync")) return "Syncing with Intervals.icu…";
   if (label.includes("stop workout")) return "Saving your ride…";
   if (label.includes("save")) return "Saving…";
   if (label.includes("delete") || label.includes("forget")) return "Removing…";
@@ -2325,7 +2371,7 @@ function successCopy(label: string) {
   if (label.includes("connect")) return label.includes("disconnect") ? "Disconnected" : "Connected and ready";
   if (label.includes("scan")) return "Scan complete";
   if (label.includes("export")) return "Export ready";
-  if (label.includes("refresh")) return "Training settings refreshed";
+  if (label.includes("sync")) return "Synced with Intervals.icu";
   if (label.includes("stop workout")) return "Ride saved. Nice work!";
   if (label.includes("save")) return "Saved";
   if (label.includes("delete") || label.includes("forget")) return "Removed";

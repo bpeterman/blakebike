@@ -296,11 +296,16 @@ export type ZoneDefinition = {
   upperBound: number | null;
 };
 
-export type ZoneMode = "derived" | "custom";
+/**
+ * Where a zone set comes from: following FTP / max HR, edited by hand, or
+ * imported from Intervals.icu. Mirrors `ZoneMode` in storage.rs.
+ */
+export type ZoneMode = "derived" | "custom" | "intervals";
 
 export type TrainingZoneSettings = {
   version: 1;
   syncPowerZonesFromIntervals: boolean;
+  syncHeartRateZonesFromIntervals: boolean;
   powerMode: ZoneMode;
   powerZones: ZoneDefinition[];
   heartRateMode: ZoneMode;
@@ -310,6 +315,7 @@ export type TrainingZoneSettings = {
 export const defaultTrainingZoneSettings: TrainingZoneSettings = {
   version: 1,
   syncPowerZonesFromIntervals: false,
+  syncHeartRateZonesFromIntervals: false,
   powerMode: "derived",
   powerZones: [],
   heartRateMode: "derived",
@@ -346,7 +352,7 @@ export const effectivePowerZones = (
   settings: TrainingZoneSettings,
   ftpWatts: number,
 ): ZoneDefinition[] =>
-  settings.powerMode === "custom" && settings.powerZones.length > 1
+  settings.powerMode !== "derived" && settings.powerZones.length > 1
     ? settings.powerZones
     : derivedPowerZones(ftpWatts);
 
@@ -354,9 +360,70 @@ export const effectiveHeartRateZones = (
   settings: TrainingZoneSettings,
   maxHeartRateBpm: number,
 ): ZoneDefinition[] =>
-  settings.heartRateMode === "custom" && settings.heartRateZones.length > 1
+  settings.heartRateMode !== "derived" && settings.heartRateZones.length > 1
     ? settings.heartRateZones
     : derivedHeartRateZones(maxHeartRateBpm);
+
+export const zoneModeLabel: Record<ZoneMode, string> = {
+  derived: "Derived",
+  custom: "Custom",
+  intervals: "From Intervals.icu",
+};
+
+/** One zone set's fate in a training-settings sync. Mirrors `ZoneSetOutcome` in commands.rs. */
+export type ZoneSetOutcome =
+  | { status: "imported" | "unchanged" | "syncOff" | "notConfigured" }
+  | { status: "invalid"; reason: string };
+
+/** Mirrors `TrainingSyncResult` in commands.rs. */
+export type TrainingSyncResult = {
+  profile: Profile;
+  zones: TrainingZoneSettings;
+  ftp: { watts: number; previousWatts: number; source: "indoorFtp" | "ftp" };
+  /** null when Intervals.icu has no max HR and the local value was kept. */
+  maxHeartRate: { bpm: number; previousBpm: number } | null;
+  powerZones: ZoneSetOutcome;
+  heartRateZones: ZoneSetOutcome;
+};
+
+const describeZoneSet = (label: string, outcome: ZoneSetOutcome): string => {
+  switch (outcome.status) {
+    case "imported":
+      return `${label} zones imported`;
+    case "unchanged":
+      return `${label} zones already up to date`;
+    case "syncOff":
+      return `${label} zones not imported (import is off)`;
+    case "notConfigured":
+      return `Intervals.icu has no ${label.toLowerCase()} zones`;
+    case "invalid":
+      return `${label} zones not imported: ${outcome.reason}`;
+  }
+};
+
+/** The status line shown after a training-settings sync, one clause per item. */
+export const describeTrainingSync = (result: TrainingSyncResult): string => {
+  const ftpSource = result.ftp.source === "indoorFtp" ? "indoor FTP" : "FTP";
+  const ftpChange =
+    result.ftp.watts === result.ftp.previousWatts
+      ? "unchanged"
+      : `was ${result.ftp.previousWatts} W`;
+  const clauses = [
+    `FTP ${result.ftp.watts} W from your Intervals.icu ${ftpSource} (${ftpChange})`,
+  ];
+  if (result.maxHeartRate === null) {
+    clauses.push("Intervals.icu has no max HR; yours is unchanged");
+  } else {
+    const change =
+      result.maxHeartRate.bpm === result.maxHeartRate.previousBpm
+        ? "unchanged"
+        : `was ${result.maxHeartRate.previousBpm} bpm`;
+    clauses.push(`Max HR ${result.maxHeartRate.bpm} bpm (${change})`);
+  }
+  clauses.push(describeZoneSet("Power", result.powerZones));
+  clauses.push(describeZoneSet("Heart-rate", result.heartRateZones));
+  return clauses.join(" · ");
+};
 
 export const zoneIndex = (value: number, zones: readonly ZoneDefinition[]): number =>
   zones.findIndex((zone) => zone.upperBound === null || value <= zone.upperBound);

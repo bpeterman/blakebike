@@ -48,12 +48,16 @@ pub struct ZoneDefinition {
     pub upper_bound: Option<u16>,
 }
 
+/// Where a zone set comes from. `Derived` follows FTP / max HR, `Custom` was
+/// edited by hand, `Intervals` was imported from Intervals.icu. Keeping the
+/// last two apart is what lets a sync avoid overwriting hand-tuned zones.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ZoneMode {
     #[default]
     Derived,
     Custom,
+    Intervals,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -61,6 +65,7 @@ pub enum ZoneMode {
 pub struct TrainingZoneSettings {
     pub version: u8,
     pub sync_power_zones_from_intervals: bool,
+    pub sync_heart_rate_zones_from_intervals: bool,
     pub power_mode: ZoneMode,
     pub power_zones: Vec<ZoneDefinition>,
     pub heart_rate_mode: ZoneMode,
@@ -72,6 +77,7 @@ impl Default for TrainingZoneSettings {
         Self {
             version: 1,
             sync_power_zones_from_intervals: false,
+            sync_heart_rate_zones_from_intervals: false,
             power_mode: ZoneMode::Derived,
             power_zones: Vec::new(),
             heart_rate_mode: ZoneMode::Derived,
@@ -96,7 +102,7 @@ impl TrainingZoneSettings {
     }
 }
 
-fn validate_zones(
+pub(crate) fn validate_zones(
     label: &str,
     mode: ZoneMode,
     zones: &[ZoneDefinition],
@@ -710,47 +716,28 @@ impl Storage {
     }
 
     pub fn save_profile(&self, profile: &Profile) -> Result<(), String> {
-        if profile.name.trim().is_empty() || !(50..=500).contains(&profile.ftp_watts) {
-            return Err("Enter a name and an FTP between 50 and 500 watts".into());
-        }
-        if !(100..=230).contains(&profile.max_heart_rate_bpm) {
-            return Err("Enter a maximum heart rate between 100 and 230 bpm".into());
-        }
-        if !(100..=2_500).contains(&profile.max_power_watts) {
-            return Err("Enter a safety power limit between 100 and 2500 watts".into());
-        }
-        if !(30.0..=250.0).contains(&profile.rider_weight_kg)
-            || !(3.0..=40.0).contains(&profile.bike_weight_kg)
-        {
-            return Err("Enter a rider weight from 30–250 kg and bike weight from 3–40 kg".into());
-        }
-        self.connection()?
-            .execute(
-                "INSERT INTO profiles(
-                   id, name, ftp_watts, max_power_watts, rider_weight_kg, bike_weight_kg,
-                   weight_unit, distance_unit, max_heart_rate_bpm, active
-                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1)
-                 ON CONFLICT(id) DO UPDATE SET name = excluded.name,
-                   ftp_watts = excluded.ftp_watts, max_power_watts = excluded.max_power_watts,
-                   rider_weight_kg = excluded.rider_weight_kg,
-                   bike_weight_kg = excluded.bike_weight_kg,
-                   weight_unit = excluded.weight_unit,
-                   distance_unit = excluded.distance_unit,
-                   max_heart_rate_bpm = excluded.max_heart_rate_bpm",
-                params![
-                    profile.id.to_string(),
-                    profile.name,
-                    profile.ftp_watts,
-                    profile.max_power_watts,
-                    profile.rider_weight_kg,
-                    profile.bike_weight_kg,
-                    weight_unit_value(profile.weight_unit),
-                    distance_unit_value(profile.distance_unit),
-                    profile.max_heart_rate_bpm,
-                ],
-            )
+        validate_profile(profile)?;
+        let connection = self.connection()?;
+        write_profile(&connection, profile)
+    }
+
+    /// Profile and training zones written together, so an FTP and the zones
+    /// scaled from it can never land half-way (a sync from Intervals.icu
+    /// changes both at once).
+    pub fn save_training_settings(
+        &self,
+        profile: &Profile,
+        zones: &TrainingZoneSettings,
+    ) -> Result<(), String> {
+        validate_profile(profile)?;
+        zones.validate()?;
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction()
             .map_err(|error| error.to_string())?;
-        Ok(())
+        write_profile(&transaction, profile)?;
+        write_setting(&transaction, TRAINING_ZONES_KEY, zones)?;
+        transaction.commit().map_err(|error| error.to_string())
     }
 
     fn setting<T: serde::de::DeserializeOwned>(&self, key: &str) -> Result<Option<T>, String> {
@@ -772,15 +759,8 @@ impl Storage {
     }
 
     fn save_setting<T: serde::Serialize>(&self, key: &str, value: &T) -> Result<(), String> {
-        let json = serde_json::to_string(value).map_err(|error| error.to_string())?;
-        self.reader()?
-            .execute(
-                "INSERT INTO settings(key, value_json) VALUES(?1, ?2)
-                 ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json",
-                params![key, json],
-            )
-            .map_err(|error| error.to_string())?;
-        Ok(())
+        let connection = self.connection()?;
+        write_setting(&connection, key, value)
     }
 
     pub fn intervals_api_key(&self) -> Result<Option<String>, String> {
@@ -1384,6 +1364,72 @@ fn parse_distance_source(value: &str) -> Option<DistanceSource> {
     }
 }
 
+fn validate_profile(profile: &Profile) -> Result<(), String> {
+    if profile.name.trim().is_empty() || !(50..=500).contains(&profile.ftp_watts) {
+        return Err("Enter a name and an FTP between 50 and 500 watts".into());
+    }
+    if !(100..=230).contains(&profile.max_heart_rate_bpm) {
+        return Err("Enter a maximum heart rate between 100 and 230 bpm".into());
+    }
+    if !(100..=2_500).contains(&profile.max_power_watts) {
+        return Err("Enter a safety power limit between 100 and 2500 watts".into());
+    }
+    if !(30.0..=250.0).contains(&profile.rider_weight_kg)
+        || !(3.0..=40.0).contains(&profile.bike_weight_kg)
+    {
+        return Err("Enter a rider weight from 30–250 kg and bike weight from 3–40 kg".into());
+    }
+    Ok(())
+}
+
+/// Upsert the active profile on any connection or transaction.
+fn write_profile(connection: &Connection, profile: &Profile) -> Result<(), String> {
+    connection
+        .execute(
+            "INSERT INTO profiles(
+               id, name, ftp_watts, max_power_watts, rider_weight_kg, bike_weight_kg,
+               weight_unit, distance_unit, max_heart_rate_bpm, active
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1)
+             ON CONFLICT(id) DO UPDATE SET name = excluded.name,
+               ftp_watts = excluded.ftp_watts, max_power_watts = excluded.max_power_watts,
+               rider_weight_kg = excluded.rider_weight_kg,
+               bike_weight_kg = excluded.bike_weight_kg,
+               weight_unit = excluded.weight_unit,
+               distance_unit = excluded.distance_unit,
+               max_heart_rate_bpm = excluded.max_heart_rate_bpm",
+            params![
+                profile.id.to_string(),
+                profile.name,
+                profile.ftp_watts,
+                profile.max_power_watts,
+                profile.rider_weight_kg,
+                profile.bike_weight_kg,
+                weight_unit_value(profile.weight_unit),
+                distance_unit_value(profile.distance_unit),
+                profile.max_heart_rate_bpm,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+/// Upsert one JSON setting on any connection or transaction.
+fn write_setting<T: serde::Serialize>(
+    connection: &Connection,
+    key: &str,
+    value: &T,
+) -> Result<(), String> {
+    let json = serde_json::to_string(value).map_err(|error| error.to_string())?;
+    connection
+        .execute(
+            "INSERT INTO settings(key, value_json) VALUES(?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json",
+            params![key, json],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 fn parse_uuid(value: String) -> rusqlite::Result<Uuid> {
     Uuid::parse_str(&value).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(
@@ -1616,12 +1662,26 @@ mod tests {
             storage.training_zones().unwrap(),
             TrainingZoneSettings::default()
         );
+        assert!(!TrainingZoneSettings::default().sync_power_zones_from_intervals);
+        assert!(!TrainingZoneSettings::default().sync_heart_rate_zones_from_intervals);
         assert_eq!(
             storage.ride_display_preferences().unwrap(),
             RideDisplayPreferences::default()
         );
         let zones = TrainingZoneSettings {
             sync_power_zones_from_intervals: true,
+            sync_heart_rate_zones_from_intervals: true,
+            power_mode: ZoneMode::Intervals,
+            power_zones: vec![
+                ZoneDefinition {
+                    name: "Endurance".into(),
+                    upper_bound: Some(200),
+                },
+                ZoneDefinition {
+                    name: "Threshold".into(),
+                    upper_bound: None,
+                },
+            ],
             heart_rate_mode: ZoneMode::Custom,
             heart_rate_zones: vec![
                 ZoneDefinition {
@@ -1637,6 +1697,33 @@ mod tests {
         };
         storage.save_training_zones(&zones).unwrap();
         assert_eq!(storage.training_zones().unwrap(), zones);
+        // Imported zones are validated like custom ones.
+        let bad_import = TrainingZoneSettings {
+            power_mode: ZoneMode::Intervals,
+            power_zones: vec![ZoneDefinition {
+                name: "Only".into(),
+                upper_bound: None,
+            }],
+            ..TrainingZoneSettings::default()
+        };
+        assert!(storage.save_training_zones(&bad_import).is_err());
+        // Settings written before the heart-rate toggle existed load with it off.
+        storage
+            .save_setting(
+                TRAINING_ZONES_KEY,
+                &serde_json::json!({
+                    "version": 1,
+                    "syncPowerZonesFromIntervals": true,
+                    "powerMode": "derived",
+                    "powerZones": [],
+                    "heartRateMode": "derived",
+                    "heartRateZones": []
+                }),
+            )
+            .unwrap();
+        let loaded = storage.training_zones().unwrap();
+        assert!(loaded.sync_power_zones_from_intervals);
+        assert!(!loaded.sync_heart_rate_zones_from_intervals);
         let mut display = RideDisplayPreferences::default();
         display.screens.swap(0, 1);
         display.screens[0].items.truncate(2);
@@ -1795,6 +1882,41 @@ mod tests {
         storage.clear_intervals_api_key().unwrap();
         assert_eq!(storage.intervals_api_key().unwrap(), None);
         assert!(storage.save_intervals_api_key("  ").is_err());
+    }
+
+    #[test]
+    fn training_settings_save_together_or_not_at_all() {
+        let storage = Storage::in_memory().unwrap();
+        let mut profile = storage.profile().unwrap();
+        profile.ftp_watts = 265;
+        let zones = TrainingZoneSettings {
+            power_mode: ZoneMode::Intervals,
+            power_zones: vec![
+                ZoneDefinition {
+                    name: "Endurance".into(),
+                    upper_bound: Some(199),
+                },
+                ZoneDefinition {
+                    name: "Threshold".into(),
+                    upper_bound: None,
+                },
+            ],
+            ..TrainingZoneSettings::default()
+        };
+        storage.save_training_settings(&profile, &zones).unwrap();
+        assert_eq!(storage.profile().unwrap().ftp_watts, 265);
+        assert_eq!(storage.training_zones().unwrap(), zones);
+
+        // An invalid profile rejects the whole save; the zones stay as they were.
+        let mut bad_profile = profile.clone();
+        bad_profile.ftp_watts = 20;
+        assert!(
+            storage
+                .save_training_settings(&bad_profile, &TrainingZoneSettings::default())
+                .is_err()
+        );
+        assert_eq!(storage.profile().unwrap().ftp_watts, 265);
+        assert_eq!(storage.training_zones().unwrap(), zones);
     }
 
     #[test]
