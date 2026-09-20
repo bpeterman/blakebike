@@ -273,6 +273,7 @@ dependencies = [
  "fit-sdk-rust",
  "futures",
  "keepawake",
+ "percent-encoding",
  "proptest",
  "quick-xml 0.38.4",
  "reqwest 0.12.28",

@@ -25,15 +25,12 @@ use super::{
     fuser::{Reading, TelemetryFuser},
     spawn_ble_link_worker, spawn_link_worker,
 };
-use crate::{
-    domain::Telemetry,
-    ftms::{
-        FITNESS_MACHINE_CONTROL_POINT, FITNESS_MACHINE_FEATURE, FITNESS_MACHINE_STATUS, FtmsError,
-        INDOOR_BIKE_DATA, ResponseCode, SUPPORTED_POWER_RANGE, SpinDownStatus,
-        parse_control_response, parse_indoor_bike_data, parse_spin_down_response,
-        parse_spin_down_status, request_control, set_target_power, start_or_resume,
-        start_spin_down, stop_or_pause, supports_spin_down,
-    },
+use crate::ftms::{
+    FITNESS_MACHINE_CONTROL_POINT, FITNESS_MACHINE_FEATURE, FITNESS_MACHINE_STATUS, FtmsError,
+    INDOOR_BIKE_DATA, IndoorBikeData, ResponseCode, SUPPORTED_POWER_RANGE, SpinDownStatus,
+    parse_control_response, parse_indoor_bike_data, parse_spin_down_response,
+    parse_spin_down_status, request_control, set_target_power, start_or_resume, start_spin_down,
+    stop_or_pause, supports_spin_down,
 };
 
 pub const SIMULATED_TRAINER_ID: &str = "simulated-trainer";
@@ -415,25 +412,18 @@ impl Trainer {
                             &notification.value,
                             Utc::now().timestamp_millis(),
                         ) {
-                            Ok(telemetry) => {
+                            Ok(data) => {
                                 samples += 1;
                                 slot.record_sample(Some(&notification.value));
                                 if samples == 1 {
-                                    tracing::debug!(?telemetry, "First Indoor Bike Data sample");
+                                    tracing::debug!(?data, "First Indoor Bike Data sample");
                                     slot.note(
                                         "ok",
                                         "First sample received",
-                                        Some(format!(
-                                            "{} W · {} rpm",
-                                            telemetry.power_watts,
-                                            telemetry
-                                                .cadence_rpm
-                                                .map(|c| format!("{c:.0}"))
-                                                .unwrap_or_else(|| "—".into())
-                                        )),
+                                        Some(describe(&data, None)),
                                     );
                                 } else if samples.is_multiple_of(120) {
-                                    tracing::debug!(samples, ?telemetry, "Indoor Bike Data");
+                                    tracing::debug!(samples, ?data, "Indoor Bike Data");
                                 }
                                 if last_summary.elapsed() >= Duration::from_secs(60) {
                                     last_summary = std::time::Instant::now();
@@ -447,11 +437,14 @@ impl Trainer {
                                         )),
                                     );
                                 }
-                                slot.record_reading(describe(&telemetry));
+                                slot.record_reading(describe(&data, None));
                                 fuser.ingest(
                                     DeviceRole::Trainer,
-                                    Reading::Trainer(telemetry),
-                                    Utc::now().timestamp_millis(),
+                                    Reading::Trainer {
+                                        data,
+                                        target_power_watts: None,
+                                    },
+                                    data.timestamp_ms,
                                 );
                             }
                             Err(error) => {
@@ -541,24 +534,27 @@ impl Trainer {
                     power += (requested - power) * 0.18;
                     let elapsed = Utc::now().timestamp_millis() as f32 / 1_000.0;
                     let wobble = elapsed.sin() * 3.0;
-                    let telemetry = Telemetry {
+                    let data = IndoorBikeData {
                         timestamp_ms: Utc::now().timestamp_millis(),
-                        power_watts: (power + wobble).max(0.0) as u16,
+                        power_watts: Some((power + wobble).max(0.0) as u16),
                         cadence_rpm: Some(88.0 + wobble / 2.0),
                         speed_kph: Some(30.0 + wobble / 3.0),
                         heart_rate_bpm: Some((125.0 + requested / 20.0).min(185.0) as u8),
-                        target_power_watts: Some(requested as u16),
                     };
+                    let target_power_watts = Some(requested as u16);
                     slot.record_sample(None);
                     if first {
                         first = false;
                         slot.note("ok", "First sample received", Some("simulated".into()));
                     }
-                    slot.record_reading(describe(&telemetry));
+                    slot.record_reading(describe(&data, target_power_watts));
                     fuser.ingest(
                         DeviceRole::Trainer,
-                        Reading::Trainer(telemetry),
-                        Utc::now().timestamp_millis(),
+                        Reading::Trainer {
+                            data,
+                            target_power_watts,
+                        },
+                        data.timestamp_ms,
                     );
                 }
                 // A dropped simulator is as gone as a dropped trainer.
@@ -624,6 +620,7 @@ impl Trainer {
                     at: Utc::now(),
                     kind: CalibrationKind::SpinDown,
                     offset_raw: None,
+                    previous_offset_raw: None,
                 };
                 self.slot.record_calibration(Some(record.clone())).await;
                 self.slot.note("ok", "Calibration complete", None);
@@ -927,18 +924,25 @@ impl Trainer {
 }
 
 /// One-line summary of an Indoor Bike Data sample for the hub card.
-fn describe(telemetry: &Telemetry) -> String {
-    let mut parts = vec![format!("{} W", telemetry.power_watts)];
-    if let Some(cadence) = telemetry.cadence_rpm {
+fn describe(data: &IndoorBikeData, target_power_watts: Option<u16>) -> String {
+    let mut parts = Vec::new();
+    if let Some(power) = data.power_watts {
+        parts.push(format!("{power} W"));
+    }
+    if let Some(cadence) = data.cadence_rpm {
         parts.push(format!("{cadence:.0} rpm"));
     }
-    if let Some(speed) = telemetry.speed_kph {
+    if let Some(speed) = data.speed_kph {
         parts.push(format!("{speed:.1} km/h"));
     }
-    if let Some(target) = telemetry.target_power_watts {
+    if let Some(target) = target_power_watts {
         parts.push(format!("target {target} W"));
     }
-    parts.join(" · ")
+    if parts.is_empty() {
+        "no power or cadence in frame".into()
+    } else {
+        parts.join(" · ")
+    }
 }
 
 #[cfg(test)]
@@ -961,10 +965,11 @@ mod tests {
     #[tokio::test]
     async fn simulated_target_power_respects_rider_limit() {
         let (telemetry, _) = broadcast::channel(4);
+        let (sources, _) = broadcast::channel(4);
         let trainer = Trainer::new(
             DeviceSlot::new(DeviceRole::Trainer, None),
             Arc::new(Ble::disabled()),
-            Arc::new(TelemetryFuser::new(None, telemetry)),
+            Arc::new(TelemetryFuser::new(None, telemetry, sources)),
         );
         // Nothing connected: commands must fail, not silently "succeed".
         assert_eq!(

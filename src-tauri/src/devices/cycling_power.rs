@@ -515,6 +515,7 @@ pub async fn zero_offset(
                 at: Utc::now(),
                 kind: CalibrationKind::ZeroOffset,
                 offset_raw: Some(offset.raw),
+                previous_offset_raw: previous,
             };
             slot.record_calibration(Some(record.clone())).await;
             slot.set_calibration_requested(false);

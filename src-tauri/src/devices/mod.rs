@@ -39,7 +39,7 @@ use tokio::{
 
 pub use ble::{Capability, DeviceInfo, DeviceTransport};
 pub use control_point::ControlError;
-pub use fuser::{SourcePreferences, TelemetrySources};
+pub use fuser::{SourcePreferences, SourceSample, TelemetrySources};
 pub use log::DeviceLogLine;
 
 use crate::domain::Telemetry;
@@ -47,7 +47,7 @@ use fuser::TelemetryFuser;
 use log::DeviceLog;
 
 /// The job a connected device does. One device per role at a time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum DeviceRole {
     Trainer,
@@ -63,6 +63,25 @@ impl DeviceRole {
         DeviceRole::Power,
         DeviceRole::Cadence,
     ];
+
+    /// Roles whose device measures power. Two of them connected at once is
+    /// what makes a ride a dual-power ride.
+    pub const POWER_CAPABLE: [DeviceRole; 2] = [DeviceRole::Trainer, DeviceRole::Power];
+
+    /// The stable string the frontend and the database use for this role
+    /// (its serde name), e.g. `heartRate`.
+    pub fn id(self) -> &'static str {
+        match self {
+            DeviceRole::Trainer => "trainer",
+            DeviceRole::HeartRate => "heartRate",
+            DeviceRole::Power => "power",
+            DeviceRole::Cadence => "cadence",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<DeviceRole> {
+        DeviceRole::ALL.into_iter().find(|role| role.id() == id)
+    }
 
     pub fn label(self) -> &'static str {
         match self {
@@ -110,6 +129,18 @@ impl DeviceState {
 
     pub fn is_connected(&self) -> bool {
         self.device().is_some()
+    }
+
+    /// The rider has a device in this slot: connected, connecting or on its
+    /// way back. `Idle`, `Scanning` and a given-up `Error` have none.
+    pub fn has_device(&self) -> bool {
+        matches!(
+            self,
+            DeviceState::Connecting { .. }
+                | DeviceState::Reconnecting { .. }
+                | DeviceState::Ready { .. }
+                | DeviceState::Controlling { .. }
+        )
     }
 
     /// True when there is no link to wait on: nothing connected, the link was
@@ -180,13 +211,38 @@ pub enum CalibrationKind {
 }
 
 /// One completed calibration. For a zero offset `offset_raw` is the meter's
-/// answer in its own units; its drift between sessions is what matters.
+/// answer in its own units; its drift between sessions is what matters, so
+/// the zero it replaced travels with it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CalibrationRecord {
     pub at: chrono::DateTime<Utc>,
     pub kind: CalibrationKind,
     pub offset_raw: Option<i16>,
+    /// The offset on record before this one, when there was one. Missing on
+    /// records written before drift was kept.
+    #[serde(default)]
+    pub previous_offset_raw: Option<i16>,
+}
+
+/// A device as it was during a ride, stored with the session so a historical
+/// ride can still name what measured it (and, later, fill a FIT
+/// `device_info` message).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RideDevice {
+    pub role: DeviceRole,
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub transport: DeviceTransport,
+    pub simulated: bool,
+    pub manufacturer: Option<String>,
+    pub model: Option<String>,
+    pub firmware: Option<String>,
+    /// The device's last calibration as the slot knew it when the ride began.
+    #[serde(default)]
+    pub last_calibration: Option<CalibrationRecord>,
 }
 
 /// Procedure-specific numbers carried by a calibration progress event.
@@ -355,6 +411,29 @@ impl DeviceSlot {
 
     pub async fn state(&self) -> DeviceState {
         self.state.borrow().clone()
+    }
+
+    /// Whether a device is in this slot right now (see `DeviceState::has_device`).
+    pub fn has_device(&self) -> bool {
+        self.state.borrow().has_device()
+    }
+
+    /// The connected device as a ride record, or `None` while nothing is
+    /// connected (a device that is still connecting has no details yet).
+    pub fn ride_device(&self) -> Option<RideDevice> {
+        let device = self.state.borrow().device()?.clone();
+        let stats = self.stats();
+        Some(RideDevice {
+            role: self.role,
+            id: device.id,
+            name: device.name,
+            transport: device.transport,
+            simulated: device.simulated,
+            manufacturer: stats.manufacturer,
+            model: stats.model,
+            firmware: stats.firmware,
+            last_calibration: stats.last_calibration,
+        })
     }
 
     pub async fn set_state(&self, next: DeviceState) {
@@ -819,6 +898,9 @@ pub struct DeviceHub {
     scanning: AtomicBool,
     scan_error: std::sync::Mutex<Option<ScanError>>,
     telemetry: broadcast::Sender<Telemetry>,
+    /// Every power-capable device's readings at device rate; see
+    /// `subscribe_sources`.
+    sources: broadcast::Sender<SourceSample>,
     fuser: Arc<fuser::TelemetryFuser>,
     trainer: trainer::Trainer,
     heart_rate: sensor::Sensor,
@@ -847,13 +929,18 @@ impl DeviceHub {
 
     fn build(app: Option<AppHandle>) -> Self {
         let (telemetry, _) = broadcast::channel(256);
+        let (sources, _) = broadcast::channel(512);
         // A hub without a window (tests) never touches the OS Bluetooth stack.
         let ble = Arc::new(if app.is_some() {
             ble::Ble::default()
         } else {
             ble::Ble::disabled()
         });
-        let fuser = Arc::new(fuser::TelemetryFuser::new(app.clone(), telemetry.clone()));
+        let fuser = Arc::new(fuser::TelemetryFuser::new(
+            app.clone(),
+            telemetry.clone(),
+            sources.clone(),
+        ));
         let ant = if app.is_some() {
             ant::Ant::new(true)
         } else {
@@ -893,6 +980,7 @@ impl DeviceHub {
             scanning: AtomicBool::new(false),
             scan_error: std::sync::Mutex::new(None),
             telemetry,
+            sources,
             fuser,
             connect_lock: Mutex::new(()),
             links: DeviceRole::ALL
@@ -943,6 +1031,26 @@ impl DeviceHub {
 
     pub fn subscribe(&self) -> broadcast::Receiver<Telemetry> {
         self.telemetry.subscribe()
+    }
+
+    /// Every trainer and power-meter reading as the device sent it, before
+    /// fusion picks one. The dual-power recording reads this.
+    pub fn subscribe_sources(&self) -> broadcast::Receiver<SourceSample> {
+        self.sources.subscribe()
+    }
+
+    /// Whether the rider has a device in the role's slot (connected, connecting
+    /// or reconnecting).
+    pub fn has_device(&self, role: DeviceRole) -> bool {
+        self.slot(role).has_device()
+    }
+
+    /// The connected devices, one record per role, as a ride stores them.
+    pub fn ride_devices(&self) -> Vec<RideDevice> {
+        DeviceRole::ALL
+            .into_iter()
+            .filter_map(|role| self.slot(role).ride_device())
+            .collect()
     }
 
     pub fn source_preferences(&self) -> SourcePreferences {

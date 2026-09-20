@@ -3,6 +3,7 @@ mod default_workouts;
 mod devices;
 mod distance;
 mod domain;
+mod dual_power;
 mod fit;
 mod formats;
 mod ftms;
@@ -225,6 +226,8 @@ pub fn run() {
             commands::stop_workout,
             commands::list_sessions,
             commands::get_session,
+            commands::get_power_comparison,
+            commands::export_png,
             commands::export_session_csv,
             commands::export_session_fit,
             commands::prepare_garmin_upload,

@@ -42,6 +42,8 @@ tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
 fit-sdk-rust = "0.2.1"
+# Decodes the destination header of the raw-body PNG export.
+percent-encoding = "2"
 # Prevents system/display sleep while a ride is active (IOKit on macOS,
 # ScreenSaver + logind inhibit over D-Bus on Linux).
 keepawake = "0.6"

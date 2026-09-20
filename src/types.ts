@@ -285,6 +285,30 @@ export type CalibrationRecord = {
   at: string;
   kind: CalibrationKind;
   offsetRaw: number | null;
+  /** The zero this one replaced; missing on records written before drift was kept. */
+  previousOffsetRaw?: number | null;
+};
+
+/** A device as it was during a ride, stored with the session. */
+export type RideDevice = {
+  role: DeviceRole;
+  id: string;
+  name: string;
+  transport?: DeviceTransport;
+  simulated: boolean;
+  manufacturer: string | null;
+  model: string | null;
+  firmware: string | null;
+  lastCalibration?: CalibrationRecord | null;
+};
+
+/** One device's own reading before fusion (the dual-power recording). */
+export type SourceSample = {
+  role: DeviceRole;
+  timestampMs: number;
+  powerWatts: number | null;
+  cadenceRpm: number | null;
+  balanceLeftPercent: number | null;
 };
 
 /** Roles whose device can offer a calibration procedure. */
@@ -390,6 +414,8 @@ export type Telemetry = {
   targetPowerWatts: number | null;
   /** Present on live samples from the devices hub; absent on recorded history. */
   sources?: TelemetrySources;
+  /** Every power-capable device's fresh reading, on live samples only. */
+  powerBySource?: Partial<Record<DeviceRole, number>>;
 };
 
 /** How the trainer is keeping up with the ride (absent on older payloads). */
