@@ -222,12 +222,35 @@ describe("Intervals.icu settings", () => {
     const library = screen.getByRole("checkbox", { name: /Mirror the workout library/ });
     const calendar = screen.getByRole("checkbox", { name: /Show today's planned workout/ });
     fireEvent.click(library);
-    expect(onIntervalsSyncSettings).toHaveBeenCalledWith({ calendar: true, library: false });
+    expect(onIntervalsSyncSettings).toHaveBeenCalledWith({ calendar: true, library: false, ftpSource: "indoorFtp" });
     // One round trip at a time: the other toggle waits until this one lands.
     expect(calendar).toBeDisabled();
     await waitFor(() => expect(calendar).toBeEnabled());
     fireEvent.click(calendar);
-    expect(onIntervalsSyncSettings).toHaveBeenLastCalledWith({ calendar: false, library: true });
+    expect(onIntervalsSyncSettings).toHaveBeenLastCalledWith({ calendar: false, library: true, ftpSource: "indoorFtp" });
+  });
+
+  it("saves the FTP source and reports the eFTP the sync used", async () => {
+    const onIntervalsSyncSettings = vi.fn(() => Promise.resolve());
+    renderSettings({ intervalsStatus: connectedStatus, onIntervalsSyncSettings });
+    fireEvent.change(screen.getByLabelText("FTP source"), { target: { value: "estimatedFtp" } });
+    expect(onIntervalsSyncSettings).toHaveBeenCalledWith({
+      ...connectedStatus.settings,
+      ftpSource: "estimatedFtp",
+    });
+
+    vi.mocked(api.syncTrainingSettings).mockResolvedValue({
+      profile,
+      zones: defaultTrainingZoneSettings,
+      ftp: { watts: 301, previousWatts: 280, source: "estimatedFtp" },
+      maxHeartRate: null,
+      powerZones: { status: "syncOff" },
+      heartRateZones: { status: "syncOff" },
+    });
+    fireEvent.click(await screen.findByRole("button", { name: "Sync from Intervals.icu" }));
+    expect(
+      await screen.findByText(/FTP 301 W from your Intervals\.icu eFTP \(was 280 W\)/),
+    ).toBeInTheDocument();
   });
 
   it("runs Sync now through App and reports what changed", async () => {

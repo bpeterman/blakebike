@@ -96,10 +96,23 @@ export const localDateString = (date = new Date()): string => {
 export const plannedOn = (planned: PlannedWorkout[], date: string): PlannedWorkout[] =>
   planned.filter((entry) => entry.date === date);
 
+/**
+ * Which Intervals.icu number a training-settings sync takes the FTP from,
+ * and which one it actually used. Mirrors `FtpSource` in intervals.rs.
+ */
+export type FtpSource = "indoorFtp" | "ftp" | "estimatedFtp";
+
+export const ftpSourceLabel: Record<FtpSource, string> = {
+  indoorFtp: "indoor FTP",
+  ftp: "FTP",
+  estimatedFtp: "eFTP",
+};
+
 /** Mirrors `IntervalsSyncSettings` in storage.rs. */
 export type IntervalsSyncSettings = {
   calendar: boolean;
   library: boolean;
+  ftpSource: FtpSource;
 };
 
 /** Mirrors `IntervalsStatus` in intervals_sync.rs. */
@@ -116,7 +129,7 @@ export const disconnectedIntervalsStatus: IntervalsStatus = {
   configured: false,
   athleteId: null,
   athleteName: null,
-  settings: { calendar: true, library: true },
+  settings: { calendar: true, library: true, ftpSource: "indoorFtp" },
   lastSyncedAt: null,
   lastError: null,
 };
@@ -549,7 +562,7 @@ export type ZoneSetOutcome =
 export type TrainingSyncResult = {
   profile: Profile;
   zones: TrainingZoneSettings;
-  ftp: { watts: number; previousWatts: number; source: "indoorFtp" | "ftp" };
+  ftp: { watts: number; previousWatts: number; source: FtpSource };
   /** null when Intervals.icu has no max HR and the local value was kept. */
   maxHeartRate: { bpm: number; previousBpm: number } | null;
   powerZones: ZoneSetOutcome;
@@ -573,7 +586,7 @@ const describeZoneSet = (label: string, outcome: ZoneSetOutcome): string => {
 
 /** The status line shown after a training-settings sync, one clause per item. */
 export const describeTrainingSync = (result: TrainingSyncResult): string => {
-  const ftpSource = result.ftp.source === "indoorFtp" ? "indoor FTP" : "FTP";
+  const ftpSource = ftpSourceLabel[result.ftp.source];
   const ftpChange =
     result.ftp.watts === result.ftp.previousWatts
       ? "unchanged"

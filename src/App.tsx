@@ -82,6 +82,7 @@ import type {
   Workout,
   WorkoutInterval,
   WorkoutStep,
+  FtpSource,
   IntervalsStatus,
   IntervalsSyncReport,
   IntervalsSyncSettings,
@@ -2172,6 +2173,19 @@ export function SettingsPage({
             )}
           </div>
           <span className="label">TRAINING SETTINGS</span>
+          <label>
+            FTP source
+            <select
+              disabled={!intervalsConfigured || intervalsBusy !== null}
+              value={intervalsStatus.settings.ftpSource}
+              onChange={(event) => void setMirrorSetting({ ftpSource: event.target.value as FtpSource })}
+            >
+              <option value="indoorFtp">Indoor FTP</option>
+              <option value="ftp">FTP</option>
+              <option value="estimatedFtp">eFTP (modeled from your rides)</option>
+            </select>
+          </label>
+          <p className="settings-note">The next sync takes your FTP from this number and scales your power zones from it. If Intervals.icu has no value there, the sync falls back to one it does have and the result says which was used.</p>
           <button
             className="primary"
             disabled={!intervalsConfigured || intervalsBusy !== null || unsavedHint !== null}

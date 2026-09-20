@@ -148,7 +148,7 @@ describe("today's plan on the home screen", () => {
     expect(screen.queryByRole("region", { name: "Today's plan" })).not.toBeInTheDocument();
     cleanup();
     renderOverview({
-      intervalsStatus: { ...connectedStatus, settings: { calendar: false, library: true } },
+      intervalsStatus: { ...connectedStatus, settings: { ...connectedStatus.settings, calendar: false } },
       plannedToday: [planned()],
     });
     expect(screen.queryByRole("region", { name: "Today's plan" })).not.toBeInTheDocument();

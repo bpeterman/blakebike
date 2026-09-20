@@ -185,6 +185,24 @@ impl IntervalsClient {
             .map(normalized_cycling_settings))
     }
 
+    /// The FTP the Intervals.icu power model estimates for riding, as the
+    /// site shows it as "eFTP". `Ok(None)` means the model has no usable
+    /// number yet (too little recent data), which is not an error: the sync
+    /// falls back to a configured FTP.
+    pub async fn estimated_ftp(&self, athlete_id: &str) -> Result<Option<u16>, IntervalsError> {
+        #[derive(Deserialize)]
+        struct MmpModel {
+            ftp: Option<f64>,
+        }
+        let model: MmpModel = self
+            .get_json(
+                &format!("/api/v1/athlete/{athlete_id}/mmp-model?type=Ride&fields=ftp"),
+                "power model",
+            )
+            .await?;
+        Ok(in_range(model.ftp, 50.0, 500.0))
+    }
+
     /// Planned cycling workouts between two local dates, inclusive, with
     /// their structure decoded from the ZWO Intervals.icu attaches when asked
     /// with `ext=zwo`. A ZWO that cannot be read is a per-event failure.
@@ -309,13 +327,20 @@ fn to_u32(value: Option<f64>) -> Option<u32> {
         .map(|value| value.round() as u32)
 }
 
-/// Which Intervals.icu field an FTP came from. blake.bike is an indoor app,
-/// so a configured indoor FTP wins over the general one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+/// Which Intervals.icu number an FTP came from, and — as the rider's stored
+/// preference — which one a sync should reach for first. blake.bike is an
+/// indoor app, so the default prefers a configured indoor FTP, but a rider
+/// who trusts the modeled eFTP can ask for that instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum FtpSource {
+    /// The `indoor_ftp` of the cycling sport settings.
+    #[default]
     IndoorFtp,
+    /// The `ftp` of the cycling sport settings.
     Ftp,
+    /// The FTP the Intervals.icu power model estimates from recent rides.
+    EstimatedFtp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -334,13 +359,38 @@ pub struct ZoneBoundaries {
 }
 
 /// The cycling sport settings, each zone set normalized on its own so a bad
-/// HR set cannot spoil the FTP or the power zones.
+/// HR set cannot spoil the FTP or the power zones. Both FTP fields are kept
+/// as Intervals.icu reports them; `resolve_ftp` picks between them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CyclingSettings {
-    pub ftp: Option<CyclingFtp>,
+    pub indoor_ftp: Option<u16>,
+    pub ftp: Option<u16>,
     pub max_heart_rate_bpm: Option<u16>,
     pub heart_rate_zones: Result<ZoneBoundaries, String>,
     pub power_zones: Result<ZoneBoundaries, String>,
+}
+
+impl CyclingSettings {
+    /// The FTP a sync should use: the rider's preferred source when it has a
+    /// usable number, otherwise the next one that does, so a sync still
+    /// lands a value when the preferred field is empty. `estimated` is the
+    /// modeled eFTP, fetched only when it is the preference. The returned
+    /// `source` names the field actually used, which the status line shows.
+    pub fn resolve_ftp(&self, preferred: FtpSource, estimated: Option<u16>) -> Option<CyclingFtp> {
+        let watts = |source: FtpSource| match source {
+            FtpSource::IndoorFtp => self.indoor_ftp,
+            FtpSource::Ftp => self.ftp,
+            FtpSource::EstimatedFtp => estimated,
+        };
+        [
+            preferred,
+            FtpSource::IndoorFtp,
+            FtpSource::Ftp,
+            FtpSource::EstimatedFtp,
+        ]
+        .into_iter()
+        .find_map(|source| watts(source).map(|watts| CyclingFtp { watts, source }))
+    }
 }
 
 #[derive(Deserialize)]
@@ -532,17 +582,8 @@ fn normalized_boundaries(
 }
 
 fn normalized_cycling_settings(settings: SportSettings) -> CyclingSettings {
-    let ftp = in_range(settings.indoor_ftp, 50.0, 500.0)
-        .map(|watts| CyclingFtp {
-            watts,
-            source: FtpSource::IndoorFtp,
-        })
-        .or_else(|| {
-            in_range(settings.ftp, 50.0, 500.0).map(|watts| CyclingFtp {
-                watts,
-                source: FtpSource::Ftp,
-            })
-        });
+    let indoor_ftp = in_range(settings.indoor_ftp, 50.0, 500.0);
+    let ftp = in_range(settings.ftp, 50.0, 500.0);
     let max_heart_rate_bpm = in_range(settings.max_hr, 100.0, 230.0);
     let heart_rate_zones =
         normalized_boundaries(settings.hr_zones.unwrap_or_default(), 30.0, 250.0, "HR").and_then(
@@ -577,6 +618,7 @@ fn normalized_cycling_settings(settings: SportSettings) -> CyclingSettings {
         }
     });
     CyclingSettings {
+        indoor_ftp,
         ftp,
         max_heart_rate_bpm,
         heart_rate_zones,
@@ -716,30 +758,74 @@ mod tests {
         BASE64.encode(zwo.as_bytes())
     }
 
+    fn settings_with(indoor_ftp: Option<u16>, ftp: Option<u16>) -> CyclingSettings {
+        CyclingSettings {
+            indoor_ftp,
+            ftp,
+            max_heart_rate_bpm: None,
+            heart_rate_zones: Ok(ZoneBoundaries::default()),
+            power_zones: Ok(ZoneBoundaries::default()),
+        }
+    }
+
     #[test]
-    fn prefers_indoor_ftp_and_falls_back_to_ftp() {
-        let both =
-            normalized_cycling_settings(ride(r#"{"types":["Ride"],"ftp":280,"indoor_ftp":265.4}"#));
+    fn resolves_the_preferred_ftp_and_falls_back_when_it_is_missing() {
+        let all = settings_with(Some(265), Some(280));
+        for (preferred, expected) in [
+            (FtpSource::IndoorFtp, (265, FtpSource::IndoorFtp)),
+            (FtpSource::Ftp, (280, FtpSource::Ftp)),
+            (FtpSource::EstimatedFtp, (301, FtpSource::EstimatedFtp)),
+        ] {
+            assert_eq!(
+                all.resolve_ftp(preferred, Some(301)),
+                Some(CyclingFtp {
+                    watts: expected.0,
+                    source: expected.1
+                })
+            );
+        }
+        // A preference the athlete has not configured falls back to one they
+        // have, and the source says which.
         assert_eq!(
-            both.ftp,
-            Some(CyclingFtp {
-                watts: 265,
-                source: FtpSource::IndoorFtp
-            })
-        );
-        let only_ftp = normalized_cycling_settings(ride(r#"{"types":["Ride"],"ftp":280}"#));
-        assert_eq!(
-            only_ftp.ftp,
+            settings_with(None, Some(280)).resolve_ftp(FtpSource::IndoorFtp, None),
             Some(CyclingFtp {
                 watts: 280,
                 source: FtpSource::Ftp
             })
         );
+        assert_eq!(
+            settings_with(Some(265), None).resolve_ftp(FtpSource::EstimatedFtp, None),
+            Some(CyclingFtp {
+                watts: 265,
+                source: FtpSource::IndoorFtp
+            })
+        );
+        assert_eq!(
+            settings_with(None, None).resolve_ftp(FtpSource::EstimatedFtp, Some(301)),
+            Some(CyclingFtp {
+                watts: 301,
+                source: FtpSource::EstimatedFtp
+            })
+        );
+        assert_eq!(
+            settings_with(None, None).resolve_ftp(FtpSource::IndoorFtp, None),
+            None
+        );
+    }
+
+    #[test]
+    fn keeps_both_configured_ftps_within_range() {
+        let both =
+            normalized_cycling_settings(ride(r#"{"types":["Ride"],"ftp":280,"indoor_ftp":265.4}"#));
+        assert_eq!(both.indoor_ftp, Some(265));
+        assert_eq!(both.ftp, Some(280));
         let out_of_range =
             normalized_cycling_settings(ride(r#"{"types":["Ride"],"ftp":49,"indoor_ftp":501}"#));
+        assert_eq!(out_of_range.indoor_ftp, None);
         assert_eq!(out_of_range.ftp, None);
         let nothing = normalized_cycling_settings(ride(r#"{"types":["Ride"]}"#));
         assert_eq!(nothing.ftp, None);
+        assert_eq!(nothing.indoor_ftp, None);
         assert_eq!(nothing.max_heart_rate_bpm, None);
         assert_eq!(nothing.heart_rate_zones, Ok(ZoneBoundaries::default()));
         assert_eq!(nothing.power_zones, Ok(ZoneBoundaries::default()));
@@ -769,7 +855,7 @@ mod tests {
             r#"{"types":["Ride"],"ftp":280,"max_hr":190,"hr_zones":[140,130],
                 "power_zones":[55,75,90,105,120,150,999]}"#,
         ));
-        assert_eq!(bad_hr.ftp.map(|ftp| ftp.watts), Some(280));
+        assert_eq!(bad_hr.ftp, Some(280));
         assert_eq!(
             bad_hr.heart_rate_zones.unwrap_err(),
             "Intervals.icu returned HR zones that do not increase"
@@ -796,6 +882,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetches_the_modeled_eftp() {
+        let (base_url, server) = serve_once("200 OK", r#"{"ftp":301.4}"#);
+        let client = IntervalsClient::with_base_url("secret", &base_url).unwrap();
+        assert_eq!(client.estimated_ftp("i123").await.unwrap(), Some(301));
+        let request = server.join().unwrap();
+        assert!(request.starts_with("GET /api/v1/athlete/i123/mmp-model?type=Ride&fields=ftp "));
+        assert!(request.contains("authorization: Basic QVBJX0tFWTpzZWNyZXQ="));
+    }
+
+    #[tokio::test]
+    async fn reports_no_eftp_when_the_model_has_none() {
+        for body in [r#"{"ftp":null}"#, r#"{}"#, r#"{"ftp":12}"#] {
+            let (base_url, server) = serve_once("200 OK", body);
+            let client = IntervalsClient::with_base_url("secret", &base_url).unwrap();
+            assert_eq!(client.estimated_ftp("i1").await.unwrap(), None);
+            server.join().unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn fetches_cycling_sport_settings_with_api_key_basic_auth() {
         let body = r#"[
           {"types":["Run"],"ftp":null,"max_hr":188,"hr_zones":[130,150,170,188],
@@ -808,13 +914,8 @@ mod tests {
         let (base_url, server) = serve_once("200 OK", body);
         let client = IntervalsClient::with_base_url("secret", &base_url).unwrap();
         let settings = client.cycling_settings("i123").await.unwrap().unwrap();
-        assert_eq!(
-            settings.ftp,
-            Some(CyclingFtp {
-                watts: 270,
-                source: FtpSource::IndoorFtp
-            })
-        );
+        assert_eq!(settings.indoor_ftp, Some(270));
+        assert_eq!(settings.ftp, Some(280));
         assert_eq!(settings.max_heart_rate_bpm, Some(194));
         assert_eq!(
             settings.heart_rate_zones.unwrap().boundaries,
