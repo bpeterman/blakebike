@@ -19,6 +19,10 @@ Conventions:
 
 ## [Unreleased]
 
+### Fixed
+
+- Pausing a ride no longer flashes "Trainer pause not confirmed" every time. The warning now waits to see whether the trainer is actually slow to acknowledge the pause, so it only appears when the trainer really might still be holding resistance.
+
 ## [0.3.0] - 2026-09-19
 
 A "Stats for nerds" card for diagnosing your connected devices, and zeroing power meters and trainer spin-downs right from the app.
