@@ -14,6 +14,7 @@ import {
   Route,
   ChevronDown,
   ChevronRight,
+  CircleCheck,
   CircleStop,
   Download,
   ExternalLink,
@@ -1291,6 +1292,8 @@ export function Ride({
   const riding = runner.status === "running" || runner.status === "paused";
   const manualErg = riding && runner.manualErg;
   const openEnded = riding && runner.totalSeconds === null;
+  // The workout ran out and the same ride carries on as a free ride.
+  const workoutComplete = riding && runner.workoutComplete;
   const distanceMeters = riding ? runner.distanceMeters : 0;
   const targetPower = riding ? runner.targetPowerWatts : telemetry.targetPowerWatts;
   // Structured workouts get the same target controls as free ride: ± 5 W,
@@ -1299,6 +1302,8 @@ export function Ride({
   const overrideActive = riding && !runner.manualErg && runner.overrideActive;
   const biasPercent = riding ? runner.biasPercent : 100;
   const structured = riding && !openEnded;
+  // Bias scales the plan, so it only means something while one is left.
+  const biasAdjustable = structured && !workoutComplete;
   const adjustable = manualErg || openEnded || (structured && targetPower !== null);
   const screens = displayPreferences.screens;
   const screen = screens[Math.min(screenIndex, screens.length - 1)];
@@ -1374,7 +1379,7 @@ export function Ride({
       if (applied !== null) setTargetDraft(String(applied));
     }, "clear target override");
 
-  const canSkip = structured && activeWorkout !== undefined && workoutIntervals.length > 0;
+  const canSkip = structured && !workoutComplete && activeWorkout !== undefined && workoutIntervals.length > 0;
   useEffect(() => {
     if (!active) return;
     const onKeyDown = (event: KeyboardEvent) => {
@@ -1410,7 +1415,7 @@ export function Ride({
       }
       // Targets only move while a ride is actually running and adjustable.
       if (runner.status !== "running" || !adjustable) return;
-      if (action.kind === "bias" && !structured) return;
+      if (action.kind === "bias" && !biasAdjustable) return;
       event.preventDefault();
       if (action.kind === "power") {
         void perform(() => api.adjustManualPower(action.delta), "adjust manual power");
@@ -1420,7 +1425,7 @@ export function Ride({
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [active, adjustable, biasPercent, canSkip, endRideConfirmOpen, onEndRequest, perform, runner.status, screens.length, structured]);
+  }, [active, adjustable, biasAdjustable, biasPercent, canSkip, endRideConfirmOpen, onEndRequest, perform, runner.status, screens.length]);
 
   const intervalHistory = useMemo(() => {
     if (!riding || runner.intervalElapsedSeconds >= elapsed) return telemetryHistory;
@@ -1504,6 +1509,7 @@ export function Ride({
         intervalElapsedSeconds={runner.intervalElapsedSeconds}
         elapsedSeconds={elapsed}
         totalSeconds={total ?? 0}
+        complete={workoutComplete}
         paused={runner.status === "paused"}
         onSkip={() => void perform(() => api.skipInterval(), "skip interval")}
       />
@@ -1538,9 +1544,14 @@ export function Ride({
               <button className="secondary" disabled={runner.status !== "running"} onClick={() => void adjustPower(5)}>+ 5 W</button>
             </div>
           ) : <strong>{targetPower ?? "Free"}{targetPower !== null ? " W" : ""}</strong>}
-          {adjustable && <span className="manual-erg-hint">{structured ? "Type watts or use ↑ / ↓ · Shift for bias" : "Type watts or use ↑ / ↓"}</span>}
+          {adjustable && <span className="manual-erg-hint">{biasAdjustable ? "Type watts or use ↑ / ↓ · Shift for bias" : "Type watts or use ↑ / ↓"}</span>}
         </div>
-        {structured && (
+        {workoutComplete && (
+          <div className="plan-line">
+            <span className="plan-note">Workout complete · free riding · manual ERG</span>
+          </div>
+        )}
+        {biasAdjustable && (
           <div className="plan-line">
             <span className="plan-note">
               {manualErg
@@ -1605,7 +1616,7 @@ export function Ride({
             />
             {openEnded
               ? <div className="open-ended-time"><span>Elapsed</span><strong>{formatDuration(elapsed)}</strong><span>Open ended</span></div>
-              : <div className="progress-meta"><span>{formatDuration(elapsed)}</span><div className="progress"><i style={{ width: `${progress}%` }} /></div><span>-{formatDuration(Math.max(0, (total ?? 0) - elapsed))}</span></div>}
+              : <div className="progress-meta"><span>{formatDuration(elapsed)}</span><div className="progress"><i style={{ width: `${progress}%` }} /></div><span>{workoutComplete ? `+${formatDuration(Math.max(0, elapsed - (total ?? 0)))}` : `-${formatDuration(Math.max(0, (total ?? 0) - elapsed))}`}</span></div>}
           </div>
         )}
       </div>
@@ -1679,6 +1690,15 @@ export function Ride({
             <p>{zeroOffsetDue} feeds power for this ride and has not been zeroed in the last day. Unclip, keep the bike still, and it takes a few seconds.</p>
           </div>
           <button className="secondary" onClick={onZeroOffset}>Zero offset</button>
+        </div>
+      )}
+      {workoutComplete && (
+        <div className="notice soft" role="status">
+          <CircleCheck />
+          <div>
+            <strong>Workout complete · free riding</strong>
+            <p>Every block is done and this ride is still recording. The trainer is in manual ERG{targetPower !== null ? ` at ${targetPower} W` : ""}; adjust it as you like and end the ride when you’re done.</p>
+          </div>
         </div>
       )}
       {riding && runner.control === "lost" && (
@@ -2608,6 +2628,7 @@ function WorkoutTimeline({
   intervalElapsedSeconds,
   elapsedSeconds,
   totalSeconds,
+  complete,
   paused,
   onSkip,
 }: {
@@ -2622,44 +2643,60 @@ function WorkoutTimeline({
   intervalElapsedSeconds: number;
   elapsedSeconds: number;
   totalSeconds: number;
+  /** Every block is done; the ride carries on as a free ride past the plan. */
+  complete: boolean;
   paused: boolean;
   onSkip: () => void;
 }) {
-  const current = intervals[currentIndex];
-  if (!current) return null;
+  // Once complete the runner sits one past the last block, in its free ride.
+  const current = complete ? undefined : intervals[currentIndex];
+  if (!complete && !current) return null;
 
   const blockState = (_shape: unknown, index: number) => {
-    const state = index < currentIndex ? "completed" : index === currentIndex ? "current" : "upcoming";
+    const state = complete || index < currentIndex ? "completed" : index === currentIndex ? "current" : "upcoming";
     const progress = state === "completed"
       ? 1
-      : state === "current"
+      : state === "current" && current
         ? Math.min(1, intervalElapsedSeconds / Math.max(1, current.durationSeconds))
         : 0;
     return { className: state, state, progress };
   };
-  const currentRemaining = Math.max(0, current.durationSeconds - intervalElapsedSeconds);
-  const workoutRemaining = Math.max(0, totalSeconds - elapsedSeconds);
-  const currentTarget = formatIntervalTarget(current.startWatts, current.endWatts);
+  const pausedNote = paused ? " · Paused" : "";
+  const heading = current
+    ? {
+        title: `Block ${currentIndex + 1} of ${intervals.length}`,
+        note: `${formatIntervalTarget(current.startWatts, current.endWatts)}${pausedNote}`,
+        countdowns: [
+          { label: "Current block", seconds: Math.max(0, current.durationSeconds - intervalElapsedSeconds) },
+          { label: "Workout remaining", seconds: Math.max(0, totalSeconds - elapsedSeconds) },
+        ],
+      }
+    : {
+        title: "Workout complete",
+        note: `All ${intervals.length} blocks done · free riding${pausedNote}`,
+        countdowns: [
+          { label: "Free ride", seconds: intervalElapsedSeconds },
+          { label: "Workout", seconds: totalSeconds },
+        ],
+      };
 
   return (
     <section className="card workout-timeline" aria-label="Workout timeline">
       <div className="timeline-heading">
         <div>
           <span className="label">{workoutName}</span>
-          <h3>Block {currentIndex + 1} of {intervals.length}</h3>
-          <span className="timeline-target">{currentTarget}{paused ? " · Paused" : ""}</span>
+          <h3>{heading.title}</h3>
+          <span className="timeline-target">{heading.note}</span>
         </div>
         <div className="timeline-side">
-          <button className="secondary" onClick={onSkip}><SkipForward /> Skip block</button>
+          {current && <button className="secondary" onClick={onSkip}><SkipForward /> Skip block</button>}
           <div className="timeline-countdowns">
-            <div>
-              <span>Current block</span>
-              <strong>{formatDuration(currentRemaining)}</strong>
-            </div>
-            <div>
-              <span>Workout remaining</span>
-              <strong>{formatDuration(workoutRemaining)}</strong>
-            </div>
+            {heading.countdowns.map((countdown) => (
+              <div key={countdown.label}>
+                <span>{countdown.label}</span>
+                <strong>{formatDuration(countdown.seconds)}</strong>
+              </div>
+            ))}
           </div>
         </div>
       </div>

@@ -19,6 +19,10 @@ Conventions:
 
 ## [Unreleased]
 
+### Changed
+
+- Reaching the end of a structured workout no longer ends the ride. The same ride keeps recording as a free ride in manual ERG (held at your last target, or eased down to 100 W if the workout ended harder than that), the ride screen says **Workout complete · free riding**, and you end it with **End** when you're done. The saved ride and its FIT file include the extra riding, and the ride still counts as completed.
+
 ## [0.5.2] - 2026-10-15
 
 blake.bike can find Bluetooth devices on Macs where macOS was quietly blocking it.

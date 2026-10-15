@@ -1,4 +1,4 @@
-import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { RunnerState } from "./types";
 import { defaultRideDisplayPreferences } from "./rideScreens";
@@ -21,6 +21,7 @@ const running: RunnerState = {
   plannedTargetWatts: 200,
   manualErg: false,
   overrideActive: false,
+  workoutComplete: false,
   biasPercent: 100,
 };
 
@@ -91,5 +92,34 @@ describe("post-ride navigation", () => {
 
     expect(await screen.findByRole("dialog", { name: "Threshold" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "View ride metrics" })).not.toBeInTheDocument();
+  });
+
+  it("keeps riding when the workout runs out, and opens the ride once the rider ends it", async () => {
+    render(<App />);
+    await waitFor(() => expect(listeners.runner).not.toBeNull());
+
+    await act(async () => {
+      listeners.runner?.({
+        ...running,
+        elapsedSeconds: 75,
+        intervalIndex: 1,
+        intervalElapsedSeconds: 15,
+        targetPowerWatts: 100,
+        plannedTargetWatts: null,
+        manualErg: true,
+        workoutComplete: true,
+      });
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Ride" }));
+
+    expect(await screen.findByText("Workout complete · free riding")).toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: "Threshold" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "End" })).toBeInTheDocument();
+
+    await act(async () => {
+      listeners.runner?.({ status: "finished", sessionId: "session", completed: true });
+    });
+
+    expect(await screen.findByRole("dialog", { name: "Threshold" })).toBeInTheDocument();
   });
 });

@@ -428,6 +428,11 @@ export type RunnerState =
       manualErg: boolean;
       /** The rider has overridden this interval's target. */
       overrideActive: boolean;
+      /**
+       * Every planned interval is done and the ride carries on as a free ride
+       * in the same session (manualErg is true too) until the rider ends it.
+       */
+      workoutComplete: boolean;
       biasPercent: number;
       control?: ControlStatus;
       recordingWarning?: string | null;
@@ -445,6 +450,7 @@ export type RunnerState =
       plannedTargetWatts: number | null;
       manualErg: boolean;
       overrideActive: boolean;
+      workoutComplete: boolean;
       biasPercent: number;
       control?: ControlStatus;
       recordingWarning?: string | null;
