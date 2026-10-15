@@ -132,9 +132,11 @@ import {
   defaultRideDisplayPreferences,
   migrateRideDisplayPreferences,
   normalizeRideDisplayPreferences,
+  rideScreenItemKey,
   type RideDisplayPreferences,
 } from "./rideScreens";
 import { RideScreensEditor } from "./RideScreensEditor";
+import { LapTimerCard } from "./LapTimerCard";
 import { DevicePicker } from "./DevicePicker";
 import { DevicesPage } from "./DevicesPage";
 import { CalibrationModal } from "./CalibrationModal";
@@ -1401,6 +1403,11 @@ export function Ride({
         void perform(() => api.skipInterval(), "skip interval");
         return;
       }
+      if (action.kind === "lap") {
+        event.preventDefault();
+        void perform(() => api.markLap(), "mark lap");
+        return;
+      }
       if (action.kind === "end") {
         // The confirmation dialog's own Escape handler already closes it; don't reopen it.
         if (endRideConfirmOpen) return;
@@ -1752,6 +1759,19 @@ export function Ride({
           )}
           <div className="live-ride-grid">
             {screen.items.map((item) => {
+              if (item.kind === "lapTimer") {
+                return (
+                  <div className="ride-slot" data-span={4} data-ride-lap-timer key={rideScreenItemKey(item)}>
+                    <LapTimerCard
+                      timer={item.timer}
+                      laps={riding ? runner.laps : []}
+                      elapsedSeconds={elapsed}
+                      history={telemetryHistory}
+                      onLap={() => void perform(() => api.markLap(), "mark lap")}
+                    />
+                  </div>
+                );
+              }
               if (item.kind === "panel") {
                 const content = panelContent[item.panel];
                 return content === null ? null : (
@@ -2725,6 +2745,7 @@ function successCopy(label: string) {
   if (label.includes("export")) return "Export ready";
   if (label.includes("sync")) return "Synced with Intervals.icu";
   if (label.includes("stop workout")) return "Ride saved. Nice work!";
+  if (label === "mark lap") return "Lap marked";
   if (label.includes("save")) return "Saved";
   if (label.includes("delete") || label.includes("forget")) return "Removed";
   if (label.includes("restore")) return "Restored";

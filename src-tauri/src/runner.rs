@@ -8,8 +8,8 @@
 //!   during a ride: it follows the timeline's intent (running / paused /
 //!   stopped plus the current target), retries with backoff and reports a
 //!   [`ControlStatus`] instead of ever failing the ride;
-//! - the **recorder** thread batches telemetry into SQLite so a slow or
-//!   failing write never stalls the ride.
+//! - the **recorder** thread batches telemetry (and the rider's lap marks)
+//!   into SQLite so a slow or failing write never stalls the ride.
 //!
 //! Trainer trouble degrades a ride; it never ends it. The session is finalized
 //! on every exit path.
@@ -37,7 +37,7 @@ use uuid::Uuid;
 use crate::{
     devices::{ControlError, DeviceHub, DeviceState},
     distance::{DistanceAccumulator, estimate_distance},
-    domain::{Interval, SessionSummary, Telemetry, Workout},
+    domain::{Interval, LapMark, SessionSummary, Telemetry, Workout},
     fit::ensure_ride_file,
     ftms::ResponseCode,
     storage::Storage,
@@ -116,6 +116,9 @@ pub enum RunnerState {
         /// True while the rider has overridden this interval's target.
         override_active: bool,
         bias_percent: u16,
+        /// Laps the rider has marked so far, oldest first.
+        #[serde(default)]
+        laps: Vec<LapMark>,
         control: ControlStatus,
         #[serde(default)]
         recording_warning: Option<String>,
@@ -134,6 +137,8 @@ pub enum RunnerState {
         manual_erg: bool,
         override_active: bool,
         bias_percent: u16,
+        #[serde(default)]
+        laps: Vec<LapMark>,
         control: ControlStatus,
         #[serde(default)]
         recording_warning: Option<String>,
@@ -220,7 +225,9 @@ struct Controls {
     bias_percent: Arc<AtomicU16>,
     /// What the trainer should be doing; the writer task follows it.
     intent: Arc<watch::Sender<TrainerIntent>>,
-    /// Wakes the timeline so stop, skip, pause and resume act at once.
+    /// The rider pressed Lap; the timeline marks it on the ride clock.
+    lap_requested: Arc<AtomicBool>,
+    /// Wakes the timeline so stop, skip, pause, resume and laps act at once.
     wake: Arc<Notify>,
 }
 
@@ -238,6 +245,7 @@ impl Default for Controls {
                 phase: Phase::Idle,
                 target: None,
             })),
+            lap_requested: Arc::new(AtomicBool::new(false)),
             wake: Arc::new(Notify::new()),
         }
     }
@@ -465,6 +473,7 @@ impl WorkoutRunner {
             .bias_percent
             .store(DEFAULT_BIAS_PERCENT, Ordering::Relaxed);
         self.controls.current_target.store(0, Ordering::Relaxed);
+        self.controls.lap_requested.store(false, Ordering::Relaxed);
         self.controls.intent.send_replace(TrainerIntent {
             phase: Phase::Running,
             target: None,
@@ -493,6 +502,7 @@ impl WorkoutRunner {
             controls: self.controls.clone(),
             status_rx,
             recorder: Recorder::start(storage.clone(), session_id),
+            laps: Vec::new(),
         };
         let ride_files_dir = self.ride_files_dir.clone();
         let awake = self.awake.clone();
@@ -803,6 +813,19 @@ impl WorkoutRunner {
         Ok(())
     }
 
+    /// Mark a lap: the current lap ends and the next starts now, on the ride
+    /// clock. Works while paused too (the lap then starts when riding does).
+    /// The timeline records the mark, so it lands in the saved ride and the
+    /// FIT file.
+    pub fn mark_lap(&self) -> Result<(), String> {
+        if self.controls.control.load(Ordering::Relaxed) == STOPPED {
+            return Err("No ride is active".into());
+        }
+        self.controls.lap_requested.store(true, Ordering::Relaxed);
+        self.controls.wake.notify_one();
+        Ok(())
+    }
+
     pub fn skip(&self) -> Result<(), String> {
         if self.standalone.load(Ordering::Relaxed) {
             return Err("Free rides do not have intervals to skip".into());
@@ -916,6 +939,40 @@ struct Ride {
     controls: Controls,
     status_rx: watch::Receiver<ControlStatus>,
     recorder: Recorder,
+    /// Laps marked so far, oldest first.
+    laps: Vec<LapMark>,
+}
+
+impl Ride {
+    /// Record a lap mark at `elapsed`, unless it would make a lap with no
+    /// riding time in it (a double press, or a press before the clock moved).
+    fn mark_lap(&mut self, elapsed: u64) {
+        let elapsed_seconds = elapsed as u32;
+        if !lap_has_riding(&self.laps, elapsed_seconds) {
+            tracing::info!(
+                elapsed_seconds,
+                "Lap ignored: no riding time since the last one"
+            );
+            return;
+        }
+        let mark = LapMark {
+            elapsed_seconds,
+            timestamp_ms: Utc::now().timestamp_millis(),
+        };
+        self.laps.push(mark);
+        self.recorder.push_lap(mark);
+        tracing::info!(
+            session_id = %self.session_id,
+            lap = self.laps.len(),
+            elapsed_seconds,
+            "Lap marked"
+        );
+    }
+}
+
+/// Whether a lap ending at `elapsed_seconds` has any riding time in it.
+fn lap_has_riding(laps: &[LapMark], elapsed_seconds: u32) -> bool {
+    elapsed_seconds > laps.last().map_or(0, |lap| lap.elapsed_seconds)
 }
 
 /// Drive the ride to its end on wall time. Never fails: trainer and storage
@@ -967,7 +1024,11 @@ async fn run_timeline(ride: &mut Ride, stats: &mut RideStats) -> bool {
         }
 
         let now = Instant::now();
-        match controls.control.load(Ordering::Relaxed) {
+        let control = controls.control.load(Ordering::Relaxed);
+        if control != STOPPED && controls.lap_requested.swap(false, Ordering::Relaxed) {
+            ride.mark_lap(clock.elapsed_seconds(now));
+        }
+        match control {
             STOPPED => {
                 stats.elapsed = clock.elapsed_seconds(now) as u32;
                 // A stopped free ride still counts as completed: it has no end.
@@ -1118,6 +1179,7 @@ async fn publish(
             manual_erg: interval.free_ride,
             override_active: !interval.free_ride && ride.controls.override_target().is_some(),
             bias_percent: ride.controls.bias(),
+            laps: ride.laps.clone(),
             control,
             recording_warning: ride.recorder.warning(),
         }
@@ -1135,6 +1197,7 @@ async fn publish(
             manual_erg: interval.free_ride,
             override_active: !interval.free_ride && ride.controls.override_target().is_some(),
             bias_percent: ride.controls.bias(),
+            laps: ride.laps.clone(),
             control,
             recording_warning: ride.recorder.warning(),
         }
@@ -1351,17 +1414,36 @@ async fn classify_failure(
 /// failing sinks.
 pub trait SampleSink: Send + Sync {
     fn write_samples(&self, session_id: Uuid, samples: &[Telemetry]) -> Result<(), String>;
+    fn write_laps(&self, session_id: Uuid, laps: &[LapMark]) -> Result<(), String>;
 }
 
 impl SampleSink for Storage {
     fn write_samples(&self, session_id: Uuid, samples: &[Telemetry]) -> Result<(), String> {
         self.record_samples(session_id, samples)
     }
+
+    fn write_laps(&self, session_id: Uuid, laps: &[LapMark]) -> Result<(), String> {
+        self.record_laps(session_id, laps)
+    }
 }
 
 enum RecorderMessage {
     Sample(Telemetry),
+    Lap(LapMark),
     Flush(std::sync::mpsc::Sender<Result<(), String>>),
+}
+
+/// What the recorder holds until the next successful write.
+#[derive(Default)]
+struct Pending {
+    samples: Vec<Telemetry>,
+    laps: Vec<LapMark>,
+}
+
+impl Pending {
+    fn is_empty(&self) -> bool {
+        self.samples.is_empty() && self.laps.is_empty()
+    }
 }
 
 #[derive(Default)]
@@ -1450,6 +1532,24 @@ impl Recorder {
         }
     }
 
+    /// Queue a lap mark. Laps are rare, so the queue only refuses one when the
+    /// recorder is stuck, and that is reported like a lost measurement.
+    fn push_lap(&self, lap: LapMark) {
+        let sent = self
+            .tx
+            .as_ref()
+            .map(|tx| tx.try_send(RecorderMessage::Lap(lap)));
+        if !matches!(sent, Some(Ok(()))) {
+            let mut health = recording_health(&self.health);
+            health.dropped += 1;
+            health.stopped |= matches!(sent, Some(Err(TrySendError::Disconnected(_))));
+            tracing::warn!(
+                elapsed_seconds = lap.elapsed_seconds,
+                "Recorder dropped a lap mark"
+            );
+        }
+    }
+
     /// One deadline covers both queueing and acknowledgement. Neither can
     /// block the async runtime; a failed write is never acknowledged as saved.
     async fn flush(&self, grace: Duration) -> Result<(), String> {
@@ -1498,19 +1598,23 @@ fn recorder_loop(
     session_id: Uuid,
     health: &SharedRecordingHealth,
 ) {
-    let mut pending: Vec<Telemetry> = Vec::new();
+    let mut pending = Pending::default();
     let mut oldest: Option<std::time::Instant> = None;
     loop {
         match rx.recv_timeout(Duration::from_millis(250)) {
             Ok(RecorderMessage::Sample(sample)) => {
-                pending.push(sample);
+                pending.samples.push(sample);
                 oldest.get_or_insert_with(std::time::Instant::now);
-                if pending.len() > MAX_PENDING_SAMPLES {
-                    let excess = pending.len() - MAX_PENDING_SAMPLES;
-                    pending.drain(..excess);
+                if pending.samples.len() > MAX_PENDING_SAMPLES {
+                    let excess = pending.samples.len() - MAX_PENDING_SAMPLES;
+                    pending.samples.drain(..excess);
                     recording_health(health).dropped += excess as u32;
                     tracing::warn!(excess, "Recorder backlog full; oldest samples dropped");
                 }
+            }
+            Ok(RecorderMessage::Lap(lap)) => {
+                pending.laps.push(lap);
+                oldest.get_or_insert_with(std::time::Instant::now);
             }
             Ok(RecorderMessage::Flush(ack)) => {
                 let result = write_with_retries(&*sink, session_id, &mut pending, 8, health);
@@ -1538,10 +1642,28 @@ fn recorder_loop(
     }
 }
 
+/// Write whatever is pending, samples then laps; each part is cleared once it
+/// is saved, so a retry only repeats what failed.
+fn write_pending(
+    sink: &dyn SampleSink,
+    session_id: Uuid,
+    pending: &mut Pending,
+) -> Result<(), String> {
+    if !pending.samples.is_empty() {
+        sink.write_samples(session_id, &pending.samples)?;
+        pending.samples.clear();
+    }
+    if !pending.laps.is_empty() {
+        sink.write_laps(session_id, &pending.laps)?;
+        pending.laps.clear();
+    }
+    Ok(())
+}
+
 fn write_with_retries(
     sink: &dyn SampleSink,
     session_id: Uuid,
-    pending: &mut Vec<Telemetry>,
+    pending: &mut Pending,
     attempts: u32,
     health: &SharedRecordingHealth,
 ) -> Result<(), String> {
@@ -1549,14 +1671,13 @@ fn write_with_retries(
         if pending.is_empty() {
             return Ok(());
         }
-        match sink.write_samples(session_id, pending) {
+        match write_pending(sink, session_id, pending) {
             Ok(()) => {
                 let mut health = recording_health(health);
                 if health.write_failed {
                     tracing::info!("Telemetry writes recovered");
                 }
                 health.write_failed = false;
-                pending.clear();
                 return Ok(());
             }
             Err(error) => {
@@ -1652,6 +1773,7 @@ fn finish(
         let detail = crate::domain::SessionDetail {
             summary,
             samples: detail.samples,
+            laps: detail.laps,
         };
         ensure_ride_file(ride_files_dir, &detail).map_err(|error| {
             format!("Ride data is in History, but its FIT file could not be saved: {error}")
@@ -1727,6 +1849,7 @@ mod tests {
             manual_erg: true,
             override_active: false,
             bias_percent: DEFAULT_BIAS_PERCENT,
+            laps: Vec::new(),
             control: ControlStatus::Lost,
             recording_warning: None,
         };
@@ -1758,6 +1881,7 @@ mod tests {
             manual_erg: false,
             override_active: false,
             bias_percent: DEFAULT_BIAS_PERCENT,
+            laps: Vec::new(),
             control: ControlStatus::Ok,
             recording_warning: None,
         };
@@ -2319,6 +2443,80 @@ mod tests {
         rig.hub.disconnect().await;
     }
 
+    #[test]
+    fn a_lap_needs_riding_time_in_it() {
+        let mark = |elapsed_seconds| LapMark {
+            elapsed_seconds,
+            timestamp_ms: 0,
+        };
+        // Not at the very start, and not twice in the same second.
+        assert!(!lap_has_riding(&[], 0));
+        assert!(lap_has_riding(&[], 1));
+        assert!(!lap_has_riding(&[mark(30)], 30));
+        assert!(lap_has_riding(&[mark(30)], 31));
+    }
+
+    #[tokio::test]
+    async fn laps_follow_the_ride_clock_and_are_saved_with_the_ride() {
+        let rig = rig().await;
+        assert!(rig.runner.mark_lap().is_err(), "no ride, no lap");
+        let session_id = rig
+            .runner
+            .start_free_ride(None, 800, 84.0, rig.hub.clone(), rig.storage.clone())
+            .await
+            .unwrap();
+        wait_for(&rig.runner, |state| {
+            matches!(state, RunnerState::Running { elapsed_seconds, .. } if *elapsed_seconds >= 1)
+        })
+        .await;
+        rig.runner.mark_lap().unwrap();
+        let lapped = wait_for(
+            &rig.runner,
+            |state| matches!(state, RunnerState::Running { laps, .. } if laps.len() == 1),
+        )
+        .await;
+        let RunnerState::Running { laps, .. } = lapped else {
+            panic!("{lapped:?}");
+        };
+        assert!(laps[0].elapsed_seconds >= 1);
+        // While paused the clock stands still, and a lap is still taken.
+        wait_for(&rig.runner, |state| {
+            matches!(state, RunnerState::Running { elapsed_seconds, .. } if *elapsed_seconds > laps[0].elapsed_seconds)
+        })
+        .await;
+        rig.runner.pause_or_resume().await.unwrap();
+        wait_for(&rig.runner, |state| {
+            matches!(state, RunnerState::Paused { .. })
+        })
+        .await;
+        rig.runner.mark_lap().unwrap();
+        let paused = wait_for(
+            &rig.runner,
+            |state| matches!(state, RunnerState::Paused { laps, .. } if laps.len() == 2),
+        )
+        .await;
+        let RunnerState::Paused {
+            laps: marked,
+            elapsed_seconds,
+            ..
+        } = paused
+        else {
+            panic!("{paused:?}");
+        };
+        assert_eq!(marked[1].elapsed_seconds, elapsed_seconds);
+        rig.runner.pause_or_resume().await.unwrap();
+        rig.runner.stop().await.unwrap();
+        wait_for(&rig.runner, |state| {
+            matches!(state, RunnerState::Finished { .. })
+        })
+        .await;
+        assert_eq!(
+            rig.storage.session(session_id).unwrap().unwrap().laps,
+            marked
+        );
+        rig.hub.disconnect().await;
+    }
+
     struct FlakySink {
         inner: Arc<Storage>,
         remaining_failures: std::sync::Mutex<u32>,
@@ -2334,6 +2532,10 @@ mod tests {
                 return Err("disk on fire".into());
             }
             self.inner.write_samples(session_id, samples)
+        }
+
+        fn write_laps(&self, session_id: Uuid, laps: &[LapMark]) -> Result<(), String> {
+            self.inner.write_laps(session_id, laps)
         }
     }
 
@@ -2638,6 +2840,10 @@ mod tests {
         struct PanickingSink;
         impl SampleSink for PanickingSink {
             fn write_samples(&self, _: Uuid, _: &[Telemetry]) -> Result<(), String> {
+                panic!("injected recorder failure")
+            }
+
+            fn write_laps(&self, _: Uuid, _: &[LapMark]) -> Result<(), String> {
                 panic!("injected recorder failure")
             }
         }

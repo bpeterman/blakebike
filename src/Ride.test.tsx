@@ -43,6 +43,7 @@ const runner: RunnerState = {
   manualErg: true,
   overrideActive: false,
   biasPercent: 100,
+  laps: [],
 };
 
 const telemetry: Telemetry = {
@@ -309,6 +310,7 @@ describe("Ride charts", () => {
       manualErg: false,
       overrideActive: false,
       biasPercent: 100,
+      laps: [],
     };
     const commonProps = {
       workouts: [structuredWorkout],
@@ -380,6 +382,7 @@ describe("Ride charts", () => {
       manualErg: false,
       overrideActive: false,
       biasPercent: 100,
+      laps: [],
     };
     const commonProps = {
       workouts: [structuredWorkout],
@@ -500,6 +503,49 @@ describe("Ride charts", () => {
     expect(screen.getByRole("tab", { name: "Ride" })).toHaveAttribute("aria-selected", "true");
     fireEvent.keyDown(window, { key: "ArrowRight" });
     expect(slots()).toEqual([["speed:ride:current", "4"]]);
+  });
+
+  it("shows the lap timer and marks laps from its button and the L key", () => {
+    const perform = vi.fn<(action: () => Promise<unknown>, label?: string) => Promise<void>>(
+      async () => undefined,
+    );
+    const { container } = render(
+      <Ride
+        workouts={[]}
+        selectedWorkout={null}
+        setSelectedWorkout={vi.fn()}
+        connected
+        onConnect={vi.fn()}
+        runner={{ ...runner, elapsedSeconds: 50, laps: [{ elapsedSeconds: 20, timestampMs: 500 }] }}
+        telemetry={telemetry}
+        telemetryHistory={[telemetry]}
+        powerSmoothing="instant"
+        onPowerSmoothing={vi.fn()}
+        sourcePreferences={defaultSourcePreferences}
+        onSourcePreference={vi.fn()}
+        hub={hub}
+        profile={profile}
+        trainingZones={defaultTrainingZoneSettings}
+        displayPreferences={{
+          version: 3,
+          screens: [
+            {
+              id: "drills",
+              name: "Drills",
+              items: [{ kind: "lapTimer", timer: { mode: "manual", workSeconds: 30, restSeconds: 30 } }],
+            },
+          ],
+        }}
+        perform={perform}
+      />,
+    );
+    expect(container.querySelector("[data-ride-lap-timer]")).toHaveAttribute("data-span", "4");
+    expect(screen.getByLabelText("Lap time")).toHaveTextContent("0:30");
+    expect(screen.getByText("Lap 2")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Lap" }));
+    fireEvent.keyDown(window, { key: "l" });
+    expect(perform.mock.calls.map((call) => call[1])).toEqual(["mark lap", "mark lap"]);
   });
 
   it("shows no screen tabs when there is only one screen", () => {

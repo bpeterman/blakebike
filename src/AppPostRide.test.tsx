@@ -22,6 +22,7 @@ const running: RunnerState = {
   manualErg: false,
   overrideActive: false,
   biasPercent: 100,
+  laps: [],
 };
 
 const session = {

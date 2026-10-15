@@ -38,6 +38,7 @@ const running: RunnerState = {
   manualErg: false,
   overrideActive: false,
   biasPercent: 100,
+  laps: [],
 };
 
 const session: SessionDetail = {
@@ -56,6 +57,7 @@ const session: SessionDetail = {
     distanceWeightKg: 84,
     completed: true,
   },
+  laps: [],
   samples: [
     {
       timestampMs: 1000,

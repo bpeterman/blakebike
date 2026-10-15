@@ -188,6 +188,12 @@ describe("workout helpers", () => {
     expect(rideKeyAction("Escape", false, true)).toBeNull();
   });
 
+  it("routes L to a lap, once per press", () => {
+    expect(rideKeyAction("l", false, false)).toEqual({ kind: "lap" });
+    expect(rideKeyAction("L", true, false)).toEqual({ kind: "lap" });
+    expect(rideKeyAction("l", false, true)).toBeNull();
+  });
+
   it("keeps the bias inside 50–150 %", () => {
     expect(clampBias(100.4)).toBe(100);
     expect(clampBias(10)).toBe(50);

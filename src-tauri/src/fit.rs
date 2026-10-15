@@ -7,8 +7,8 @@ use chrono::{DateTime, TimeZone, Utc};
 use fit::{Decoder, Encoder, Field, FieldKind, Message, Value, profile::MesgNum};
 
 use crate::{
-    distance::{DistanceEstimate, DistancePoint, estimate_distance},
-    domain::{SessionDetail, SessionSummary, Telemetry},
+    distance::{DistancePoint, estimate_distance},
+    domain::{LapMark, SessionDetail, SessionSummary, Telemetry},
     storage::Storage,
 };
 
@@ -92,7 +92,8 @@ pub fn encode_activity(detail: &SessionDetail) -> Result<Vec<u8>, String> {
         started_at + chrono::Duration::seconds(i64::from(summary.elapsed_seconds))
     });
     let distance = estimate_distance(&detail.samples, summary.distance_weight_kg);
-    let stats = RideStats::from_samples(&detail.samples, &distance, summary.elapsed_seconds);
+    let session = Totals::session(summary, ended_at, &detail.samples, &distance.points);
+    let laps = laps(detail, &distance.points, &session);
     let mut messages = vec![
         message(
             MesgNum::FileId,
@@ -112,18 +113,10 @@ pub fn encode_activity(detail: &SessionDetail) -> Result<Vec<u8>, String> {
     }
 
     messages.push(event_message(ended_at, "stop_all"));
-    messages.push(lap_message(
-        summary,
-        ended_at,
-        &stats,
-        distance.total_meters,
-    ));
-    messages.push(session_message(
-        summary,
-        ended_at,
-        &stats,
-        distance.total_meters,
-    ));
+    for (index, (lap, trigger)) in laps.iter().enumerate() {
+        messages.push(lap_message(index, lap, trigger));
+    }
+    messages.push(session_message(summary, &session, laps.len()));
     messages.push(message(
         MesgNum::Activity,
         vec![
@@ -331,36 +324,94 @@ fn event_message(timestamp: DateTime<Utc>, event_type: &'static str) -> Message 
     )
 }
 
-fn lap_message(
-    summary: &SessionSummary,
-    ended_at: DateTime<Utc>,
-    stats: &RideStats,
-    total_distance_meters: f64,
-) -> Message {
-    let mut fields = common_summary_fields(summary, ended_at, stats, SummaryKind::Lap);
-    fields.push(float_field(9, "total_distance", total_distance_meters));
+/// The FIT laps with what ended each: one lap per manual lap the rider marked
+/// plus the last one the ride's end closed, or the whole ride as a single lap
+/// when they marked none. Marks are matched to the samples by wall time, so a
+/// lap's records, averages and distance are exactly the samples ridden in it.
+fn laps(
+    detail: &SessionDetail,
+    points: &[DistancePoint],
+    session: &Totals,
+) -> Vec<(Totals, &'static str)> {
+    let marks = usable_marks(&detail.laps, session);
+    if marks.is_empty() {
+        return vec![(session.clone(), "session_end")];
+    }
+    let mut laps = Vec::with_capacity(marks.len() + 1);
+    let mut start = session.start;
+    let mut start_elapsed = 0;
+    let mut first = 0;
+    for (mark, end) in marks {
+        let last = first
+            + detail.samples[first..]
+                .partition_point(|sample| sample.timestamp_ms < mark.timestamp_ms);
+        laps.push((
+            Totals::lap(
+                start,
+                end,
+                mark.elapsed_seconds - start_elapsed,
+                &detail.samples[first..last],
+                &points[..last],
+                first,
+            ),
+            "manual",
+        ));
+        start = end;
+        start_elapsed = mark.elapsed_seconds;
+        first = last;
+    }
+    laps.push((
+        Totals::lap(
+            start,
+            session.end,
+            session.timer_seconds.saturating_sub(start_elapsed),
+            &detail.samples[first..],
+            points,
+            first,
+        ),
+        "session_end",
+    ));
+    laps
+}
+
+/// The marks that split the ride into laps, with their wall time: inside the
+/// ride, and each later than the one before on both clocks. Anything else (a
+/// clock jump, a corrupt row) would make a lap of no or negative length.
+fn usable_marks(marks: &[LapMark], session: &Totals) -> Vec<(LapMark, DateTime<Utc>)> {
+    let mut usable: Vec<(LapMark, DateTime<Utc>)> = Vec::new();
+    for mark in marks {
+        let Some(at) = Utc.timestamp_millis_opt(mark.timestamp_ms).single() else {
+            continue;
+        };
+        let after_previous = usable.last().is_none_or(|(previous, previous_at)| {
+            mark.elapsed_seconds > previous.elapsed_seconds && at > *previous_at
+        });
+        if at > session.start && at < session.end && mark.elapsed_seconds > 0 && after_previous {
+            usable.push((*mark, at));
+        }
+    }
+    usable
+}
+
+fn lap_message(index: usize, lap: &Totals, trigger: &'static str) -> Message {
+    let mut fields = common_summary_fields(lap, SummaryKind::Lap);
     fields.extend([
+        uint_field(254, "message_index", index as u64),
         enum_field(23, "intensity", "active"),
-        enum_field(24, "lap_trigger", "session_end"),
+        enum_field(24, "lap_trigger", trigger),
         enum_field(25, "sport", "cycling"),
         uint_field(26, "event_group", 0),
     ]);
     message(MesgNum::Lap, fields)
 }
 
-fn session_message(
-    summary: &SessionSummary,
-    ended_at: DateTime<Utc>,
-    stats: &RideStats,
-    total_distance_meters: f64,
-) -> Message {
-    let mut fields = common_summary_fields(summary, ended_at, stats, SummaryKind::Session);
-    fields.push(float_field(9, "total_distance", total_distance_meters));
+fn session_message(summary: &SessionSummary, session: &Totals, lap_count: usize) -> Message {
+    let mut fields = common_summary_fields(session, SummaryKind::Session);
     fields.extend([
         enum_field(5, "sport", "cycling"),
         enum_field(6, "sub_sport", "indoor_cycling"),
         uint_field(25, "first_lap_index", 0),
-        uint_field(26, "num_laps", 1),
+        uint_field(26, "num_laps", lap_count as u64),
         enum_field(28, "trigger", "activity_end"),
         string_field(110, "sport_profile_name", &summary.workout_name),
     ]);
@@ -373,12 +424,7 @@ enum SummaryKind {
     Session,
 }
 
-fn common_summary_fields(
-    summary: &SessionSummary,
-    ended_at: DateTime<Utc>,
-    stats: &RideStats,
-    kind: SummaryKind,
-) -> Vec<Field> {
+fn common_summary_fields(totals: &Totals, kind: SummaryKind) -> Vec<Field> {
     let (avg_speed, max_speed, avg_hr, max_hr, avg_cadence, max_cadence, avg_power, max_power) =
         match kind {
             SummaryKind::Lap => (13, 14, 15, 16, 17, 18, 19, 20),
@@ -389,46 +435,58 @@ fn common_summary_fields(
         SummaryKind::Session => "session",
     };
     let mut fields = vec![
-        datetime_field(253, "timestamp", ended_at),
+        datetime_field(253, "timestamp", totals.end),
         enum_field(0, "event", event),
         enum_field(1, "event_type", "stop"),
-        datetime_field(2, "start_time", summary.started_at),
-        float_field(7, "total_elapsed_time", f64::from(summary.elapsed_seconds)),
-        float_field(8, "total_timer_time", f64::from(summary.elapsed_seconds)),
+        datetime_field(2, "start_time", totals.start),
+        float_field(7, "total_elapsed_time", totals.elapsed_seconds),
+        float_field(8, "total_timer_time", f64::from(totals.timer_seconds)),
+        float_field(9, "total_distance", totals.distance_meters),
         uint_field(
             avg_power,
             "avg_power",
-            u64::from(summary.average_power_watts),
+            u64::from(totals.average_power_watts),
         ),
-        uint_field(max_power, "max_power", u64::from(summary.max_power_watts)),
+        uint_field(max_power, "max_power", u64::from(totals.max_power_watts)),
     ];
-    if let Some(value) = stats.average_speed_mps {
+    if let Some(value) = totals.average_speed_mps {
         fields.push(float_field(avg_speed, "avg_speed", value));
     }
-    if let Some(value) = stats.max_speed_mps {
+    if let Some(value) = totals.max_speed_mps {
         fields.push(float_field(max_speed, "max_speed", value));
     }
-    if let Some(value) = stats.average_heart_rate {
+    if let Some(value) = totals.average_heart_rate {
         fields.push(uint_field(avg_hr, "avg_heart_rate", u64::from(value)));
     }
-    if let Some(value) = stats.max_heart_rate {
+    if let Some(value) = totals.max_heart_rate {
         fields.push(uint_field(max_hr, "max_heart_rate", u64::from(value)));
     }
-    if let Some(value) = summary.average_cadence_rpm {
+    if let Some(value) = totals.average_cadence_rpm {
         fields.push(uint_field(
             avg_cadence,
             "avg_cadence",
             value.round().clamp(0.0, 254.0) as u64,
         ));
     }
-    if let Some(value) = stats.max_cadence {
+    if let Some(value) = totals.max_cadence {
         fields.push(uint_field(max_cadence, "max_cadence", u64::from(value)));
     }
     fields
 }
 
-#[derive(Default)]
-struct RideStats {
+/// What a lap or session message says about its stretch of the ride.
+#[derive(Clone)]
+struct Totals {
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    /// Wall time, pauses included.
+    elapsed_seconds: f64,
+    /// Riding time on the ride clock.
+    timer_seconds: u32,
+    distance_meters: f64,
+    average_power_watts: u16,
+    max_power_watts: u16,
+    average_cadence_rpm: Option<f32>,
     average_speed_mps: Option<f64>,
     max_speed_mps: Option<f64>,
     average_heart_rate: Option<u8>,
@@ -436,28 +494,101 @@ struct RideStats {
     max_cadence: Option<u8>,
 }
 
-impl RideStats {
-    fn from_samples(
+impl Totals {
+    /// The whole ride. Power and cadence come from the summary the runner
+    /// kept, so the session agrees with History.
+    fn session(
+        summary: &SessionSummary,
+        end: DateTime<Utc>,
         samples: &[Telemetry],
-        distance: &DistanceEstimate,
-        elapsed_seconds: u32,
+        points: &[DistancePoint],
+    ) -> Self {
+        let mut totals = Self::from_samples(
+            summary.started_at,
+            end,
+            summary.elapsed_seconds,
+            samples,
+            points,
+            0.0,
+        );
+        // Kept as it always was: riding time on both clocks.
+        totals.elapsed_seconds = f64::from(summary.elapsed_seconds);
+        totals.average_power_watts = summary.average_power_watts;
+        totals.max_power_watts = summary.max_power_watts;
+        totals.average_cadence_rpm = summary.average_cadence_rpm;
+        totals
+    }
+
+    /// One manual lap: `samples` are the lap's own, `points` the ride's
+    /// distance up to the lap's end, and `first` where the lap's samples
+    /// start in them.
+    fn lap(
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        timer_seconds: u32,
+        samples: &[Telemetry],
+        points: &[DistancePoint],
+        first: usize,
+    ) -> Self {
+        let start_meters = first
+            .checked_sub(1)
+            .and_then(|index| points.get(index))
+            .map_or(0.0, |point| point.distance_meters);
+        Self::from_samples(
+            start,
+            end,
+            timer_seconds,
+            samples,
+            &points[first.min(points.len())..],
+            start_meters,
+        )
+    }
+
+    fn from_samples(
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        timer_seconds: u32,
+        samples: &[Telemetry],
+        points: &[DistancePoint],
+        start_meters: f64,
     ) -> Self {
         let heart_rates: Vec<u8> = samples
             .iter()
             .filter_map(|sample| sample.heart_rate_bpm)
             .collect();
-        let cadences: Vec<u8> = samples
+        let cadences: Vec<f32> = samples
             .iter()
-            .filter_map(|sample| {
-                sample
-                    .cadence_rpm
-                    .map(|value| value.round().clamp(0.0, 254.0) as u8)
-            })
+            .filter_map(|sample| sample.cadence_rpm)
             .collect();
+        let distance_meters = points
+            .last()
+            .map_or(0.0, |point| point.distance_meters - start_meters)
+            .max(0.0);
         Self {
-            average_speed_mps: (elapsed_seconds > 0)
-                .then(|| distance.total_meters / f64::from(elapsed_seconds)),
-            max_speed_mps: distance.max_speed_mps,
+            start,
+            end,
+            elapsed_seconds: (end - start).num_milliseconds().max(0) as f64 / 1000.0,
+            timer_seconds,
+            distance_meters,
+            average_power_watts: if samples.is_empty() {
+                0
+            } else {
+                (samples
+                    .iter()
+                    .map(|sample| u64::from(sample.power_watts))
+                    .sum::<u64>()
+                    / samples.len() as u64) as u16
+            },
+            max_power_watts: samples
+                .iter()
+                .map(|sample| sample.power_watts)
+                .max()
+                .unwrap_or(0),
+            average_cadence_rpm: (!cadences.is_empty())
+                .then(|| cadences.iter().sum::<f32>() / cadences.len() as f32),
+            average_speed_mps: (timer_seconds > 0)
+                .then(|| distance_meters / f64::from(timer_seconds)),
+            max_speed_mps: points.iter().map(|point| point.speed_mps).reduce(f64::max),
             average_heart_rate: (!heart_rates.is_empty()).then(|| {
                 (heart_rates
                     .iter()
@@ -466,7 +597,10 @@ impl RideStats {
                     / heart_rates.len() as u32) as u8
             }),
             max_heart_rate: heart_rates.iter().copied().max(),
-            max_cadence: cadences.iter().copied().max(),
+            max_cadence: cadences
+                .iter()
+                .map(|value| value.round().clamp(0.0, 254.0) as u8)
+                .max(),
         }
     }
 }
@@ -581,6 +715,7 @@ mod tests {
                     target_power_watts: Some(220),
                 },
             ],
+            laps: Vec::new(),
         }
     }
 
@@ -648,6 +783,151 @@ mod tests {
             .unwrap();
         assert!(total_distance > 8.0);
         assert!((total_distance - distances.last().unwrap()).abs() < 0.01);
+    }
+
+    /// Two minutes at one sample a second: 150 W for the first 60 s, 250 W
+    /// after, and a manual lap at 60 s and 90 s.
+    fn lapped_detail() -> SessionDetail {
+        let mut detail = detail();
+        let started_ms = detail.summary.started_at.timestamp_millis();
+        detail.summary.ended_at = Some(detail.summary.started_at + chrono::Duration::seconds(120));
+        detail.summary.elapsed_seconds = 120;
+        detail.samples = (0..120_i64)
+            .map(|second| Telemetry {
+                timestamp_ms: started_ms + second * 1_000,
+                power_watts: if second < 60 { 150 } else { 250 },
+                cadence_rpm: Some(if second < 60 { 80.0 } else { 100.0 }),
+                speed_kph: Some(36.0),
+                heart_rate_bpm: Some(140),
+                target_power_watts: None,
+            })
+            .collect();
+        detail.laps = vec![
+            LapMark {
+                elapsed_seconds: 60,
+                timestamp_ms: started_ms + 60_000,
+            },
+            LapMark {
+                elapsed_seconds: 90,
+                timestamp_ms: started_ms + 90_000,
+            },
+        ];
+        detail
+    }
+
+    fn lap_messages(detail: &SessionDetail) -> (Vec<Message>, Message) {
+        let bytes = encode_activity(detail).unwrap();
+        fit::check_integrity(&bytes).unwrap();
+        let (messages, errors) = Decoder::builder(&bytes).build().read_all();
+        assert!(errors.is_empty(), "{errors:?}");
+        let session = messages
+            .iter()
+            .find(|message| message.name == "session")
+            .unwrap()
+            .clone();
+        let laps = messages
+            .into_iter()
+            .filter(|message| message.name == "lap")
+            .collect();
+        (laps, session)
+    }
+
+    fn uint(message: &Message, name: &str) -> u64 {
+        message.field(name).unwrap().value.as_u64().unwrap()
+    }
+
+    fn float(message: &Message, name: &str) -> f64 {
+        message.field(name).unwrap().value.as_f64().unwrap()
+    }
+
+    #[test]
+    fn a_ride_without_manual_laps_is_one_lap() {
+        let (laps, session) = lap_messages(&detail());
+        assert_eq!(laps.len(), 1);
+        assert_eq!(
+            laps[0].field("lap_trigger").unwrap().value.as_str(),
+            Some("session_end")
+        );
+        assert_eq!(uint(&session, "num_laps"), 1);
+        assert_eq!(uint(&laps[0], "avg_power"), 210);
+    }
+
+    #[test]
+    fn manual_laps_become_fit_laps_of_their_own_samples() {
+        let detail = lapped_detail();
+        let (laps, session) = lap_messages(&detail);
+        assert_eq!(laps.len(), 3);
+        assert_eq!(uint(&session, "num_laps"), 3);
+        let triggers: Vec<_> = laps
+            .iter()
+            .map(|lap| {
+                lap.field("lap_trigger")
+                    .unwrap()
+                    .value
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(triggers, ["manual", "manual", "session_end"]);
+        let timers: Vec<f64> = laps
+            .iter()
+            .map(|lap| float(lap, "total_timer_time"))
+            .collect();
+        assert_eq!(timers, [60.0, 30.0, 30.0]);
+        let powers: Vec<u64> = laps.iter().map(|lap| uint(lap, "avg_power")).collect();
+        assert_eq!(powers, [150, 250, 250]);
+        let cadences: Vec<u64> = laps.iter().map(|lap| uint(lap, "avg_cadence")).collect();
+        assert_eq!(cadences, [80, 100, 100]);
+        let starts: Vec<_> = laps
+            .iter()
+            .map(|lap| {
+                lap.field("start_time")
+                    .unwrap()
+                    .value
+                    .as_datetime()
+                    .unwrap()
+            })
+            .collect();
+        let started_at = detail.summary.started_at;
+        assert_eq!(
+            starts,
+            [
+                started_at,
+                started_at + chrono::Duration::seconds(60),
+                started_at + chrono::Duration::seconds(90),
+            ]
+        );
+        // The laps' distances add up to the ride's.
+        let lap_distance: f64 = laps.iter().map(|lap| float(lap, "total_distance")).sum();
+        assert!((lap_distance - float(&session, "total_distance")).abs() < 0.05);
+    }
+
+    #[test]
+    fn marks_that_cannot_split_the_ride_are_ignored() {
+        let mut detail = lapped_detail();
+        let started_ms = detail.summary.started_at.timestamp_millis();
+        detail.laps = vec![
+            // Before the ride, out of order, and after it ended.
+            LapMark {
+                elapsed_seconds: 10,
+                timestamp_ms: started_ms - 5_000,
+            },
+            LapMark {
+                elapsed_seconds: 60,
+                timestamp_ms: started_ms + 60_000,
+            },
+            LapMark {
+                elapsed_seconds: 50,
+                timestamp_ms: started_ms + 70_000,
+            },
+            LapMark {
+                elapsed_seconds: 200,
+                timestamp_ms: started_ms + 200_000,
+            },
+        ];
+        let (laps, _) = lap_messages(&detail);
+        assert_eq!(laps.len(), 2);
     }
 
     #[test]

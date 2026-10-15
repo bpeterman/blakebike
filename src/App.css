@@ -189,6 +189,18 @@ p { color: #8d9587; font-size: 13px; }
 .live-ride-grid .workout-controls-card,
 .live-ride-grid .live-chart,
 .live-ride-grid .zone-chart-grid { margin-top: 0; }
+.lap-timer-card { display: grid; grid-template-columns: minmax(0, 1.6fr) repeat(2, minmax(0, 1fr)) auto; align-items: center; gap: 18px; padding: 17px 20px; border-radius: 11px; transition: border-color .2s, background-color .2s; }
+.lap-timer-card .label { display: flex; align-items: center; gap: 6px; }
+.lap-timer-clock { display: block; margin: 7px 0 4px; font-size: 56px; line-height: 1; letter-spacing: -.04em; font-variant-numeric: tabular-nums; color: #c8ff32; }
+.lap-timer-card.resting .lap-timer-clock { color: #7cc7ff; }
+.lap-timer-caption { color: #9aa394; font-size: 12px; }
+.lap-timer-column { display: grid; gap: 4px; padding-left: 18px; border-left: 1px solid #2d322b; color: #9aa394; font-size: 12px; }
+.lap-timer-column strong { color: #e8ede3; font-size: 26px; letter-spacing: -.03em; font-variant-numeric: tabular-nums; }
+.lap-timer-action { display: grid; justify-items: center; gap: 6px; color: #768071; font-size: 10px; }
+.lap-timer-action .primary { min-width: 96px; }
+.lap-timer-card.flash { animation: lap-timer-flash .7s ease-out; }
+@keyframes lap-timer-flash { from { border-color: #c8ff32; background-color: #2e3a17; } to { border-color: #292e27; background-color: #191c18; } }
+@media (max-width: 760px) { .lap-timer-card { grid-template-columns: repeat(2, minmax(0, 1fr)); } .lap-timer-main { grid-column: 1 / -1; } .lap-timer-action { grid-column: 1 / -1; } }
 .live-metric { padding: 17px; border: 1px solid #2d322b; border-radius: 11px; background: #191c18; }
 .live-metric > span { display: flex; align-items: center; gap: 6px; color: #768071; font-size: 9px; font-weight: 700; letter-spacing: .08em; }
 .live-metric > strong { display: block; margin-top: 7px; font-size: 35px; line-height: 1; letter-spacing: -.04em; }
@@ -303,6 +315,8 @@ textarea { min-height: 70px; resize: vertical; }
 .ride-slot-kind { min-width: 44px; color: #768071; font-size: 9px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
 .ride-slot-controls select { height: 30px; padding: 0 8px; border: 1px solid #2d322b; border-radius: 7px; color: #dce5d3; background: #191c18; font-size: 12px; }
 .ride-slot-controls select:disabled { opacity: .5; }
+.lap-timer-seconds { display: flex; align-items: center; gap: 6px; color: #768071; font-size: 11px; }
+.lap-timer-seconds input { width: 64px; height: 30px; padding: 0 8px; border: 1px solid #2d322b; border-radius: 7px; color: #dce5d3; background: #191c18; font-size: 12px; }
 .ride-card-order { display: flex; gap: 4px; }
 .ride-card-order .icon-button { width: 32px; height: 30px; }
 .ride-card-order .icon-button:disabled { opacity: .28; cursor: default; }

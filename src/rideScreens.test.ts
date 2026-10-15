@@ -20,6 +20,41 @@ const field = (
   }) as RideScreenItem;
 
 describe("ride screens", () => {
+  it("keeps one lap timer per screen and holds its drill to sensible lengths", () => {
+    const normalized = normalizeRideDisplayPreferences({
+      version: 3,
+      screens: [
+        {
+          id: "drills",
+          name: "Drills",
+          items: [
+            { kind: "lapTimer", timer: { mode: "countdown", workSeconds: 2.4, restSeconds: -10 } },
+            { kind: "lapTimer", timer: { mode: "manual", workSeconds: 30, restSeconds: 30 } },
+            field("cadence"),
+          ],
+        },
+      ],
+    });
+    expect(normalized.screens[0].items).toEqual([
+      { kind: "lapTimer", timer: { mode: "countdown", workSeconds: 5, restSeconds: 0 } },
+      field("cadence"),
+    ]);
+  });
+
+  it("drops slot kinds from a newer version", () => {
+    const normalized = normalizeRideDisplayPreferences({
+      version: 3,
+      screens: [
+        {
+          id: "ride",
+          name: "Ride",
+          items: [{ kind: "hologram" } as unknown as RideScreenItem, field("power")],
+        },
+      ],
+    });
+    expect(normalized.screens[0].items).toEqual([field("power")]);
+  });
+
   it("ships screens a rider can ride with out of the box", () => {
     expect(defaultRideDisplayPreferences.screens.map((screen) => screen.name)).toEqual([
       "Ride",
