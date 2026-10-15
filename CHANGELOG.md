@@ -19,18 +19,28 @@ Conventions:
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-15
+
+Lap timer for drills, %FTP fields, editable repeats, and workouts that roll into a free ride when they finish.
+
 ### Added
 
+- **Percent of FTP** ride fields: live, average and max power as a share of your FTP, for the whole ride or the current block, plus your target as a share of FTP. Add them in Settings → Ride screens.
+- Repeat blocks are fully editable in the workout builder: add a repeat, set how many times it runs, and add, edit, reorder or remove the steps inside it, or group neighbouring steps into a repeat. The preview stays pinned at the top and shows every repeat played out.
 - **Sync from Intervals.icu** now updates your rider weight and first name too. The weight feeds the distance estimate and W/kg. It comes from your newest Intervals.icu wellness weight from the last 90 days (the weight Intervals.icu itself uses for W/kg), or from your Intervals.icu settings if you have not logged one. The name fills the home-screen greeting. The result says which weight was used, from which day, and what each value replaced. To keep the weight and name you enter by hand, turn off **Sync rider profile (weight, name)** in the Intervals.icu card.
 - A lap timer for ride screens. Add it in **Settings → Ride screens**, then tap **Lap** or press **L** while riding: it shows the current and last lap times with their average cadence and power. Set it to **Countdown drill** for repeating on/off efforts (30 s on / 30 s off, or one repeating length) with a beep and a flash at every change. Laps stop with the ride clock when you pause, and they are saved with the ride as laps in its FIT file, so Garmin Connect and Intervals.icu show them too.
 - A **Total time** ride field that keeps counting through pauses, beside **Elapsed**, which counts only the time you ride. Add it in Settings → Ride screens under Time → Whole ride → Total (with pauses). Ride detail shows both too.
 
 ### Changed
 
+- Every dropdown now shows a chevron, so the **Auto** source pickers for power, cadence and heart rate read as something you can change.
+- Chart hover tooltips are easier to read: light text on a solid background, with a colour swatch for each line.
+- The ride screen's reset buttons say what they reset: **Back to plan** drops a block override, and **Reset bias**, now left of the bias stepper, sets bias back to 100%.
 - Reaching the end of a structured workout no longer ends the ride. The same ride keeps recording as a free ride in manual ERG (held at your last target, or eased down to 100 W if the workout ended harder than that), the ride screen says **Workout complete · free riding**, and you end it with **End** when you're done. The saved ride and its FIT file include the extra riding, and the ride still counts as completed.
 
 ### Fixed
 
+- W/kg shows a dash instead of an endless number when no rider weight is set.
 - FIT files now report pauses the way Garmin and Intervals.icu expect: timer time leaves pauses out, and elapsed time is the wall clock from start to finish. Before, both were set to the time ridden.
 - Skipping a workout block no longer counts the skipped time as time ridden, in Elapsed, the saved ride, or its FIT file.
 
