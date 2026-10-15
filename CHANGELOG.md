@@ -19,6 +19,14 @@ Conventions:
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-10-15
+
+blake.bike can find Bluetooth devices on Macs where macOS was quietly blocking it.
+
+### Fixed
+
+- On some Macs, every Bluetooth scan came back empty, even with Bluetooth on and devices nearby. The app was missing the signature macOS uses to tie the Bluetooth permission to it, so macOS never asked. After updating, scan once and choose **Allow** when macOS asks.
+
 ## [0.5.1] - 2026-10-15
 
 Scanning tells you when Bluetooth is off or blake.bike isn't allowed to use it, instead of showing an empty list.

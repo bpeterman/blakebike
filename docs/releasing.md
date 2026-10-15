@@ -68,7 +68,11 @@ changelog. Nothing is published unless the tag matches the committed version.
 
 The dmg is **not signed or notarized** — there is no Apple Developer account
 behind it yet, so the bundle carries only an ad-hoc signature and `spctl`
-rejects it with "no usable signature". On first launch macOS says it could not
+rejects it with "no usable signature". That ad-hoc signature still has to cover
+the whole bundle (`signingIdentity: "-"` in `tauri.conf.json`). Without it, the
+executable is only linker-signed under a random identifier, so macOS cannot tie
+Bluetooth permission to `com.bpeterman.blakebike` and scans silently find
+nothing. On first launch macOS says it could not
 verify the app, and the release notes walk people through **System Settings >
 Privacy & Security > Open Anyway**. Gatekeeper only asks once.
 
