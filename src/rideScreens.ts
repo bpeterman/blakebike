@@ -78,6 +78,7 @@ export const defaultRideDisplayPreferences: RideDisplayPreferences = {
         field("energy", "total"),
         field("calories", "total"),
         field("power", "average", "interval"),
+        field("ftpPercent"),
         field("heartRate", "average"),
         panel("heartRateChart"),
         panel("timeInZone"),
