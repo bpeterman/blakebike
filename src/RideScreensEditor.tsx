@@ -1,5 +1,16 @@
 import { useEffect, useState } from "react";
 import { ChevronDown, ChevronUp, Plus, Trash2 } from "lucide-react";
+import { EditableNumberInput } from "./EditableNumberInput";
+import {
+  LAP_TIMER_REST_SECONDS,
+  LAP_TIMER_WORK_SECONDS,
+  defaultLapTimerSettings,
+  isLapTimerMode,
+  lapTimerModeLabels,
+  lapTimerModes,
+  normalizeLapTimerSettings,
+  type LapTimerSettings,
+} from "./lapTimer";
 import {
   firstRideField,
   rideAggregatesFor,
@@ -21,6 +32,7 @@ import {
 import {
   MAX_RIDE_SCREENS,
   defaultRideDisplayPreferences,
+  rideScreenItemKey,
   rideSlotSpans,
   type RideDisplayPreferences,
   type RideScreen,
@@ -35,11 +47,10 @@ const spanLabels: Record<RideSlotSpan, string> = {
 };
 
 const usedKeys = (screen: RideScreen): Set<string> =>
-  new Set(
-    screen.items.map((item) =>
-      item.kind === "field" ? `field:${rideFieldKey(item.field)}` : `panel:${item.panel}`,
-    ),
-  );
+  new Set(screen.items.map(rideScreenItemKey));
+
+const hasLapTimer = (screen: RideScreen): boolean =>
+  screen.items.some((item) => item.kind === "lapTimer");
 
 /** The first field this screen does not already show. */
 const nextField = (screen: RideScreen): RideField | null => {
@@ -99,8 +110,9 @@ export function RideScreensEditor({
         <h2>Ride screens</h2>
         <p>
           Build the screens you ride by. Each screen holds fields — a metric, over the whole ride or
-          just the current block, live or averaged — and the larger panels like the workout timeline
-          and the charts. Page between screens while riding with the tabs or the ← and → keys.
+          just the current block, live or averaged — the larger panels like the workout timeline
+          and the charts, and a lap timer for drills. Page between screens while riding with the
+          tabs or the ← and → keys; press L to mark a lap.
         </p>
       </div>
       <div className="ride-layout-settings">
@@ -151,20 +163,19 @@ export function RideScreensEditor({
               </div>
             </div>
             <div className="ride-card-list">
-              {screen.items.map((item, itemIndex) => (
-                <div
-                  className="ride-card-setting"
-                  key={item.kind === "field" ? rideFieldKey(item.field) : item.panel}
-                >
+              {screen.items.map((item, itemIndex) => {
+                const replace = (next: RideScreenItem) =>
+                  updateItems(screenIndex, (items) =>
+                    items.map((current, index) => (index === itemIndex ? next : current)),
+                  );
+                return (
+                <div className="ride-card-setting" key={rideScreenItemKey(item)}>
                   {item.kind === "field" ? (
-                    <FieldRow
-                      field={item.field}
-                      span={item.span}
-                      onChange={(next) =>
-                        updateItems(screenIndex, (items) =>
-                          items.map((current, index) => (index === itemIndex ? next : current)),
-                        )
-                      }
+                    <FieldRow field={item.field} span={item.span} onChange={replace} />
+                  ) : item.kind === "lapTimer" ? (
+                    <LapTimerRow
+                      timer={item.timer}
+                      onChange={(timer) => replace({ kind: "lapTimer", timer })}
                     />
                   ) : (
                     <div className="ride-slot-controls">
@@ -173,15 +184,10 @@ export function RideScreensEditor({
                         <span className="sr-only">Panel</span>
                         <select
                           value={item.panel}
-                          onChange={(event) =>
-                            updateItems(screenIndex, (items) =>
-                              items.map((current, index) =>
-                                index === itemIndex
-                                  ? { kind: "panel", panel: event.target.value as RidePanelId }
-                                  : current,
-                              ),
-                            )
-                          }
+                          onChange={(event) => {
+                            const panel = ridePanelIds.find((id) => id === event.target.value);
+                            if (panel !== undefined) replace({ kind: "panel", panel });
+                          }}
                         >
                           {ridePanelIds.map((panel) => (
                             <option key={panel} value={panel}>
@@ -225,7 +231,8 @@ export function RideScreensEditor({
                     </button>
                   </div>
                 </div>
-              ))}
+                );
+              })}
             </div>
             <div className="ride-screen-add">
               <button
@@ -251,6 +258,19 @@ export function RideScreensEditor({
                 }}
               >
                 <Plus size={15} /> Add panel
+              </button>
+              <button
+                type="button"
+                className="secondary"
+                disabled={hasLapTimer(screen)}
+                onClick={() =>
+                  updateItems(screenIndex, (items) => [
+                    ...items,
+                    { kind: "lapTimer", timer: defaultLapTimerSettings },
+                  ])
+                }
+              >
+                <Plus size={15} /> Add lap timer
               </button>
             </div>
           </div>
@@ -368,6 +388,67 @@ function FieldRow({
           ))}
         </select>
       </label>
+    </div>
+  );
+}
+
+/** Manual laps, or a countdown drill that repeats work (and optional rest) and restarts at each lap. */
+function LapTimerRow({
+  timer,
+  onChange,
+}: {
+  timer: LapTimerSettings;
+  onChange: (timer: LapTimerSettings) => void;
+}) {
+  const change = (next: Partial<LapTimerSettings>) =>
+    onChange(normalizeLapTimerSettings({ ...timer, ...next }));
+  return (
+    <div className="ride-slot-controls lap-timer-setting">
+      <span className="ride-slot-kind">Lap timer</span>
+      <label>
+        <span className="sr-only">Lap timer mode</span>
+        <select
+          value={timer.mode}
+          onChange={(event) => {
+            const mode = event.target.value;
+            if (isLapTimerMode(mode)) change({ mode });
+          }}
+        >
+          {lapTimerModes.map((mode) => (
+            <option key={mode} value={mode}>
+              {lapTimerModeLabels[mode]}
+            </option>
+          ))}
+        </select>
+      </label>
+      {timer.mode === "countdown" && (
+        <>
+          <label className="lap-timer-seconds">
+            <span>On</span>
+            <EditableNumberInput
+              aria-label="Drill work seconds"
+              value={timer.workSeconds}
+              min={LAP_TIMER_WORK_SECONDS.min}
+              max={LAP_TIMER_WORK_SECONDS.max}
+              step={5}
+              onValueChange={(workSeconds) => change({ workSeconds })}
+            />
+            <span>s</span>
+          </label>
+          <label className="lap-timer-seconds">
+            <span>Off</span>
+            <EditableNumberInput
+              aria-label="Drill rest seconds"
+              value={timer.restSeconds}
+              min={LAP_TIMER_REST_SECONDS.min}
+              max={LAP_TIMER_REST_SECONDS.max}
+              step={5}
+              onValueChange={(restSeconds) => change({ restSeconds })}
+            />
+            <span>s</span>
+          </label>
+        </>
+      )}
     </div>
   );
 }

@@ -25,6 +25,7 @@ const running: RunnerState = {
   overrideActive: false,
   workoutComplete: false,
   biasPercent: 100,
+  laps: [],
 };
 
 const session = {

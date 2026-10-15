@@ -222,6 +222,7 @@ pub fn run() {
             commands::set_ride_display_preferences,
             commands::pause_or_resume_workout,
             commands::skip_interval,
+            commands::mark_lap,
             commands::stop_workout,
             commands::list_sessions,
             commands::get_session,

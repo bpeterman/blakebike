@@ -18,7 +18,6 @@ pub struct DistanceEstimate {
     pub points: Vec<DistancePoint>,
     pub total_meters: f64,
     pub source: Option<DistanceSource>,
-    pub max_speed_mps: Option<f64>,
 }
 
 /// Folds samples into a running distance total. The live ride and the saved
@@ -31,7 +30,6 @@ pub struct DistanceAccumulator {
     meters: f64,
     used_trainer: bool,
     used_power: bool,
-    max_speed_mps: Option<f64>,
 }
 
 impl DistanceAccumulator {
@@ -42,7 +40,6 @@ impl DistanceAccumulator {
             meters: 0.0,
             used_trainer: false,
             used_power: false,
-            max_speed_mps: None,
         }
     }
 
@@ -58,10 +55,6 @@ impl DistanceAccumulator {
         };
         self.used_trainer |= trainer_speed;
         self.used_power |= !trainer_speed;
-        self.max_speed_mps = Some(
-            self.max_speed_mps
-                .map_or(speed_mps, |current| current.max(speed_mps)),
-        );
         if let Some((previous_timestamp, previous_speed)) = self.previous {
             let delta_seconds = (sample.timestamp_ms - previous_timestamp) as f64 / 1000.0;
             if delta_seconds > 0.0 && delta_seconds <= MAX_SAMPLE_GAP_SECONDS {
@@ -84,10 +77,6 @@ impl DistanceAccumulator {
             (false, false) => None,
         }
     }
-
-    pub fn max_speed_mps(&self) -> Option<f64> {
-        self.max_speed_mps
-    }
 }
 
 pub fn estimate_distance(samples: &[Telemetry], total_weight_kg: f32) -> DistanceEstimate {
@@ -103,7 +92,6 @@ pub fn estimate_distance(samples: &[Telemetry], total_weight_kg: f32) -> Distanc
         points,
         total_meters: accumulator.meters(),
         source: accumulator.source(),
-        max_speed_mps: accumulator.max_speed_mps(),
     }
 }
 

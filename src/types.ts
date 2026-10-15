@@ -408,6 +408,16 @@ export type Telemetry = {
 /** How the trainer is keeping up with the ride (absent on older payloads). */
 export type ControlStatus = "ok" | "degraded" | "lost";
 
+/**
+ * The moment the rider pressed Lap, on both clocks: riding time (which stops
+ * while paused) and wall time (which lines up with the samples). Each mark
+ * ends one lap and starts the next. Mirrors `LapMark` in `domain.rs`.
+ */
+export type LapMark = {
+  elapsedSeconds: number;
+  timestampMs: number;
+};
+
 export type RunnerState =
   | { status: "idle" }
   | {
@@ -439,6 +449,8 @@ export type RunnerState =
        */
       workoutComplete: boolean;
       biasPercent: number;
+      /** Manual laps marked so far this ride, oldest first. */
+      laps: LapMark[];
       control?: ControlStatus;
       recordingWarning?: string | null;
     }
@@ -459,6 +471,7 @@ export type RunnerState =
       overrideActive: boolean;
       workoutComplete: boolean;
       biasPercent: number;
+      laps: LapMark[];
       control?: ControlStatus;
       recordingWarning?: string | null;
     }
@@ -500,6 +513,7 @@ export const sessionWallClockSeconds = (
 export type SessionDetail = {
   summary: SessionSummary;
   samples: Telemetry[];
+  laps: LapMark[];
 };
 
 export type ZoneDefinition = {
@@ -906,13 +920,14 @@ export type RideKeyAction =
   | { kind: "screen"; delta: number }
   | { kind: "pause" }
   | { kind: "skip" }
+  | { kind: "lap" }
   | { kind: "end" };
 
 /**
  * Keyboard shortcuts on the live ride view: ↑/↓ nudge the target by 5 W,
  * Shift+↑/↓ nudge the workout bias by 1 %, ←/→ page between ride screens,
- * Space pauses/resumes, S skips the current workout block, and Escape
- * brings up the end-ride confirmation. Held keys do not repeat.
+ * Space pauses/resumes, S skips the current workout block, L marks a lap,
+ * and Escape brings up the end-ride confirmation. Held keys do not repeat.
  */
 export const rideKeyAction = (
   key: string,
@@ -925,6 +940,7 @@ export const rideKeyAction = (
     }
     if (key === " ") return { kind: "pause" };
     if (key === "s" || key === "S") return { kind: "skip" };
+    if (key === "l" || key === "L") return { kind: "lap" };
     if (key === "Escape") return { kind: "end" };
   }
   const delta = manualPowerDeltaForKey(key, repeat);

@@ -138,6 +138,7 @@ export const api = {
     invoke<void>("set_ride_display_preferences", { preferences }),
   pauseOrResume: () => invoke<void>("pause_or_resume_workout"),
   skipInterval: () => invoke<void>("skip_interval"),
+  markLap: () => invoke<void>("mark_lap"),
   stopWorkout: () => invoke<void>("stop_workout"),
   sessions: () => invoke<SessionSummary[]>("list_sessions"),
   session: (id: string) =>

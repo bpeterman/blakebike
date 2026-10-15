@@ -39,6 +39,7 @@ const session: SessionDetail = {
     distanceWeightKg: 84,
     completed: true,
   },
+  laps: [],
   samples: [
     { timestampMs: 1000, powerWatts: 205, cadenceRpm: 88, speedKph: 30, heartRateBpm: 150, targetPowerWatts: 200 },
   ],

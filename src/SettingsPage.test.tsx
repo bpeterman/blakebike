@@ -378,6 +378,28 @@ describe("Intervals.icu settings", () => {
     });
   });
 
+  it("adds one lap timer per screen and sets up its countdown drill", () => {
+    const onSaveRideDisplayPreferences = vi.fn();
+    renderSettings({ onSaveRideDisplayPreferences });
+
+    const [addToRide] = screen.getAllByRole("button", { name: "Add lap timer" });
+    fireEvent.click(addToRide);
+    // A screen holds one lap timer.
+    expect(screen.getAllByRole("button", { name: "Add lap timer" })[0]).toBeDisabled();
+    expect(screen.queryByLabelText("Drill work seconds")).not.toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText("Lap timer mode"), { target: { value: "countdown" } });
+    fireEvent.change(screen.getByLabelText("Drill work seconds"), { target: { value: "20" } });
+    fireEvent.change(screen.getByLabelText("Drill rest seconds"), { target: { value: "0" } });
+
+    fireEvent.click(screen.getByRole("button", { name: "Save ride layout" }));
+    const saved = onSaveRideDisplayPreferences.mock.calls[0][0];
+    expect(saved.screens[0].items.at(-1)).toEqual({
+      kind: "lapTimer",
+      timer: { mode: "countdown", workSeconds: 20, restSeconds: 0 },
+    });
+  });
+
   it("only offers scopes and aggregates the chosen metric has", () => {
     render(
       <SettingsPage

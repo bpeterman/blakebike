@@ -382,11 +382,24 @@ pub enum DistanceSource {
     Mixed,
 }
 
+/// The moment the rider pressed Lap, on both clocks: riding time (which stops
+/// while paused) and wall time (which lines up with the samples). Each mark
+/// ends one lap and starts the next. Mirrors `LapMark` in `src/types.ts`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LapMark {
+    pub elapsed_seconds: u32,
+    pub timestamp_ms: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionDetail {
     pub summary: SessionSummary,
     pub samples: Vec<Telemetry>,
+    /// Manual laps, oldest first; empty when the rider marked none.
+    #[serde(default)]
+    pub laps: Vec<LapMark>,
 }
 
 #[cfg(test)]
