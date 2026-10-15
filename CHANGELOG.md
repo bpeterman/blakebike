@@ -19,6 +19,10 @@ Conventions:
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-10-15
+
+Dropdown menus now show their chevron in the app, so it is clear you can change them.
+
 ### Fixed
 
 - Dropdown chevrons now show in the app itself. Its security policy was blocking the small built-in images they are drawn with, so 0.6.0 showed plain boxes.
