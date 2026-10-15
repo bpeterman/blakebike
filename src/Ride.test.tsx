@@ -349,7 +349,11 @@ describe("Ride charts", () => {
     expect(timeline?.nextElementSibling).toBe(controls);
     expect(controls?.nextElementSibling).toBe(powerChart);
     expect(screen.queryByRole("button", { name: "Pause" })).not.toBeInTheDocument();
-    expect(screen.getByLabelText("Workout bias")).toBeInTheDocument();
+    // Reset leads the stepper so − / % / + stay pinned right; at 100% it only holds its space.
+    const biasStepper = screen.getByLabelText("Workout bias");
+    expect([...biasStepper.children].map((node) => node.textContent)).toEqual(["Reset", "Bias", "−", "100%", "+"]);
+    expect(screen.queryByRole("button", { name: "Reset" })).not.toBeInTheDocument();
+    expect(biasStepper.firstElementChild).toBeDisabled();
 
     const pausedRunner: RunnerState = {
       ...structuredRunner,
@@ -363,6 +367,10 @@ describe("Ride charts", () => {
 
     rerender(<Ride {...commonProps} runner={{ ...structuredRunner, overrideActive: true, targetPowerWatts: 225 }} />);
     expect(screen.getByRole("button", { name: "Reset override · 200 W" })).toBeInTheDocument();
+
+    rerender(<Ride {...commonProps} runner={{ ...structuredRunner, biasPercent: 105 }} />);
+    expect(screen.getByLabelText("Workout bias").firstElementChild).toBe(screen.getByRole("button", { name: "Reset" }));
+    expect(screen.getByRole("button", { name: "Reset" })).toBeEnabled();
   });
 
   it("labels timeline blocks with biased targets and durations that follow the bias", () => {

@@ -1558,11 +1558,8 @@ export function Ride({
                 Reset override{plannedTarget !== null ? ` · ${plannedTarget} W` : ""}
               </button>
             )}
+            {/* Reset leads so the − / % / + controls stay pinned at the right edge; at 100% it keeps its space hidden. */}
             <div className="bias-stepper" aria-label="Workout bias">
-              <span>Bias</span>
-              <button type="button" className="secondary" onClick={() => void adjustBias(-BIAS_STEP_PERCENT)}>−</button>
-              <strong className={biasPercent === 100 ? "" : "active"}>{biasPercent}%</strong>
-              <button type="button" className="secondary" onClick={() => void adjustBias(BIAS_STEP_PERCENT)}>+</button>
               <button
                 type="button"
                 className={biasPercent === 100 ? "text-button bias-reset placeholder" : "text-button bias-reset"}
@@ -1573,6 +1570,10 @@ export function Ride({
               >
                 Reset
               </button>
+              <span>Bias</span>
+              <button type="button" className="secondary" onClick={() => void adjustBias(-BIAS_STEP_PERCENT)}>−</button>
+              <strong className={biasPercent === 100 ? "" : "active"}>{biasPercent}%</strong>
+              <button type="button" className="secondary" onClick={() => void adjustBias(BIAS_STEP_PERCENT)}>+</button>
             </div>
           </div>
         )}
