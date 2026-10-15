@@ -1,0 +1,2732 @@
+import {
+  type ReactNode,
+  memo,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import {
+  Activity,
+  Bike,
+  Bluetooth,
+  Route,
+  ChevronDown,
+  ChevronRight,
+  CircleStop,
+  Download,
+  ExternalLink,
+  Gauge,
+  Flame,
+  HeartPulse,
+  History,
+  Info,
+  Library,
+  Pause,
+  Play,
+  Plus,
+  Scale,
+  RefreshCw,
+  Settings,
+  SkipForward,
+  Target,
+  Timer,
+  Trash2,
+  Upload,
+  X,
+  Zap,
+} from "lucide-react";
+import {
+  Area,
+  AreaChart,
+  Bar,
+  BarChart,
+  CartesianGrid,
+  Cell,
+  ReferenceArea,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
+import { api } from "./api";
+import {
+  type ChartRange,
+  type RangeSummary,
+  summarizeRange,
+  useChartRangeDrag,
+} from "./chartRange";
+import {
+  formatReleaseDate,
+  releaseFor,
+  releases,
+  type Release,
+} from "./releaseNotes";
+import type {
+  DeviceRole,
+  DeviceState,
+  DevicesSnapshot,
+  Metric as SourceMetric,
+  PowerSmoothing,
+  Profile,
+
+  RunnerState,
+  SessionDetail,
+  SessionSummary,
+  SourceChoice,
+  SourcePreferences,
+  Telemetry,
+  TelemetrySources,
+  TrainingZoneSettings,
+  Workout,
+  WorkoutInterval,
+  WorkoutStep,
+  FtpSource,
+  IntervalsStatus,
+  IntervalsSyncReport,
+  IntervalsSyncSettings,
+  PlannedWorkout,
+  ZoneDefinition,
+  ZoneMode,
+} from "./types";
+import {
+  BIAS_STEP_PERCENT,
+  clampBias,
+  compileWorkoutIntervals,
+  defaultTrainingZoneSettings,
+  describeTrainingSync,
+  deviceRoleLabel,
+  deviceRoles,
+  formatDistance,
+  formatDuration,
+  formatIntervalTarget,
+  downsampleTelemetry,
+  effectiveHeartRateZones,
+  effectivePowerZones,
+  powerSmoothingLabel,
+  powerSmoothingOptions,
+  rideKeyAction,
+  timeInZones,
+  withActiveElapsed,
+  withSmoothedPower,
+  workoutDuration,
+  zoneModeLabel,
+  describeIntervalsSync,
+  describeLastSynced,
+  disconnectedIntervalsStatus,
+  isMirrored,
+  localCopyOf,
+  localDateString,
+  plannedOn,
+} from "./types";
+import {
+  resolveRideField,
+  rideFieldKey,
+  type RideField,
+  type RideFieldContext,
+  type RideMetric,
+  type RidePanelId,
+} from "./rideFields";
+import {
+  defaultRideDisplayPreferences,
+  migrateRideDisplayPreferences,
+  normalizeRideDisplayPreferences,
+  type RideDisplayPreferences,
+} from "./rideScreens";
+import { RideScreensEditor } from "./RideScreensEditor";
+import { DevicePicker } from "./DevicePicker";
+import { DevicesPage } from "./DevicesPage";
+import { CalibrationModal } from "./CalibrationModal";
+import { isConnected as slotConnected, sourceNote, zeroOffsetIsDue } from "./devices";
+import { DeviceStatsCard } from "./DeviceStats";
+import { SourceSelect } from "./SourceSelect";
+import { defaultSourcePreferences, withSourcePreference } from "./sourcePreferences";
+import { shouldPromptForPostRide } from "./postRide";
+import { ConfirmDialog } from "./ConfirmDialog";
+import { EditableNumberInput } from "./EditableNumberInput";
+import { Metric } from "./Metric";
+import { WorkoutEditor } from "./WorkoutEditor";
+import { WorkoutProfile } from "./WorkoutProfile";
+import { useDialog } from "./useDialog";
+import { zoneColorAt } from "./zones";
+import "./App.css";
+
+type Page = "home" | "workouts" | "devices" | "ride" | "history" | "settings";
+
+type PostRidePromptState = {
+  sessionId: string;
+  errorMessage: string | null;
+  saveWarning: string | null;
+};
+
+type UndoToastState = { message: string; action: () => Promise<void> };
+type FeedbackState = { kind: "working" | "success"; message: string };
+
+const LOG_LINES_KEPT = 200;
+
+const emptyTelemetry: Telemetry = {
+  timestampMs: 0,
+  powerWatts: 0,
+  cadenceRpm: null,
+  speedKph: null,
+  heartRateBpm: null,
+  targetPowerWatts: null,
+};
+
+/**
+ * The name of the power meter that will feed the ride and is due for a zero,
+ * or null when there is nothing to nudge about: no meter, the trainer is the
+ * power source, the meter cannot be zeroed, or it was zeroed recently.
+ */
+function zeroOffsetDueFor(hub: DevicesSnapshot | null, sources: TelemetrySources | undefined): string | null {
+  const slot = hub?.slots.find((candidate) => candidate.role === "power");
+  if (!slot || !slotConnected(slot.state) || !slot.stats.calibrationSupported) return null;
+  if ((sources ?? hub?.sources)?.power?.role !== "power") return null;
+  if (!zeroOffsetIsDue(slot.stats.lastCalibration)) return null;
+  return slot.state.status === "ready" || slot.state.status === "controlling" ? slot.state.device.name : null;
+}
+
+function App() {
+  const [page, setPage] = useState<Page>("home");
+  const [profile, setProfile] = useState<Profile | null>(null);
+  const [workouts, setWorkouts] = useState<Workout[]>([]);
+  const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  const [hub, setHub] = useState<DevicesSnapshot | null>(null);
+  const [runner, setRunner] = useState<RunnerState>({ status: "idle" });
+  const [telemetry, setTelemetry] = useState(emptyTelemetry);
+  const [telemetryHistory, setTelemetryHistory] = useState<Telemetry[]>([]);
+  const [powerSmoothing, setPowerSmoothing] = useState<PowerSmoothing>("instant");
+  const [trainingZones, setTrainingZones] = useState<TrainingZoneSettings>(
+    defaultTrainingZoneSettings,
+  );
+  const powerZones = useMemo(
+    () => (profile ? effectivePowerZones(trainingZones, profile.ftpWatts) : []),
+    [profile, trainingZones],
+  );
+  const [rideDisplayPreferences, setRideDisplayPreferences] =
+    useState<RideDisplayPreferences>(defaultRideDisplayPreferences);
+  const [devMode, setDevMode] = useState(false);
+  const [plannedWorkouts, setPlannedWorkouts] = useState<PlannedWorkout[]>([]);
+  const [intervalsStatus, setIntervalsStatus] = useState<IntervalsStatus>(disconnectedIntervalsStatus);
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [devicePicker, setDevicePicker] = useState<DeviceRole | null>(null);
+  const [calibrationRole, setCalibrationRole] = useState<DeviceRole | null>(null);
+  const [editor, setEditor] = useState<Workout | null>(null);
+  const [selectedWorkout, setSelectedWorkout] = useState<string | null>(null);
+  const [selectedSession, setSelectedSession] = useState<SessionDetail | null>(
+    null,
+  );
+  const [postRidePrompt, setPostRidePrompt] =
+    useState<PostRidePromptState | null>(null);
+  const [feedback, setFeedback] = useState<FeedbackState | null>(null);
+  const [undoToast, setUndoToast] = useState<UndoToastState | null>(null);
+  const [endRideConfirm, setEndRideConfirm] = useState(false);
+  const [endingRide, setEndingRide] = useState(false);
+  const importRef = useRef<HTMLInputElement>(null);
+  const runnerRef = useRef<RunnerState>(runner);
+  const liveSessionRef = useRef<string | null>(null);
+  const lastHistorySampleMsRef = useRef(0);
+
+  // Re-read everything the Intervals.icu mirrors feed: the calendar cache,
+  // the status line, and (when the library half ran) the workouts table.
+  const refreshIntervalsMirrors = useCallback(async (libraryChanged: boolean) => {
+    const [nextPlanned, nextStatus] = await Promise.all([api.plannedWorkouts(), api.intervalsStatus()]);
+    setPlannedWorkouts(nextPlanned);
+    setIntervalsStatus(nextStatus);
+    if (libraryChanged) setWorkouts(await api.workouts());
+  }, []);
+
+  // One sync for launch, "Sync now" and the home card. Throws on failure so a
+  // manual sync can toast; the backend has already stored the error, and the
+  // status re-read here puts it on the cards for the silent launch case.
+  const syncIntervals = useCallback(async (): Promise<IntervalsSyncReport> => {
+    try {
+      const report = await api.syncIntervals();
+      // A failed library half may still have written some rows before it
+      // stopped, so reload whenever that half ran at all.
+      await refreshIntervalsMirrors(report.library.status !== "off");
+      return report;
+    } catch (cause) {
+      await refreshIntervalsMirrors(false).catch(() => undefined);
+      throw cause;
+    }
+  }, [refreshIntervalsMirrors]);
+
+  const load = useCallback(async () => {
+    try {
+      const [
+        nextProfile,
+        nextWorkouts,
+        nextSessions,
+        nextHub,
+        nextRunner,
+        nextSmoothing,
+        nextZones,
+        nextRideDisplayPreferences,
+        nextDevMode,
+        nextPlanned,
+        nextIntervalsStatus,
+      ] =
+        await Promise.all([
+          api.profile(),
+          api.workouts(),
+          api.sessions(),
+          api.devicesSnapshot(),
+          api.runnerState(),
+          api.powerSmoothing(),
+          api.trainingZones(),
+          api.rideDisplayPreferences(),
+          api.devMode(),
+          api.plannedWorkouts(),
+          api.intervalsStatus(),
+        ]);
+      setProfile(nextProfile);
+      setWorkouts(nextWorkouts);
+      setSessions(nextSessions);
+      setHub(nextHub);
+      setRunner(nextRunner);
+      runnerRef.current = nextRunner;
+      setPowerSmoothing(nextSmoothing);
+      setTrainingZones(nextZones);
+      setRideDisplayPreferences(
+        migrateRideDisplayPreferences(nextRideDisplayPreferences),
+      );
+      setDevMode(nextDevMode);
+      setPlannedWorkouts(nextPlanned);
+      setIntervalsStatus(nextIntervalsStatus);
+      // The cached plan and library are already on screen; refresh them in
+      // the background. Offline, the cards keep the cache and show the error.
+      if (nextIntervalsStatus.configured) void syncIntervals().catch(() => undefined);
+      if (nextRunner.status === "running" || nextRunner.status === "paused") {
+        liveSessionRef.current = nextRunner.sessionId;
+        const session = await api.session(nextRunner.sessionId);
+        setTelemetryHistory(session?.samples ?? []);
+        lastHistorySampleMsRef.current =
+          session?.samples[session.samples.length - 1]?.timestampMs ?? 0;
+      }
+      setSelectedWorkout((current) => current ?? nextWorkouts[0]?.id ?? null);
+    } catch (cause) {
+      const message = messageOf(cause);
+      setError(message);
+      void api.reportError("initialization", message).catch(() => undefined);
+    }
+  }, [syncIntervals]);
+
+  useEffect(() => {
+    // Anything that escapes React (render errors, forgotten awaits) still
+    // lands in the backend log file.
+    const onError = (event: ErrorEvent) =>
+      void api.reportError("window.onerror", `${event.message} @ ${event.filename}:${event.lineno}`).catch(() => undefined);
+    const onRejection = (event: PromiseRejectionEvent) =>
+      void api.reportError("unhandledrejection", messageOf(event.reason)).catch(() => undefined);
+    window.addEventListener("error", onError);
+    window.addEventListener("unhandledrejection", onRejection);
+    return () => {
+      window.removeEventListener("error", onError);
+      window.removeEventListener("unhandledrejection", onRejection);
+    };
+  }, []);
+
+  useEffect(() => {
+    void api.reportEvent("navigate", page).catch(() => undefined);
+  }, [page]);
+
+  useEffect(() => {
+    void load();
+    // Subscriptions resolve asynchronously; if this effect is cleaned up
+    // before one resolves (StrictMode, fast unmount), unsubscribe it at once
+    // instead of leaking a duplicate handler.
+    let cancelled = false;
+    const subscriptions: Array<() => void> = [];
+    const track = (subscription: Promise<() => void>) => {
+      void subscription.then((off) => {
+        if (cancelled) off();
+        else subscriptions.push(off);
+      });
+    };
+    track(api.onTelemetry((sample) => {
+      setTelemetry(sample);
+      if (
+        runnerRef.current.status === "running" &&
+        sample.timestampMs - lastHistorySampleMsRef.current >= 1_000
+      ) {
+        lastHistorySampleMsRef.current = sample.timestampMs;
+        setTelemetryHistory((history) => [...history, sample]);
+      }
+    }));
+    track(api.onRunnerState((state) => {
+      const previousState = runnerRef.current;
+      setRunner(state);
+      runnerRef.current = state;
+      if (
+        state.status === "running" &&
+        liveSessionRef.current !== state.sessionId
+      ) {
+        liveSessionRef.current = state.sessionId;
+        lastHistorySampleMsRef.current = 0;
+        setTelemetryHistory([]);
+      }
+      if (state.status === "finished" || state.status === "error") {
+        void api.sessions().then(setSessions);
+      }
+      if (shouldPromptForPostRide(previousState, state)) {
+        const sessionId = state.sessionId;
+        const errorMessage = state.status === "error" ? state.message : null;
+        const saveWarning = state.status === "finished" ? state.saveWarning ?? null : null;
+        setPostRidePrompt(null);
+        void api.session(sessionId).then((session) => {
+          if (!session) {
+            setPostRidePrompt({ sessionId, errorMessage, saveWarning });
+            return;
+          }
+          setSelectedSession(session);
+          setPage("history");
+        }).catch(() => {
+          // If the saved ride cannot be loaded immediately, retain the
+          // existing recovery prompt so the rider can try again.
+          setPostRidePrompt({ sessionId, errorMessage, saveWarning });
+        });
+      }
+    }));
+    // Devices hub: whole-slot updates on state/stats changes, plus individual
+    // log lines so the per-device logs grow live between snapshots.
+    track(api.onDeviceSlot((slot) => {
+      setHub((current) =>
+        current
+          ? { ...current, slots: current.slots.map((existing) => (existing.role === slot.role ? slot : existing)) }
+          : current,
+      );
+    }));
+    track(api.onDeviceLog(({ role, line }) => {
+      setHub((current) =>
+        current
+          ? {
+              ...current,
+              slots: current.slots.map((existing) =>
+                existing.role === role
+                  ? { ...existing, log: [...existing.log.slice(-(LOG_LINES_KEPT - 1)), line] }
+                  : existing,
+              ),
+            }
+          : current,
+      );
+    }));
+    return () => {
+      cancelled = true;
+      subscriptions.forEach((off) => off());
+    };
+  }, [load]);
+
+  const deviceState: DeviceState =
+    hub?.slots.find((slot) => slot.role === "trainer")?.state ?? { status: "idle" };
+  const connected =
+    deviceState.status === "ready" || deviceState.status === "controlling";
+  const connectedRoles = deviceRoles.filter((role) =>
+    slotConnected(hub?.slots.find((slot) => slot.role === role)?.state),
+  );
+  const active =
+    runner.status === "running" ||
+    runner.status === "paused";
+  const riding = runner.status === "running" || runner.status === "paused";
+
+  const perform = useCallback(async (action: () => Promise<unknown>, label = "user action") => {
+    const visibleFeedback = !label.startsWith("load ");
+    try {
+      setError(null);
+      setNotice(null);
+      if (visibleFeedback) setFeedback({ kind: "working", message: workingCopy(label) });
+      const result = await action();
+      if (visibleFeedback) {
+        setFeedback(result === false || result === null
+          ? null
+          : { kind: "success", message: successCopy(label) });
+      }
+    } catch (cause) {
+      const message = messageOf(cause);
+      setFeedback(null);
+      setError(message);
+      void api.reportError(label, message).catch(() => undefined);
+    } finally {
+      // Scan-level state (including the optional ANT adapter) is not tied to a
+      // role slot event, so refresh the compact hub snapshot after actions.
+      void api.devicesSnapshot().then(setHub).catch(() => undefined);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (feedback?.kind !== "success") return;
+    const timer = window.setTimeout(() => setFeedback(null), 2_600);
+    return () => window.clearTimeout(timer);
+  }, [feedback]);
+
+  useEffect(() => {
+    if (!undoToast) return;
+    const timer = window.setTimeout(() => setUndoToast(null), 8_000);
+    return () => window.clearTimeout(timer);
+  }, [undoToast]);
+
+  const offerUndo = useCallback((message: string, action: () => Promise<void>) => {
+    setUndoToast({ message, action });
+  }, []);
+
+  const runUndo = async () => {
+    const pending = undoToast;
+    if (!pending) return;
+    setUndoToast(null);
+    await perform(pending.action, "restore removed item");
+  };
+
+  // The smoothing choice is remembered across launches; apply it at once and
+  // save in the background so the toggle never feels laggy.
+  const changePowerSmoothing = (smoothing: PowerSmoothing) => {
+    setPowerSmoothing(smoothing);
+    void api.savePowerSmoothing(smoothing).catch((cause) =>
+      void api.reportError("save power smoothing", messageOf(cause)).catch(() => undefined),
+    );
+  };
+
+  const changeSourcePreference = (metric: SourceMetric, choice: SourceChoice) => {
+    const next = withSourcePreference(
+      hub?.sourcePreferences ?? defaultSourcePreferences,
+      metric,
+      choice,
+    );
+    setHub((current) => current ? { ...current, sourcePreferences: next } : current);
+    void perform(() => api.saveSourcePreferences(next), "save source preferences");
+  };
+
+  const openSession = useCallback(async (sessionId: string) => {
+    await perform(async () => {
+      const session = await api.session(sessionId);
+      if (!session) throw new Error("The saved ride could not be found");
+      setSelectedSession(session);
+      setPage("history");
+      setPostRidePrompt(null);
+    }, "open session");
+  }, [perform]);
+
+  const openRide = (workoutId: string) => {
+    setSelectedWorkout(workoutId);
+    setPage("ride");
+  };
+
+  // "Start" on the home screen: with a trainer connected the ride begins at
+  // once; otherwise the Ride page opens with the plan selected so the rider
+  // can connect first.
+  const startPlanned = (workoutId: string) => {
+    openRide(workoutId);
+    if (connected) void perform(() => api.startWorkout(workoutId), "start workout");
+  };
+
+  const startFreeRideFromHome = () => {
+    setPage("ride");
+    if (connected) void perform(() => api.startFreeRide(), "start free ride");
+  };
+
+  // Today's plan, shown on the home screen and at the top of the ride picker
+  // only while the calendar mirror is on; the cache itself is cleared when the
+  // toggle goes off, this just keeps the two views in step immediately.
+  const plannedToday = useMemo(
+    () =>
+      intervalsStatus.configured && intervalsStatus.settings.calendar
+        ? plannedOn(plannedWorkouts, localDateString())
+        : [],
+    [intervalsStatus, plannedWorkouts],
+  );
+
+  const importZwo = async (file: File) => {
+    await perform(async () => {
+      await api.importZwo(await file.text());
+      setWorkouts(await api.workouts());
+    }, "import zwo");
+  };
+
+  const navItems: Array<[Page, string, typeof Activity]> = [
+    ["home", "Overview", Activity],
+    ["workouts", "Workouts", Library],
+    ["ride", "Ride", Bike],
+    ["history", "History", History],
+    ["devices", "Devices", Bluetooth],
+    ["settings", "Settings", Settings],
+  ];
+
+  if (!profile) {
+    return (
+      <div className="loading">
+        {error ? (
+          <div className="loading-error">
+            <h2>blake.bike could not start</h2>
+            <p>{error}</p>
+            <button type="button" onClick={() => { setError(null); void load(); }}>
+              Try again
+            </button>
+          </div>
+        ) : (
+          "Preparing your training space…"
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div className="app-shell">
+      <aside className="sidebar">
+        <div className="brand">
+          <img className="brand-mark" src="/blakebike-icon.svg" alt="" />
+          <span>blake.bike</span>
+        </div>
+        <nav>
+          {navItems.map(([id, label, Icon]) => (
+            <button
+              className={page === id ? "nav-item active" : "nav-item"}
+              key={id}
+              onClick={() => setPage(id)}
+            >
+              <Icon size={19} />
+              <span>{label}</span>
+              {id === "ride" && active && <i className="live-dot" />}
+            </button>
+          ))}
+        </nav>
+        <div className="sidebar-bottom">
+          {riding && (
+            <div className="sidebar-ride-controls">
+              <span className="label">RIDE CONTROLS</span>
+              <div>
+                <button className="secondary" onClick={() => void perform(() => api.pauseOrResume(), "pause/resume")}>
+                  {runner.status === "paused" ? <Play /> : <Pause />}
+                  {runner.status === "paused" ? "Resume" : "Pause"}
+                </button>
+                <button className="stop" onClick={() => setEndRideConfirm(true)}>
+                  <CircleStop /> End
+                </button>
+              </div>
+            </div>
+          )}
+          <button className="connection-pill" onClick={() => setPage("devices")}>
+            <span className="role-dots">
+              {deviceRoles.map((role) => {
+                const state = hub?.slots.find((slot) => slot.role === role)?.state;
+                const tone =
+                  slotConnected(state) ? "online"
+                  : state?.status === "reconnecting" || state?.status === "error" ? "error"
+                  : state?.status === "connecting" ? "busy"
+                  : "";
+                return <span key={role} className={`status-dot ${tone}`} title={deviceRoleLabel[role]} />;
+              })}
+            </span>
+            <span>
+              <small>DEVICES</small>
+              <strong>
+                {connectedRoles.length === 0
+                  ? "None connected"
+                  : connected && connectedRoles.length === 1
+                    ? deviceState.device.name
+                    : `${connectedRoles.length} of ${deviceRoles.length} connected`}
+              </strong>
+            </span>
+            <ChevronRight size={16} />
+          </button>
+        </div>
+      </aside>
+
+      <main className="content">
+        {page === "home" && (
+          <Overview
+            profile={profile}
+            powerZones={powerZones}
+            workouts={workouts}
+            sessions={sessions}
+            connected={connected}
+            devMode={devMode}
+            plannedToday={plannedToday}
+            intervalsStatus={intervalsStatus}
+            onConnect={() => setDevicePicker("trainer")}
+            onRide={openRide}
+            onStartPlanned={startPlanned}
+            onStartFreeRide={startFreeRideFromHome}
+            onSyncIntervals={() => perform(() => syncIntervals(), "sync Intervals.icu")}
+            onNavigate={setPage}
+            onSyncTrainingSettings={() =>
+              perform(async () => {
+                const result = await api.syncTrainingSettings();
+                setProfile(result.profile);
+                setTrainingZones(result.zones);
+              }, "sync training settings")
+            }
+          />
+        )}
+        {page === "devices" && (
+          <DevicesPage
+            hub={hub}
+            sources={telemetry.sources}
+            onConnect={setDevicePicker}
+            onCalibrate={setCalibrationRole}
+            onSourcePreference={changeSourcePreference}
+            onNotice={setNotice}
+            onOfferUndo={offerUndo}
+            rideActive={riding}
+            perform={perform}
+          />
+        )}
+        {page === "workouts" && (
+          <WorkoutLibrary
+            workouts={workouts}
+            ftp={profile.ftpWatts}
+            powerZones={powerZones}
+            onCreate={() => setEditor(newWorkout())}
+            onEdit={setEditor}
+            onRide={openRide}
+            onDelete={(workout) =>
+              void perform(async () => {
+                await api.deleteWorkout(workout.id);
+                setWorkouts(await api.workouts());
+                offerUndo(`“${workout.name}” deleted.`, async () => {
+                  await api.saveWorkout(workout);
+                  setWorkouts(await api.workouts());
+                });
+              }, "delete workout")
+            }
+            onExport={(workout) => void perform(() => api.exportZwo(workout), "export zwo")}
+            onExportAll={() =>
+              void perform(async () => {
+                const result = await api.exportAllZwo();
+                if (result) {
+                  const label = result.exportedCount === 1 ? "workout" : "workouts";
+                  setNotice(`Exported ${result.exportedCount} ${label} to ${result.directory}`);
+                }
+                return false;
+              }, "export workout library")
+            }
+            onImport={() => importRef.current?.click()}
+          />
+        )}
+        {page === "ride" && (
+          <Ride
+            workouts={workouts}
+            plannedToday={plannedToday}
+            selectedWorkout={selectedWorkout}
+            setSelectedWorkout={setSelectedWorkout}
+            connected={connected}
+            onConnect={() => setDevicePicker("trainer")}
+            zeroOffsetDue={zeroOffsetDueFor(hub, telemetry.sources)}
+            onZeroOffset={() => setCalibrationRole("power")}
+            runner={runner}
+            telemetry={telemetry}
+            telemetryHistory={telemetryHistory}
+            powerSmoothing={powerSmoothing}
+            onPowerSmoothing={changePowerSmoothing}
+            sourcePreferences={hub?.sourcePreferences ?? defaultSourcePreferences}
+            onSourcePreference={changeSourcePreference}
+            hub={hub}
+            profile={profile}
+            trainingZones={trainingZones}
+            displayPreferences={rideDisplayPreferences}
+            onBrowseWorkouts={() => setPage("workouts")}
+            onEndRequest={() => setEndRideConfirm(true)}
+            endRideConfirmOpen={endRideConfirm}
+            perform={perform}
+          />
+        )}
+        {page === "history" && (
+          <HistoryPage
+            sessions={sessions}
+            selected={selectedSession}
+            profile={profile}
+            trainingZones={trainingZones}
+            onSelect={(session) =>
+              void openSession(session.id)
+            }
+            onClose={() => setSelectedSession(null)}
+            onExport={(session) =>
+              void perform(() => api.exportSessionCsv(session), "export csv")
+            }
+            onExportFit={(session) =>
+              void perform(() => api.exportSessionFit(session), "export fit")
+            }
+            onGarmin={(session) =>
+              void perform(() => api.prepareGarminUpload(session.id), "prepare Garmin upload")
+            }
+          />
+        )}
+        {page === "settings" && (
+          <SettingsPage
+            profile={profile}
+            trainingZones={trainingZones}
+            rideDisplayPreferences={rideDisplayPreferences}
+            devMode={devMode}
+            perform={perform}
+            onProfileUpdate={setProfile}
+            onTrainingZonesUpdate={setTrainingZones}
+            onSave={(next) =>
+              void perform(async () => {
+                await api.saveProfile(next);
+                setProfile(next);
+              }, "save profile")
+            }
+            onSaveTrainingZones={(zones) =>
+              void perform(async () => {
+                await api.saveTrainingZones(zones);
+                setTrainingZones(zones);
+              }, "save training zones")
+            }
+            onSaveRideDisplayPreferences={(preferences) =>
+              void perform(async () => {
+                const normalized = normalizeRideDisplayPreferences(preferences);
+                await api.saveRideDisplayPreferences(normalized);
+                setRideDisplayPreferences(normalized);
+              }, "save ride layout")
+            }
+            onForgetDevices={() => perform(async () => {
+              const remembered = await api.knownDevices();
+              await api.forgetAllDevices();
+              if (remembered.length > 0) {
+                offerUndo(`${remembered.length} remembered ${remembered.length === 1 ? "device" : "devices"} removed.`, () => api.restoreKnownDevices(remembered));
+              }
+            }, "forget all devices")}
+            onDevMode={(enabled) =>
+              void perform(async () => {
+                await api.saveDevMode(enabled);
+                setDevMode(enabled);
+              }, "save developer mode")
+            }
+            intervalsStatus={intervalsStatus}
+            onSaveIntervalsKey={async (apiKey) => {
+              setIntervalsStatus(await api.saveIntervalsApiKey(apiKey));
+              // First sync right away so the plan and library appear; a
+              // failure lands in the status line, not on top of "saved".
+              await syncIntervals().catch(() => undefined);
+            }}
+            onClearIntervalsKey={async () => {
+              setIntervalsStatus(await api.clearIntervalsApiKey());
+              setPlannedWorkouts([]);
+              setWorkouts(await api.workouts());
+            }}
+            onIntervalsSyncSettings={async (settings) => {
+              // Turning a mirror off purges its copies on the backend, so the
+              // plan, the library and the status all need a re-read.
+              setIntervalsStatus(await api.saveIntervalsSyncSettings(settings));
+              await refreshIntervalsMirrors(true);
+            }}
+            onSyncIntervals={syncIntervals}
+          />
+        )}
+        {page !== "ride" && riding && runner.recordingWarning && <RecordingWarning message={runner.recordingWarning} />}
+      </main>
+
+      <div className="toast-stack" aria-live="polite">
+      {error && (
+        <div className="toast error-toast" role="alert">
+          <span>{error}</span>
+          <button onClick={() => setError(null)} aria-label="Dismiss error"><X size={17} /></button>
+        </div>
+      )}
+      {notice && (
+        <div className="toast success-toast" role="status">
+          <span>{notice}</span>
+          <button onClick={() => setNotice(null)} aria-label="Dismiss notification"><X size={17} /></button>
+        </div>
+      )}
+      {postRidePrompt && (
+        <PostRidePrompt
+          errorMessage={postRidePrompt.errorMessage}
+          saveWarning={postRidePrompt.saveWarning}
+          onView={() => void openSession(postRidePrompt.sessionId)}
+          onDismiss={() => setPostRidePrompt(null)}
+        />
+      )}
+      {feedback && (
+        <div className={`toast action-toast ${feedback.kind === "working" ? "working-toast" : "success-toast"}`} role="status">
+          {feedback.kind === "working" ? <span className="mini-spinner" aria-hidden="true" /> : <span className="success-mark" aria-hidden="true">✓</span>}
+          <span>{feedback.message}</span>
+        </div>
+      )}
+      {undoToast && (
+        <div className="toast undo-toast" role="status">
+          <span>{undoToast.message}</span>
+          <button className="undo-button" onClick={() => void runUndo()}>Undo</button>
+          <button onClick={() => setUndoToast(null)} aria-label="Dismiss undo"><X size={17} /></button>
+        </div>
+      )}
+      </div>
+      {endRideConfirm && (
+        <ConfirmDialog
+          title="End this ride?"
+          description="Your progress will be saved and the trainer target will be released. You can’t resume this ride afterward."
+          confirmLabel="End and save ride"
+          busyLabel="Ending ride…"
+          busy={endingRide}
+          onClose={() => setEndRideConfirm(false)}
+          onConfirm={() => {
+            setEndingRide(true);
+            void perform(async () => { await api.stopWorkout(); return false; }, "stop workout").finally(() => {
+              setEndingRide(false);
+              setEndRideConfirm(false);
+            });
+          }}
+        />
+      )}
+      {devicePicker && (
+        <DevicePicker
+          role={devicePicker}
+          slot={hub?.slots.find((slot) => slot.role === devicePicker)}
+          scanError={hub?.scanError ?? null}
+          antAdapter={hub?.antAdapter}
+          close={() => setDevicePicker(null)}
+          perform={perform}
+        />
+      )}
+      {calibrationRole && (
+        <CalibrationModal
+          role={calibrationRole}
+          slot={hub?.slots.find((slot) => slot.role === calibrationRole)}
+          speedKph={telemetry.speedKph}
+          close={() => setCalibrationRole(null)}
+        />
+      )}
+      {editor && (
+        <WorkoutEditor
+          initial={editor}
+          ftpWatts={profile.ftpWatts}
+          powerZones={powerZones}
+          close={() => setEditor(null)}
+          save={(workout) =>
+            void perform(async () => {
+              await api.saveWorkout(workout);
+              setWorkouts(await api.workouts());
+              setEditor(null);
+            }, "save workout")
+          }
+        />
+      )}
+      <input
+        ref={importRef}
+        hidden
+        type="file"
+        accept=".zwo,application/xml,text/xml"
+        onChange={(event) => {
+          const file = event.target.files?.[0];
+          if (file) void importZwo(file);
+          event.target.value = "";
+        }}
+      />
+    </div>
+  );
+}
+
+export default App;
+
+function PageHeader({
+  eyebrow,
+  title,
+  actions,
+}: {
+  eyebrow: string;
+  title: string;
+  actions?: React.ReactNode;
+}) {
+  return (
+    <header className="page-header">
+      <div><span>{eyebrow}</span><h1>{title}</h1></div>
+      <div className="header-actions">{actions}</div>
+    </header>
+  );
+}
+
+export function Overview({
+  profile,
+  powerZones,
+  workouts,
+  sessions,
+  connected,
+  devMode,
+  plannedToday = [],
+  intervalsStatus = disconnectedIntervalsStatus,
+  onConnect,
+  onRide,
+  onStartPlanned = () => undefined,
+  onStartFreeRide = () => undefined,
+  onSyncIntervals = () => Promise.resolve(),
+  onNavigate,
+  onSyncTrainingSettings,
+}: {
+  profile: Profile;
+  powerZones: readonly ZoneDefinition[];
+  workouts: Workout[];
+  sessions: SessionSummary[];
+  connected: boolean;
+  devMode: boolean;
+  /** Today's planned workouts from the Intervals.icu calendar cache. */
+  plannedToday?: PlannedWorkout[];
+  intervalsStatus?: IntervalsStatus;
+  onConnect: () => void;
+  onRide: (id: string) => void;
+  onStartPlanned?: (workoutId: string) => void;
+  onStartFreeRide?: () => void;
+  onSyncIntervals?: () => Promise<void>;
+  onNavigate: (page: Page) => void;
+  onSyncTrainingSettings: () => Promise<void>;
+}) {
+  const latest = sessions[0];
+  const [syncingTraining, setSyncingTraining] = useState(false);
+  const syncTraining = async () => {
+    setSyncingTraining(true);
+    try {
+      await onSyncTrainingSettings();
+    } finally {
+      setSyncingTraining(false);
+    }
+  };
+  return (
+    <>
+      <PageHeader eyebrow="GOOD EVENING" title={`Ready to ride, ${profile.name}?`} />
+      {intervalsStatus.configured && intervalsStatus.settings.calendar && (
+        <TodayPlanCard
+          planned={plannedToday}
+          status={intervalsStatus}
+          connected={connected}
+          ftpWatts={profile.ftpWatts}
+          powerZones={powerZones}
+          onStart={onStartPlanned}
+          onStartFreeRide={onStartFreeRide}
+          onRefresh={onSyncIntervals}
+        />
+      )}
+      <section className="hero-grid">
+        <article className="card connection-card">
+          <div className="card-icon"><Bluetooth /></div>
+          <div><span className="label">SMART TRAINER</span><h2>{connected ? "Trainer ready" : "Connect your trainer"}</h2>
+            <p>{connected ? "FTMS control is available. Choose a workout when you’re ready." : devMode ? "Pair an FTMS Bluetooth trainer or use the built-in simulator." : "Pair an FTMS Bluetooth trainer to get started."}</p>
+          </div>
+          <button className={connected ? "secondary" : "primary"} onClick={onConnect}>{connected ? "Manage" : "Connect"}</button>
+        </article>
+        <article className="card ftp-card">
+          <button
+            className="icon-button ftp-refresh"
+            title="Sync from Intervals.icu"
+            aria-label="Sync from Intervals.icu"
+            disabled={syncingTraining}
+            onClick={() => void syncTraining()}
+          >
+            <RefreshCw size={16} className={syncingTraining ? "spinning" : ""} />
+          </button>
+          <span className="label">CURRENT FTP</span>
+          <div className="big-number">{profile.ftpWatts}<small> W</small></div>
+          <p>Power targets scale from your rider profile.</p>
+          <button className="text-button" onClick={() => onNavigate("settings")}>Update profile <ChevronRight size={15} /></button>
+        </article>
+      </section>
+      <section className="section-heading"><div><span className="label">UP NEXT</span><h2>Choose a workout</h2></div><button className="text-button" onClick={() => onNavigate("workouts")}>View library <ChevronRight size={15} /></button></section>
+      <div className="workout-row">
+        {workouts.slice(0, 3).map((workout, index) => (
+          <article className="card workout-card" key={workout.id}>
+            <div className={`workout-visual tone-${index % 3}`}><WorkoutProfile steps={workout.steps} ftpWatts={profile.ftpWatts} powerZones={powerZones} /></div>
+            <span className="label">{formatDuration(workoutDuration(workout.steps))} · {workout.steps.length} BLOCKS</span>
+            <h3>{workout.name}</h3><p>{workout.description || "A structured power workout."}</p>
+            <button className="secondary" onClick={() => onRide(workout.id)}><Play size={16} fill="currentColor" /> Ride</button>
+          </article>
+        ))}
+      </div>
+      {latest && (
+        <section className="recent-strip" onClick={() => onNavigate("history")}>
+          <div className="card-icon subtle"><History /></div>
+          <div><span className="label">LATEST RIDE</span><strong>{latest.workoutName}</strong><small>{new Date(latest.startedAt).toLocaleDateString()}</small></div>
+          <Metric value={`${latest.averagePowerWatts}`} unit="W avg" />
+          <Metric value={formatDuration(latest.elapsedSeconds)} unit="duration" />
+          <ChevronRight />
+        </section>
+      )}
+    </>
+  );
+}
+
+/**
+ * Today's plan from Intervals.icu: name, structure, duration and planned load,
+ * with Start. Shows the cached plan when offline and says how old it is.
+ */
+export function TodayPlanCard({
+  planned,
+  status,
+  connected,
+  ftpWatts,
+  powerZones,
+  onStart,
+  onStartFreeRide,
+  onRefresh,
+}: {
+  planned: PlannedWorkout[];
+  status: IntervalsStatus;
+  connected: boolean;
+  ftpWatts: number;
+  powerZones: readonly ZoneDefinition[];
+  onStart: (workoutId: string) => void;
+  onStartFreeRide: () => void;
+  onRefresh: () => Promise<void>;
+}) {
+  const [refreshing, setRefreshing] = useState(false);
+  const refresh = async () => {
+    setRefreshing(true);
+    try {
+      await onRefresh();
+    } finally {
+      setRefreshing(false);
+    }
+  };
+  const syncLine = status.lastError
+    ? `${describeLastSynced(status.lastSyncedAt)} · ${
+        status.lastError.startsWith("Could not reach")
+          ? "Intervals.icu unreachable"
+          : `Last sync failed: ${status.lastError}`
+      }`
+    : describeLastSynced(status.lastSyncedAt);
+  return (
+    <section className="card today-card" aria-label="Today's plan">
+      <div className="today-head">
+        <div>
+          <span className="label">TODAY ON INTERVALS.ICU</span>
+          <h2>{planned.length === 0 ? "Nothing planned today" : planned.length === 1 ? planned[0].name : `${planned.length} workouts planned`}</h2>
+        </div>
+        <button
+          className="icon-button"
+          title="Refresh plan"
+          aria-label="Refresh plan"
+          disabled={refreshing}
+          onClick={() => void refresh()}
+        >
+          <RefreshCw size={16} className={refreshing ? "spinning" : ""} />
+        </button>
+      </div>
+      {planned.length === 0 && <p>Your Intervals.icu calendar has no ride planned for today. Pick a workout below or ride free.</p>}
+      {planned.map((entry) => (
+        <div className="today-entry" key={entry.eventId}>
+          {planned.length > 1 && <h3>{entry.name}</h3>}
+          {entry.workout ? (
+            <div className="today-visual"><WorkoutProfile steps={entry.workout.steps} ftpWatts={ftpWatts} powerZones={powerZones} /></div>
+          ) : (
+            <p className="settings-note">
+              {entry.parseError
+                ? `blake.bike could not read this workout's structure (${entry.parseError}). Ride it free and follow the plan on Intervals.icu.`
+                : "This workout has no structured steps on Intervals.icu. Ride it free and follow the plan there."}
+            </p>
+          )}
+          <div className="today-stats">
+            {entry.durationSeconds !== null && <Metric value={formatDuration(entry.durationSeconds)} unit="duration" />}
+            {entry.plannedLoad !== null && <Metric value={`${entry.plannedLoad}`} unit="planned load" />}
+            {entry.workout && <Metric value={`${entry.workout.steps.length}`} unit="blocks" />}
+          </div>
+          {entry.description && <p className="today-description">{entry.description}</p>}
+          {entry.workout ? (
+            <button className="primary" onClick={() => onStart(entry.workout!.id)}>
+              <Play size={16} fill="currentColor" /> {connected ? "Start" : "Set up ride"}
+            </button>
+          ) : (
+            <button className="secondary" onClick={onStartFreeRide}>
+              <Play size={16} fill="currentColor" /> {connected ? "Start free ride" : "Set up free ride"}
+            </button>
+          )}
+        </div>
+      ))}
+      <p className={status.lastError ? "settings-note today-sync warn" : "settings-note today-sync"}>{syncLine}</p>
+    </section>
+  );
+}
+
+export function WorkoutLibrary({
+  workouts,
+  ftp,
+  powerZones,
+  onCreate,
+  onEdit,
+  onRide,
+  onDelete,
+  onExport,
+  onExportAll,
+  onImport,
+}: {
+  workouts: Workout[];
+  ftp: number;
+  powerZones: readonly ZoneDefinition[];
+  onCreate: () => void;
+  onEdit: (workout: Workout) => void;
+  onRide: (id: string) => void;
+  onDelete: (workout: Workout) => void;
+  onExport: (workout: Workout) => void;
+  onExportAll: () => void;
+  onImport: () => void;
+}) {
+  return (
+    <>
+      <PageHeader eyebrow={`${workouts.length} SAVED WORKOUTS`} title="Workout library" actions={<>
+        <button className="secondary" onClick={onImport}><Upload size={16} /> Import ZWO</button>
+        <button className="secondary" disabled={workouts.length === 0} onClick={onExportAll}><Download size={16} /> Export all ZWO</button>
+        <button className="primary" onClick={onCreate}><Plus size={17} /> New workout</button>
+      </>} />
+      {workouts.length === 0 ? (
+        <div className="empty-state card friendly-empty">
+          <Library size={36} />
+          <h2>Your next ride starts here</h2>
+          <p>Create a workout from scratch or import a ZWO file you already love.</p>
+          <div className="empty-actions">
+            <button className="primary" onClick={onCreate}><Plus size={17} /> Create a workout</button>
+            <button className="secondary" onClick={onImport}><Upload size={16} /> Import ZWO</button>
+          </div>
+        </div>
+      ) : <div className="library-grid">
+        {workouts.map((workout, index) => (
+          <article className="card library-card" key={workout.id}>
+            <button
+              className="workout-visual-button"
+              aria-label={isMirrored(workout) ? `Edit a copy of ${workout.name}` : `Edit ${workout.name}`}
+              onClick={() => onEdit(isMirrored(workout) ? localCopyOf(workout) : workout)}
+            >
+              <div className={`workout-visual large tone-${index % 3}`}><WorkoutProfile steps={workout.steps} ftpWatts={ftp} powerZones={powerZones} /></div>
+            </button>
+            <div className="library-body">
+              <span className="label">
+                {isMirrored(workout)
+                  ? `INTERVALS.ICU${workout.origin?.folder ? ` · ${workout.origin.folder.toUpperCase()}` : ""}`
+                  : workout.source.toUpperCase()}
+                {" · "}{Math.round(workoutDuration(workout.steps) / 60)} MIN
+              </span>
+              <h3>{workout.name}</h3>
+              <p>{workout.description || "Structured workout"}</p>
+              <div className="chips">
+                <span>{workout.steps.length} blocks</span>
+                <span>{ftp} W FTP</span>
+                {workout.origin?.plannedLoad != null && <span>{workout.origin.plannedLoad} load</span>}
+              </div>
+              <div className="card-actions">
+                <button className="primary" onClick={() => onRide(workout.id)}><Play size={15} fill="currentColor" /> Ride</button>
+                <button className="icon-button" onClick={() => onExport(workout)} title="Export ZWO" aria-label={`Export ${workout.name} as ZWO`}><Download size={17} /></button>
+                {isMirrored(workout) ? (
+                  <button className="text-button" onClick={() => onEdit(localCopyOf(workout))} title="Mirrored from Intervals.icu; edits go into a local copy">Edit a copy</button>
+                ) : (
+                  <button className="icon-button danger" onClick={() => onDelete(workout)} title="Delete" aria-label={`Delete ${workout.name}`}><Trash2 size={17} /></button>
+                )}
+              </div>
+            </div>
+          </article>
+        ))}
+      </div>}
+    </>
+  );
+}
+
+export function Ride({
+  workouts,
+  plannedToday = [],
+  selectedWorkout,
+  setSelectedWorkout,
+  connected,
+  onConnect,
+  zeroOffsetDue = null,
+  onZeroOffset = () => undefined,
+  runner,
+  telemetry,
+  telemetryHistory,
+  powerSmoothing,
+  onPowerSmoothing,
+  sourcePreferences,
+  onSourcePreference,
+  hub,
+  profile,
+  trainingZones,
+  displayPreferences,
+  onBrowseWorkouts = () => undefined,
+  onEndRequest = () => undefined,
+  endRideConfirmOpen = false,
+  perform,
+}: {
+  workouts: Workout[];
+  /** Today's structured plans from Intervals.icu; listed first in the picker. */
+  plannedToday?: PlannedWorkout[];
+  selectedWorkout: string | null;
+  setSelectedWorkout: (id: string) => void;
+  connected: boolean;
+  onConnect: () => void;
+  /** Name of the power meter feeding the ride that has not been zeroed lately; null when nothing to nudge about. */
+  zeroOffsetDue?: string | null;
+  onZeroOffset?: () => void;
+  runner: RunnerState;
+  telemetry: Telemetry;
+  telemetryHistory: Telemetry[];
+  powerSmoothing: PowerSmoothing;
+  onPowerSmoothing: (smoothing: PowerSmoothing) => void;
+  sourcePreferences: SourcePreferences;
+  onSourcePreference: (metric: SourceMetric, choice: SourceChoice) => void;
+  /** The devices hub, for the stats-for-nerds card. */
+  hub: DevicesSnapshot | null;
+  profile: Profile;
+  trainingZones: TrainingZoneSettings;
+  displayPreferences: RideDisplayPreferences;
+  onBrowseWorkouts?: () => void;
+  /** Brings up the end-ride confirmation modal (Esc shortcut mirrors the sidebar End button). */
+  onEndRequest?: () => void;
+  /** True while the end-ride confirmation is already open, so Esc doesn't fight its own close handler. */
+  endRideConfirmOpen?: boolean;
+  perform: (action: () => Promise<unknown>, label?: string) => Promise<void>;
+}) {
+  const [targetDraft, setTargetDraft] = useState("100");
+  const [screenIndex, setScreenIndex] = useState(0);
+  const [powerChartExpanded, setPowerChartExpanded] = useState(true);
+  const [heartRateChartExpanded, setHeartRateChartExpanded] = useState(true);
+  const active = runner.status === "running" || runner.status === "paused";
+  // Today's plan first, then the library; one list for selection, preview and
+  // the live timeline lookup by name.
+  const plannedRides = useMemo(
+    () => plannedToday.flatMap((entry) => (entry.workout ? [entry.workout] : [])),
+    [plannedToday],
+  );
+  const rideable = useMemo(() => [...plannedRides, ...workouts], [plannedRides, workouts]);
+  const selected = rideable.find((workout) => workout.id === selectedWorkout);
+  const activeWorkout = selected
+    ?? ("workoutName" in runner
+      ? rideable.find((workout) => workout.name === runner.workoutName)
+      : undefined);
+  const elapsed = runner.status === "running" || runner.status === "paused" ? runner.elapsedSeconds : 0;
+  const total = runner.status === "running" || runner.status === "paused" ? runner.totalSeconds : selected ? workoutDuration(selected.steps) : 0;
+  const progress = total ? Math.min(100, (elapsed / total) * 100) : 0;
+  const riding = runner.status === "running" || runner.status === "paused";
+  const manualErg = riding && runner.manualErg;
+  const openEnded = riding && runner.totalSeconds === null;
+  const distanceMeters = riding ? runner.distanceMeters : 0;
+  const targetPower = riding ? runner.targetPowerWatts : telemetry.targetPowerWatts;
+  // Structured workouts get the same target controls as free ride: ± 5 W,
+  // typed watts and ↑/↓ override the current interval; a bias scales the plan.
+  const plannedTarget = riding && !runner.manualErg ? runner.plannedTargetWatts : null;
+  const overrideActive = riding && !runner.manualErg && runner.overrideActive;
+  const biasPercent = riding ? runner.biasPercent : 100;
+  const structured = riding && !openEnded;
+  const adjustable = manualErg || openEnded || (structured && targetPower !== null);
+  const screens = displayPreferences.screens;
+  const screen = screens[Math.min(screenIndex, screens.length - 1)];
+  const sessionId = riding ? runner.sessionId : null;
+  // A new ride, or a layout with fewer screens, starts at the first screen.
+  useEffect(() => {
+    setScreenIndex(0);
+  }, [sessionId, screens]);
+  const smoothedHistory = useMemo(
+    () => withSmoothedPower(telemetryHistory, powerSmoothing),
+    [telemetryHistory, powerSmoothing],
+  );
+  const chartHistory = useMemo(
+    () => downsampleTelemetry(withActiveElapsed(smoothedHistory, elapsed)),
+    [elapsed, smoothedHistory],
+  );
+  const powerZones = useMemo(
+    () => effectivePowerZones(trainingZones, profile.ftpWatts),
+    [profile.ftpWatts, trainingZones],
+  );
+  const heartRateZones = useMemo(
+    () => effectiveHeartRateZones(trainingZones, profile.maxHeartRateBpm),
+    [profile.maxHeartRateBpm, trainingZones],
+  );
+  const powerZoneSeconds = useMemo(
+    () => timeInZones(telemetryHistory, powerZones, "power"),
+    [powerZones, telemetryHistory],
+  );
+  const heartRateZoneSeconds = useMemo(
+    () => timeInZones(telemetryHistory, heartRateZones, "heartRate"),
+    [heartRateZones, telemetryHistory],
+  );
+  const displayedPower =
+    powerSmoothing === "instant"
+      ? telemetry.powerWatts
+      : smoothedHistory[smoothedHistory.length - 1]?.displayPowerWatts ?? telemetry.powerWatts;
+  // Biased like the runner's targets, so the timeline shows what the trainer is asked for.
+  const workoutIntervals = useMemo(
+    () => activeWorkout
+      ? compileWorkoutIntervals(activeWorkout.steps, profile.ftpWatts, biasPercent)
+      : [],
+    [activeWorkout, profile.ftpWatts, biasPercent],
+  );
+
+  useEffect(() => {
+    if (targetPower !== null) setTargetDraft(String(targetPower));
+  }, [targetPower]);
+
+  const adjustPower = (delta: number) =>
+    perform(async () => {
+      setTargetDraft(String(await api.adjustManualPower(delta)));
+    }, delta > 0 ? "raise manual power" : "lower manual power");
+
+  const commitTargetPower = () => {
+    const watts = Math.round(Number(targetDraft));
+    if (!Number.isFinite(watts) || watts <= 0 || watts > 65_535) {
+      setTargetDraft(String(targetPower ?? 100));
+      return;
+    }
+    void perform(async () => {
+      setTargetDraft(String(await api.setManualPower(watts)));
+    }, "set manual power");
+  };
+
+  const adjustBias = (delta: number) =>
+    perform(async () => {
+      await api.setBiasPercent(clampBias(biasPercent + delta));
+    }, delta > 0 ? "raise workout bias" : "lower workout bias");
+
+  const backToPlan = () =>
+    perform(async () => {
+      const applied = await api.clearTargetOverride();
+      if (applied !== null) setTargetDraft(String(applied));
+    }, "clear target override");
+
+  const canSkip = structured && activeWorkout !== undefined && workoutIntervals.length > 0;
+  useEffect(() => {
+    if (!active) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      // Leave typing in the watts box alone.
+      if (event.target instanceof HTMLInputElement) return;
+      const action = rideKeyAction(event.key, event.shiftKey, event.repeat);
+      if (action === null) return;
+      if (action.kind === "screen") {
+        if (screens.length < 2) return;
+        event.preventDefault();
+        setScreenIndex((index) =>
+          Math.min(screens.length - 1, Math.max(0, index + action.delta)),
+        );
+        return;
+      }
+      if (action.kind === "pause") {
+        event.preventDefault();
+        void perform(() => api.pauseOrResume(), "pause/resume");
+        return;
+      }
+      if (action.kind === "skip") {
+        if (!canSkip) return;
+        event.preventDefault();
+        void perform(() => api.skipInterval(), "skip interval");
+        return;
+      }
+      if (action.kind === "end") {
+        // The confirmation dialog's own Escape handler already closes it; don't reopen it.
+        if (endRideConfirmOpen) return;
+        event.preventDefault();
+        onEndRequest();
+        return;
+      }
+      // Targets only move while a ride is actually running and adjustable.
+      if (runner.status !== "running" || !adjustable) return;
+      if (action.kind === "bias" && !structured) return;
+      event.preventDefault();
+      if (action.kind === "power") {
+        void perform(() => api.adjustManualPower(action.delta), "adjust manual power");
+      } else {
+        void perform(() => api.setBiasPercent(clampBias(biasPercent + action.delta)), "adjust workout bias");
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [active, adjustable, biasPercent, canSkip, endRideConfirmOpen, onEndRequest, perform, runner.status, screens.length, structured]);
+
+  const intervalHistory = useMemo(() => {
+    if (!riding || runner.intervalElapsedSeconds >= elapsed) return telemetryHistory;
+    const last = telemetryHistory[telemetryHistory.length - 1];
+    if (last === undefined) return telemetryHistory;
+    const startMs = last.timestampMs - runner.intervalElapsedSeconds * 1000;
+    return telemetryHistory.filter((sample) => sample.timestampMs >= startMs);
+  }, [elapsed, riding, runner, telemetryHistory]);
+  const intervalTotalSeconds = riding && !manualErg
+    ? workoutIntervals[runner.intervalIndex]?.durationSeconds ?? null
+    : null;
+  const fieldContext: RideFieldContext = {
+    telemetry,
+    history: telemetryHistory,
+    intervalHistory,
+    displayPowerWatts: displayedPower,
+    elapsedSeconds: elapsed,
+    totalSeconds: openEnded ? null : total === 0 ? null : total,
+    intervalElapsedSeconds: riding ? runner.intervalElapsedSeconds : 0,
+    intervalTotalSeconds,
+    targetPowerWatts: targetPower,
+    distanceMeters,
+    profile,
+  };
+
+  /** The live source picker (and smoothing) belongs on the live readings only. */
+  const fieldControl = (field: RideField) => {
+    if (field.aggregate !== "current") return undefined;
+    if (field.metric === "power") {
+      return (
+        <span className="metric-control-group">
+          <SourceSelect
+            metric="power"
+            choice={sourcePreferences.power}
+            onChange={(choice) => onSourcePreference("power", choice)}
+          />
+          <label className="smoothing-select">
+            <span className="sr-only">Power smoothing</span>
+            <select value={powerSmoothing} onChange={(event) => onPowerSmoothing(event.target.value as PowerSmoothing)}>
+              {powerSmoothingOptions.map((option) => (
+                <option key={option} value={option}>{powerSmoothingLabel[option]}</option>
+              ))}
+            </select>
+          </label>
+        </span>
+      );
+    }
+    if (field.metric === "cadence" || field.metric === "heartRate") {
+      return (
+        <SourceSelect
+          metric={field.metric}
+          choice={sourcePreferences[field.metric]}
+          onChange={(choice) => onSourcePreference(field.metric as SourceMetric, choice)}
+        />
+      );
+    }
+    return undefined;
+  };
+
+  const fieldNote = (field: RideField): string | null => {
+    if (field.metric === "wattsPerKilogram") {
+      return `${displayedWeight(profile.riderWeightKg, profile.weightUnit)} ${profile.weightUnit} rider`;
+    }
+    if (field.aggregate !== "current") return null;
+    if (field.metric === "power" || field.metric === "cadence" || field.metric === "heartRate") {
+      return sourceNote(telemetry.sources?.[field.metric]);
+    }
+    return null;
+  };
+
+  const panelContent = {
+    workoutTimeline: structured && activeWorkout && workoutIntervals.length > 0 ? (
+      <WorkoutTimeline
+        steps={activeWorkout.steps}
+        ftpWatts={profile.ftpWatts}
+        biasPercent={biasPercent}
+        powerZones={powerZones}
+        intervals={workoutIntervals}
+        workoutName={runner.workoutName}
+        currentIndex={runner.intervalIndex}
+        intervalElapsedSeconds={runner.intervalElapsedSeconds}
+        elapsedSeconds={elapsed}
+        totalSeconds={total ?? 0}
+        paused={runner.status === "paused"}
+        onSkip={() => void perform(() => api.skipInterval(), "skip interval")}
+      />
+    ) : null,
+    targetAndBias: (
+      <div className="card workout-controls-card">
+        <div className="workout-controls-heading">
+          <span className="label">TARGET &amp; BIAS</span>
+        </div>
+        <div className={adjustable ? "target-line editable" : "target-line"}>
+          <span>Target power</span>
+          {adjustable ? (
+            <div className="manual-erg-stepper">
+              <button className="secondary" disabled={runner.status !== "running"} onClick={() => void adjustPower(-5)}>− 5 W</button>
+              <label>
+                <span className="sr-only">Target power in watts</span>
+                <input
+                  type="number"
+                  min="1"
+                  max="65535"
+                  step="5"
+                  disabled={runner.status !== "running"}
+                  value={targetDraft}
+                  onChange={(event) => setTargetDraft(event.target.value)}
+                  onBlur={commitTargetPower}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") event.currentTarget.blur();
+                  }}
+                />
+                <strong>W</strong>
+              </label>
+              <button className="secondary" disabled={runner.status !== "running"} onClick={() => void adjustPower(5)}>+ 5 W</button>
+            </div>
+          ) : <strong>{targetPower ?? "Free"}{targetPower !== null ? " W" : ""}</strong>}
+          {adjustable && <span className="manual-erg-hint">{structured ? "Type watts or use ↑ / ↓ · Shift for bias" : "Type watts or use ↑ / ↓"}</span>}
+        </div>
+        {structured && (
+          <div className="plan-line">
+            <span className="plan-note">
+              {manualErg
+                ? "Free-ride block · manual ERG"
+                : plannedTarget === null
+                  ? "No target in this block"
+                  : overrideActive
+                    ? `Plan ${plannedTarget} W · overridden for this block`
+                    : biasPercent !== 100
+                      ? `Plan ${plannedTarget} W · ${biasPercent}% bias`
+                      : `Plan ${plannedTarget} W`}
+            </span>
+            {overrideActive && (
+              <button type="button" className="secondary override-reset" disabled={runner.status !== "running"} onClick={() => void backToPlan()}>
+                Reset override{plannedTarget !== null ? ` · ${plannedTarget} W` : ""}
+              </button>
+            )}
+            <div className="bias-stepper" aria-label="Workout bias">
+              <span>Bias</span>
+              <button type="button" className="secondary" onClick={() => void adjustBias(-BIAS_STEP_PERCENT)}>−</button>
+              <strong className={biasPercent === 100 ? "" : "active"}>{biasPercent}%</strong>
+              <button type="button" className="secondary" onClick={() => void adjustBias(BIAS_STEP_PERCENT)}>+</button>
+              <button
+                type="button"
+                className={biasPercent === 100 ? "text-button bias-reset placeholder" : "text-button bias-reset"}
+                disabled={biasPercent === 100}
+                aria-hidden={biasPercent === 100}
+                tabIndex={biasPercent === 100 ? -1 : 0}
+                onClick={() => void perform(() => api.setBiasPercent(100), "reset workout bias")}
+              >
+                Reset
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    ),
+    powerChart: (
+      <div className="card live-chart">
+        <div className="chart-heading">
+          <div><span className="label">FULL SESSION</span><h3>Power</h3></div>
+          <button
+            type="button"
+            className="chart-collapse"
+            aria-expanded={powerChartExpanded}
+            aria-controls="ride-power-chart"
+            onClick={() => setPowerChartExpanded((expanded) => !expanded)}
+          >
+            {powerChartExpanded ? "Collapse" : "Expand"}
+            <ChevronDown size={17} />
+          </button>
+        </div>
+        {powerChartExpanded && (
+          <div id="ride-power-chart">
+            <SessionAreaChart
+              samples={chartHistory}
+              dataKey="displayPowerWatts"
+              unit="W"
+              color="#c8ff32"
+              name={powerSmoothing === "instant" ? "Power" : `Power (${powerSmoothingLabel[powerSmoothing]})`}
+              domain={powerDomain}
+            />
+            {openEnded
+              ? <div className="open-ended-time"><span>Elapsed</span><strong>{formatDuration(elapsed)}</strong><span>Open ended</span></div>
+              : <div className="progress-meta"><span>{formatDuration(elapsed)}</span><div className="progress"><i style={{ width: `${progress}%` }} /></div><span>-{formatDuration(Math.max(0, (total ?? 0) - elapsed))}</span></div>}
+          </div>
+        )}
+      </div>
+    ),
+    heartRateChart: (
+      <div className="card live-chart secondary-chart">
+        <div className="chart-heading">
+          <div><span className="label">FULL SESSION</span><h3>Heart rate</h3></div>
+          <button
+            type="button"
+            className="chart-collapse"
+            aria-expanded={heartRateChartExpanded}
+            aria-controls="ride-heart-rate-chart"
+            onClick={() => setHeartRateChartExpanded((expanded) => !expanded)}
+          >
+            {heartRateChartExpanded ? "Collapse" : "Expand"}
+            <ChevronDown size={17} />
+          </button>
+        </div>
+        {heartRateChartExpanded && (
+          <div id="ride-heart-rate-chart">
+            <SessionAreaChart
+              samples={chartHistory}
+              dataKey="heartRateBpm"
+              unit="bpm"
+              color="#ff6f7d"
+              name="Heart rate"
+              domain={heartRateDomain}
+            />
+          </div>
+        )}
+      </div>
+    ),
+    timeInZone: (
+      <div className="zone-chart-grid">
+        <TimeInZoneChart
+          title="Power zones"
+          zones={powerZones}
+          seconds={powerZoneSeconds}
+        />
+        <TimeInZoneChart
+          title="Heart-rate zones"
+          zones={heartRateZones}
+          seconds={heartRateZoneSeconds}
+        />
+      </div>
+    ),
+    deviceStats: (
+      <DeviceStatsCard
+        hub={hub}
+        telemetry={telemetry}
+        displayPowerWatts={displayedPower}
+        powerSmoothing={powerSmoothing}
+        historySampleCount={telemetryHistory.length}
+        control={riding ? runner.control : undefined}
+      />
+    ),
+  } satisfies Record<RidePanelId, ReactNode>;
+
+  return (
+    <>
+      {!active && <PageHeader eyebrow="TRAINING ROOM" title="Start a ride" />}
+      {riding && runner.recordingWarning && <RecordingWarning message={runner.recordingWarning} />}
+      {runner.status === "finished" && runner.saveWarning && <RecordingWarning message={runner.saveWarning} />}
+      {!connected && <div className="notice"><Bluetooth /><div><strong>No trainer connected</strong><p>Connect a trainer to begin.</p></div><button className="primary" onClick={onConnect}>Connect</button></div>}
+      {!active && zeroOffsetDue && (
+        <div className="notice soft" role="status">
+          <Zap />
+          <div>
+            <strong>Zero your power meter before riding?</strong>
+            <p>{zeroOffsetDue} feeds power for this ride and has not been zeroed in the last day. Unclip, keep the bike still, and it takes a few seconds.</p>
+          </div>
+          <button className="secondary" onClick={onZeroOffset}>Zero offset</button>
+        </div>
+      )}
+      {riding && runner.control === "lost" && (
+        <div className="notice" role="status">
+          <Bluetooth />
+          <div>
+            <strong>Trainer link lost</strong>
+            <p>{runner.status === "paused" ? "Reconnecting. The ride clock is paused; trainer pause will be confirmed when the connection returns." : "Reconnecting. The clock keeps running and the target is re-applied as soon as the trainer is back."}</p>
+          </div>
+        </div>
+      )}
+      {riding && runner.control === "degraded" && (
+        <div className="notice" role="status">
+          <Bluetooth />
+          <div>
+            <strong>{runner.status === "paused" ? "Trainer pause not confirmed" : "Trainer not acknowledging targets"}</strong>
+            <p>{runner.status === "paused" ? "Retrying pause. The ride clock is paused, but the trainer may still be applying resistance." : "Retrying. The workout continues."}</p>
+          </div>
+        </div>
+      )}
+      {!active ? (
+        <section className="ride-setup">
+          <div className="card setup-card">
+            <div className="free-ride-start">
+              <div>
+                <span className="label">MANUAL ERG</span>
+                <h2>Free Ride</h2>
+                <p>Start at 100 W, then use the arrow keys or on-screen controls to adjust by 5 W.</p>
+              </div>
+              <button className="primary" disabled={!connected} onClick={() => void perform(() => api.startFreeRide(), "start free ride")}><Play fill="currentColor" /> Start free ride</button>
+            </div>
+            <div className="setup-divider"><span>OR CHOOSE A WORKOUT</span></div>
+            <span className="label">SELECT WORKOUT</span>
+            <div className="select-list">
+              {rideable.length === 0 ? (
+                <div className="ride-empty-workouts">
+                  <strong>No workouts saved yet</strong>
+                  <span>Create one or import a ZWO file, then come back when you’re ready.</span>
+                  <button className="secondary" onClick={onBrowseWorkouts}>Open workout library</button>
+                </div>
+              ) : rideable.map((workout, index) => <button key={workout.id} className={selectedWorkout === workout.id ? "selected" : ""} aria-pressed={selectedWorkout === workout.id} onClick={() => setSelectedWorkout(workout.id)}>
+                <div><strong>{index < plannedRides.length && <em className="today-chip">Today</em>}{workout.name}</strong><span>{formatDuration(workoutDuration(workout.steps))}</span></div><WorkoutProfile steps={workout.steps} ftpWatts={profile.ftpWatts} powerZones={powerZones} /></button>)}
+            </div>
+          </div>
+          <div className="card ride-preview">
+            <div className="ride-preview-header">
+              <div><span className="label">WORKOUT PREVIEW</span><h2>{selected?.name ?? "Choose a workout"}</h2></div>
+              <button className="primary start-button" disabled={!connected || !selectedWorkout} onClick={() => selectedWorkout && void perform(() => api.startWorkout(selectedWorkout), "start workout")}><Play fill="currentColor" /> Start workout</button>
+            </div>
+            <p>{selected?.description}</p>
+            {selected && <><div className="preview-chart"><WorkoutProfile variant="editor" steps={selected.steps} ftpWatts={profile.ftpWatts} powerZones={powerZones} /></div><div className="preview-stats"><Metric value={formatDuration(workoutDuration(selected.steps))} unit="duration" /><Metric value={`${selected.steps.length}`} unit="blocks" /></div></>}
+          </div>
+        </section>
+      ) : (
+        <section className="live-ride">
+          {screens.length > 1 && (
+            <div className="ride-screen-tabs" role="tablist" aria-label="Ride screens">
+              {screens.map((screen, index) => (
+                <button
+                  key={screen.id}
+                  type="button"
+                  role="tab"
+                  aria-selected={index === screenIndex}
+                  className={index === screenIndex ? "selected" : ""}
+                  onClick={() => setScreenIndex(index)}
+                >
+                  {screen.name}
+                </button>
+              ))}
+            </div>
+          )}
+          <div className="live-ride-grid">
+            {screen.items.map((item) => {
+              if (item.kind === "panel") {
+                const content = panelContent[item.panel];
+                return content === null ? null : (
+                  <div className="ride-slot" data-span={4} data-ride-panel={item.panel} key={item.panel}>
+                    {content}
+                  </div>
+                );
+              }
+              const resolved = resolveRideField(item.field, fieldContext);
+              // A field with nothing to say on this ride (time left on a free
+              // ride) leaves no hole behind.
+              if (resolved === null) return null;
+              const key = rideFieldKey(item.field);
+              return (
+                <div className="ride-slot" data-span={item.span} data-ride-field={key} key={key}>
+                  <div className="ride-card-compact">
+                    <LiveMetric
+                      icon={rideFieldIcons[item.field.metric]}
+                      label={resolved.label}
+                      value={resolved.value}
+                      unit={resolved.unit}
+                      accent={item.field.metric === "power" && item.field.aggregate === "current"}
+                      note={fieldNote(item.field)}
+                      control={fieldControl(item.field)}
+                    />
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </section>
+      )}
+      {runner.status === "error" && runner.sessionId === null && (
+        <div className="toast error-toast" role="alert">
+          <span>
+            Ride ended: {runner.message}.
+          </span>
+        </div>
+      )}
+    </>
+  );
+}
+
+function HistoryPage({ sessions, selected, profile, trainingZones, onSelect, onClose, onExport, onExportFit, onGarmin }: { sessions: SessionSummary[]; selected: SessionDetail | null; profile: Profile; trainingZones: TrainingZoneSettings; onSelect: (session: SessionSummary) => void; onClose: () => void; onExport: (session: SessionSummary) => void; onExportFit: (session: SessionSummary) => void; onGarmin: (session: SessionSummary) => void }) {
+  return (
+    <>
+      <PageHeader eyebrow={`${sessions.length} RECORDED RIDES`} title="Ride history" />
+      {sessions.length === 0 ? <div className="empty-state"><History /><h2>No rides yet</h2><p>Completed and stopped workouts appear here automatically.</p></div> :
+      <div className="history-list">{sessions.map((session) => <button key={session.id} className="history-row" onClick={() => onSelect(session)}>
+        <span className={session.completed ? "completion complete" : "completion"}>{session.completed ? "✓" : "–"}</span>
+        <div className="history-title"><strong>{session.workoutName}</strong>{session.recordingWarning && <span>Recording warning</span>}<span>{new Date(session.startedAt).toLocaleString()}</span></div>
+        <Metric value={formatDuration(session.elapsedSeconds)} unit="duration" /><Metric value={`${session.averagePowerWatts}`} unit="W avg" /><DistanceMetric meters={session.estimatedDistanceMeters} unit={profile.distanceUnit} /><ChevronRight />
+      </button>)}</div>}
+      {selected && (
+        <RideDetailModal
+          session={selected}
+          profile={profile}
+          trainingZones={trainingZones}
+          onClose={onClose}
+          onExport={onExport}
+          onExportFit={onExportFit}
+          onGarmin={onGarmin}
+        />
+      )}
+    </>
+  );
+}
+
+function RecordingWarning({ message }: { message: string }) {
+  return <div className="notice" role="alert"><div><strong>Ride data needs attention</strong><p>{message}</p></div></div>;
+}
+
+export function PostRidePrompt({ errorMessage, saveWarning = null, onView, onDismiss }: { errorMessage: string | null; saveWarning?: string | null; onView: () => void; onDismiss: () => void }) {
+  const warning = saveWarning ?? errorMessage;
+  return (
+    <div className={warning ? "toast post-ride-prompt error-toast" : "toast post-ride-prompt success-toast"} role={warning ? "alert" : "status"}>
+      <div className="post-ride-copy">
+        <strong>{saveWarning ? "Ride ended with a save problem" : errorMessage ? "Ride ended" : "Ride saved. Nice work!"}</strong>
+        <span>{warning ?? "Your effort is safely recorded and ready to review."}</span>
+      </div>
+      <div className="post-ride-actions">
+        <button className="primary" onClick={onView}>View ride metrics</button>
+        <button className="icon-button" onClick={onDismiss} aria-label="Dismiss ride summary"><X size={17} /></button>
+      </div>
+    </div>
+  );
+}
+
+export function RideDetailModal({ session, profile, trainingZones, onClose, onExport, onExportFit, onGarmin }: { session: SessionDetail; profile: Profile; trainingZones: TrainingZoneSettings; onClose: () => void; onExport: (session: SessionSummary) => void; onExportFit: (session: SessionSummary) => void; onGarmin: (session: SessionSummary) => void }) {
+  const [range, setRange] = useState<ChartRange | null>(null);
+  const clearRange = useCallback(() => setRange(null), []);
+  // Escape dismisses the innermost thing: a chart selection first, then the modal.
+  const dialogRef = useDialog<HTMLDivElement>(range ? clearRange : onClose);
+  const powerZones = useMemo(
+    () => effectivePowerZones(trainingZones, profile.ftpWatts),
+    [profile.ftpWatts, trainingZones],
+  );
+  const heartRateZones = useMemo(
+    () => effectiveHeartRateZones(trainingZones, profile.maxHeartRateBpm),
+    [profile.maxHeartRateBpm, trainingZones],
+  );
+  const activeSamples = useMemo(
+    () => withActiveElapsed(session.samples, session.summary.elapsedSeconds),
+    [session],
+  );
+  const samples = useMemo(() => downsampleTelemetry(activeSamples), [activeSamples]);
+  const rangeSummary = useMemo(
+    () => (range ? summarizeRange(activeSamples, range) : null),
+    [activeSamples, range],
+  );
+  const powerSeconds = useMemo(
+    () => timeInZones(session.samples, powerZones, "power"),
+    [powerZones, session],
+  );
+  const heartRateSeconds = useMemo(
+    () => timeInZones(session.samples, heartRateZones, "heartRate"),
+    [heartRateZones, session],
+  );
+  return (
+    <div className="modal-backdrop dialog-enter" role="presentation" onMouseDown={(event) => {
+      if (event.target === event.currentTarget) onClose();
+    }}>
+      <div ref={dialogRef} className="modal detail-modal" role="dialog" aria-modal="true" aria-labelledby="ride-detail-title" tabIndex={-1}>
+        <button className="modal-close" onClick={onClose} aria-label="Close ride detail"><X /></button>
+        <div className="detail-header">
+          <div>
+            <span className="label">RIDE DETAIL</span>
+            <h2 id="ride-detail-title">{session.summary.workoutName}</h2>
+            <p>{new Date(session.summary.startedAt).toLocaleString()}</p>
+          </div>
+          <div className="detail-action-block">
+            <div className="detail-actions">
+              <button className="primary" onClick={() => onGarmin(session.summary)}><Upload size={16}/> Upload to Garmin</button>
+              <button className="secondary" onClick={() => onExportFit(session.summary)}><Download size={16}/> Export FIT</button>
+              <button className="secondary" onClick={() => onExport(session.summary)}><Download size={16}/> Export CSV</button>
+            </div>
+            <p className="handoff-note">Garmin Connect and Finder will open. Drag the selected FIT file onto Garmin’s import page, then confirm the upload.</p>
+          </div>
+        </div>
+        {session.summary.recordingWarning && <RecordingWarning message={session.summary.recordingWarning} />}
+        <div className="detail-metrics">
+          <Metric value={formatDuration(session.summary.elapsedSeconds)} unit="duration" />
+          <Metric value={`${session.summary.averagePowerWatts}`} unit="W average" />
+          <Metric value={`${session.summary.maxPowerWatts}`} unit="W maximum" />
+          <Metric value={`${Math.round(session.summary.averageCadenceRpm ?? 0)}`} unit="rpm average" />
+          <DistanceMetric meters={session.summary.estimatedDistanceMeters} unit={profile.distanceUnit} />
+        </div>
+        <p className="distance-note">Estimated distance · {distanceSourceLabel(session.summary.distanceSource)}</p>
+        <div className="history-charts">
+          <RangeSummaryStrip summary={rangeSummary} onClear={clearRange} />
+          <h3>Power</h3>
+          <SessionAreaChart samples={samples} dataKey="powerWatts" unit="W" color="#c8ff32" name="Power" domain={powerDomain} selection={range} onSelectionChange={setRange}/>
+          <h3>Heart rate</h3>
+          <SessionAreaChart samples={samples} dataKey="heartRateBpm" unit="bpm" color="#ff6f7d" name="Heart rate" domain={heartRateDomain} selection={range} onSelectionChange={setRange}/>
+          <div className="zone-chart-grid history-zone-charts">
+            <TimeInZoneChart title="Power zones" zones={powerZones} seconds={powerSeconds}/>
+            <TimeInZoneChart title="Heart-rate zones" zones={heartRateZones} seconds={heartRateSeconds}/>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+const KG_PER_LB = 0.45359237;
+
+const rideFieldIcons: Record<RideMetric, typeof Activity> = {
+  power: Zap,
+  cadence: RefreshCw,
+  heartRate: HeartPulse,
+  speed: Gauge,
+  wattsPerKilogram: Scale,
+  distance: Route,
+  energy: Flame,
+  calories: Flame,
+  time: Timer,
+  targetPower: Target,
+};
+
+function displayedWeight(kg: number, unit: Profile["weightUnit"]) {
+  return Number((unit === "lb" ? kg / KG_PER_LB : kg).toFixed(1));
+}
+
+function storedWeight(value: number, unit: Profile["weightUnit"]) {
+  return unit === "lb" ? value * KG_PER_LB : value;
+}
+
+export function SettingsPage({
+  profile,
+  trainingZones,
+  rideDisplayPreferences,
+  devMode,
+  perform,
+  onProfileUpdate,
+  onTrainingZonesUpdate,
+  onSave,
+  onSaveTrainingZones,
+  onSaveRideDisplayPreferences,
+  onForgetDevices,
+  onDevMode,
+  intervalsStatus = disconnectedIntervalsStatus,
+  onSaveIntervalsKey = async () => undefined,
+  onClearIntervalsKey = async () => undefined,
+  onIntervalsSyncSettings = async () => undefined,
+  onSyncIntervals = () => Promise.reject(new Error("Intervals.icu sync is not available")),
+}: {
+  profile: Profile;
+  trainingZones: TrainingZoneSettings;
+  rideDisplayPreferences: RideDisplayPreferences;
+  devMode: boolean;
+  perform: (action: () => Promise<unknown>, label?: string) => Promise<void>;
+  onProfileUpdate: (profile: Profile) => void;
+  onTrainingZonesUpdate: (zones: TrainingZoneSettings) => void;
+  onSave: (profile: Profile) => void;
+  onSaveTrainingZones: (zones: TrainingZoneSettings) => void;
+  onSaveRideDisplayPreferences: (preferences: RideDisplayPreferences) => void;
+  onForgetDevices: () => Promise<void>;
+  onDevMode: (enabled: boolean) => void;
+  /** Owned by `App` so the home screen and this card never disagree. */
+  intervalsStatus?: IntervalsStatus;
+  onSaveIntervalsKey?: (apiKey: string) => Promise<void>;
+  onClearIntervalsKey?: () => Promise<void>;
+  onIntervalsSyncSettings?: (settings: IntervalsSyncSettings) => Promise<void>;
+  onSyncIntervals?: () => Promise<IntervalsSyncReport>;
+}) {
+  const [draft, setDraft] = useState(profile);
+  const [zoneDraft, setZoneDraft] = useState(trainingZones);
+  const [logPath, setLogPath] = useState("Loading log location…");
+  const [rideFilesPath, setRideFilesPath] = useState("Loading ride files location…");
+  const [apiKey, setApiKey] = useState("");
+  const intervalsConfigured = intervalsStatus.configured;
+  const [intervalsBusy, setIntervalsBusy] = useState<"save" | "clear" | "sync" | "mirrors" | "settings" | null>(null);
+  const [trainingSyncStatus, setTrainingSyncStatus] = useState<string | null>(null);
+  const [mirrorSyncStatus, setMirrorSyncStatus] = useState<string | null>(null);
+  const [zoneSyncConfirm, setZoneSyncConfirm] = useState<"power" | "heartRate" | null>(null);
+  useEffect(() => {
+    void api.logFilePath().then(setLogPath);
+    void api.rideFilesPath().then(setRideFilesPath);
+  }, []);
+  useEffect(() => setDraft(profile), [profile]);
+  useEffect(() => setZoneDraft(trainingZones), [trainingZones]);
+
+  const saveIntervalsKey = async () => {
+    setIntervalsBusy("save");
+    await perform(async () => {
+      await onSaveIntervalsKey(apiKey);
+      setApiKey("");
+    }, "save Intervals.icu API key");
+    setIntervalsBusy(null);
+  };
+
+  const clearIntervalsKey = async () => {
+    setIntervalsBusy("clear");
+    await perform(async () => {
+      await onClearIntervalsKey();
+      setApiKey("");
+      setMirrorSyncStatus(null);
+      setTrainingSyncStatus(null);
+    }, "clear Intervals.icu API key");
+    setIntervalsBusy(null);
+  };
+
+  const syncTrainingSettings = async () => {
+    setIntervalsBusy("sync");
+    await perform(async () => {
+      const result = await api.syncTrainingSettings();
+      onProfileUpdate(result.profile);
+      onTrainingZonesUpdate(result.zones);
+      setTrainingSyncStatus(describeTrainingSync(result));
+    }, "sync training settings");
+    setIntervalsBusy(null);
+  };
+
+  const syncMirrors = async () => {
+    setIntervalsBusy("mirrors");
+    await perform(async () => {
+      setMirrorSyncStatus(describeIntervalsSync(await onSyncIntervals()));
+    }, "sync Intervals.icu");
+    setIntervalsBusy(null);
+  };
+
+  // One round trip at a time: the toggles disable while busy, so two quick
+  // clicks cannot send stale settings that undo each other.
+  const setMirrorSetting = async (patch: Partial<IntervalsSyncSettings>) => {
+    setIntervalsBusy("settings");
+    await perform(
+      () => onIntervalsSyncSettings({ ...intervalsStatus.settings, ...patch }),
+      "save Intervals.icu sync settings",
+    );
+    setIntervalsBusy(null);
+  };
+
+  // A sync result replaces both drafts, so unsaved edits would be lost: the
+  // button waits until they are saved (or discarded) rather than saving them
+  // behind the rider's back.
+  const profileDirty = JSON.stringify(draft) !== JSON.stringify(profile);
+  const zonesDirty = JSON.stringify(zoneDraft) !== JSON.stringify(trainingZones);
+  const unsavedHint =
+    profileDirty && zonesDirty
+      ? "Save your rider profile and zone settings first."
+      : profileDirty
+        ? "Save your rider profile first."
+        : zonesDirty
+          ? "Save your zone settings first."
+          : null;
+
+  const setZoneSync = (set: "power" | "heartRate", enabled: boolean) =>
+    setZoneDraft(
+      set === "power"
+        ? { ...zoneDraft, syncPowerZonesFromIntervals: enabled }
+        : { ...zoneDraft, syncHeartRateZonesFromIntervals: enabled },
+    );
+  // Turning import on over hand-edited zones destroys them on the next sync,
+  // so that one transition asks first.
+  const requestZoneSync = (set: "power" | "heartRate", enabled: boolean) => {
+    const mode = set === "power" ? zoneDraft.powerMode : zoneDraft.heartRateMode;
+    if (enabled && mode === "custom") setZoneSyncConfirm(set);
+    else setZoneSync(set, enabled);
+  };
+
+  return (
+    <>
+      <PageHeader eyebrow="LOCAL PROFILE" title="Settings" />
+      <section className="card settings-card"><div><span className="label">RIDER PROFILE</span><h2>Training and distance</h2><p>Your weight and bike weight support flat-road distance estimates when the trainer does not report speed. Values are stored in kilograms regardless of display units.</p></div><form onSubmit={(event) => { event.preventDefault(); onSave(draft); }}>
+        <label>Rider name<input value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })}/></label>
+        <div className="form-row"><label>FTP (watts)<EditableNumberInput min={50} max={500} value={draft.ftpWatts} onValueChange={(ftpWatts) => setDraft({ ...draft, ftpWatts })}/></label><label>Maximum heart rate (bpm)<EditableNumberInput min={100} max={230} value={draft.maxHeartRateBpm} onValueChange={(maxHeartRateBpm) => setDraft({ ...draft, maxHeartRateBpm })}/></label></div>
+        <label>Safety power limit<EditableNumberInput min={100} max={2500} value={draft.maxPowerWatts} onValueChange={(maxPowerWatts) => setDraft({ ...draft, maxPowerWatts })}/></label>
+        <div className="form-row"><label>Weight unit<select value={draft.weightUnit} onChange={(event) => setDraft({ ...draft, weightUnit: event.target.value as Profile["weightUnit"] })}><option value="kg">Kilograms (kg)</option><option value="lb">Pounds (lb)</option></select></label><label>Distance unit<select value={draft.distanceUnit} onChange={(event) => setDraft({ ...draft, distanceUnit: event.target.value as Profile["distanceUnit"] })}><option value="km">Kilometers</option><option value="mi">Miles</option></select></label></div>
+        <div className="form-row"><label>Rider weight ({draft.weightUnit})<EditableNumberInput step={0.1} min={draft.weightUnit === "lb" ? 66 : 30} max={draft.weightUnit === "lb" ? 551 : 250} value={displayedWeight(draft.riderWeightKg, draft.weightUnit)} onValueChange={(value) => setDraft({ ...draft, riderWeightKg: storedWeight(value, draft.weightUnit) })}/></label><label>Bike weight ({draft.weightUnit})<EditableNumberInput step={0.1} min={draft.weightUnit === "lb" ? 7 : 3} max={draft.weightUnit === "lb" ? 88 : 40} value={displayedWeight(draft.bikeWeightKg, draft.weightUnit)} onValueChange={(value) => setDraft({ ...draft, bikeWeightKg: storedWeight(value, draft.weightUnit) })}/></label></div>
+        <button className="primary" type="submit">Save settings</button>
+      </form></section>
+      <RideScreensEditor
+        preferences={rideDisplayPreferences}
+        onSave={onSaveRideDisplayPreferences}
+      />
+      <section className="card settings-card">
+        <div>
+          <span className="label">TRAINING ZONES</span>
+          <h2>Power and heart rate</h2>
+          <p>Defaults follow your FTP and maximum heart rate. Editing a boundary switches that set to custom values. Turn on import for a set to replace it with your Intervals.icu zones whenever you sync.</p>
+        </div>
+        <div className="zone-settings">
+          <ZoneEditor
+            title="Power"
+            unit="W"
+            mode={zoneDraft.powerMode}
+            zones={effectivePowerZones(zoneDraft, draft.ftpWatts)}
+            syncFromIntervals={zoneDraft.syncPowerZonesFromIntervals}
+            onSyncFromIntervals={(enabled) => requestZoneSync("power", enabled)}
+            onChange={(zones) => setZoneDraft({ ...zoneDraft, powerMode: "custom", powerZones: zones })}
+            onReset={() => setZoneDraft({ ...zoneDraft, powerMode: "derived", powerZones: [] })}
+          />
+          <ZoneEditor
+            title="Heart rate"
+            unit="bpm"
+            mode={zoneDraft.heartRateMode}
+            zones={effectiveHeartRateZones(zoneDraft, draft.maxHeartRateBpm)}
+            syncFromIntervals={zoneDraft.syncHeartRateZonesFromIntervals}
+            onSyncFromIntervals={(enabled) => requestZoneSync("heartRate", enabled)}
+            onChange={(zones) => setZoneDraft({ ...zoneDraft, heartRateMode: "custom", heartRateZones: zones })}
+            onReset={() => setZoneDraft({ ...zoneDraft, heartRateMode: "derived", heartRateZones: [] })}
+          />
+          <button className="primary" type="button" onClick={() => onSaveTrainingZones(zoneDraft)}>Save zone settings</button>
+        </div>
+      </section>
+      {zoneSyncConfirm && (
+        <ConfirmDialog
+          title={`Replace your custom ${zoneSyncConfirm === "power" ? "power" : "heart-rate"} zones?`}
+          description="The next sync from Intervals.icu overwrites the boundaries you set by hand. Nothing changes until you sync."
+          confirmLabel="Replace on sync"
+          onClose={() => setZoneSyncConfirm(null)}
+          onConfirm={() => {
+            setZoneSync(zoneSyncConfirm, true);
+            setZoneSyncConfirm(null);
+          }}
+        />
+      )}
+      <section className="card settings-card">
+        <div>
+          <span className="label">INTERVALS.ICU</span>
+          <h2>Intervals.icu</h2>
+          <p>Your planned workouts and workout library are mirrored here, read-only, and refreshed when blake.bike starts and whenever you press Sync now. Syncing training settings pulls your FTP and maximum heart rate from your cycling settings; power and heart-rate zones are imported only when you turn them on in Training zones above.</p>
+          <span className={`integration-status ${intervalsConfigured ? "configured" : ""}`}>
+            {!intervalsConfigured
+              ? "API key not configured"
+              : intervalsStatus.athleteName
+                ? `Connected as ${intervalsStatus.athleteName}`
+                : "API key saved"}
+          </span>
+        </div>
+        <div className="integration-controls">
+          <label>
+            API key
+            <input
+              type="password"
+              autoComplete="off"
+              placeholder={intervalsConfigured ? "Enter a new key to replace the saved key" : "Intervals.icu API key"}
+              value={apiKey}
+              onChange={(event) => setApiKey(event.target.value)}
+            />
+          </label>
+          <p className="settings-note">The key is stored in this app's local SQLite database and is used only by the desktop backend.</p>
+          <div className="settings-actions">
+            <button
+              className="secondary"
+              disabled={!apiKey.trim() || intervalsBusy !== null}
+              onClick={() => void saveIntervalsKey()}
+            >
+              {intervalsBusy === "save" ? "Saving…" : "Save API key"}
+            </button>
+            {intervalsConfigured && (
+              <button
+                className="danger-button"
+                disabled={intervalsBusy !== null}
+                onClick={() => void clearIntervalsKey()}
+              >
+                {intervalsBusy === "clear" ? "Clearing…" : "Clear key"}
+              </button>
+            )}
+          </div>
+          <span className="label">TRAINING SETTINGS</span>
+          <label>
+            FTP source
+            <select
+              disabled={!intervalsConfigured || intervalsBusy !== null}
+              value={intervalsStatus.settings.ftpSource}
+              onChange={(event) => void setMirrorSetting({ ftpSource: event.target.value as FtpSource })}
+            >
+              <option value="indoorFtp">Indoor FTP</option>
+              <option value="ftp">FTP</option>
+              <option value="estimatedFtp">eFTP (modeled from your rides)</option>
+            </select>
+          </label>
+          <p className="settings-note">The next sync takes your FTP from this number and scales your power zones from it. If Intervals.icu has no value there, the sync falls back to one it does have and the result says which was used.</p>
+          <button
+            className="primary"
+            disabled={!intervalsConfigured || intervalsBusy !== null || unsavedHint !== null}
+            onClick={() => void syncTrainingSettings()}
+          >
+            {intervalsBusy === "sync" ? "Syncing…" : "Sync from Intervals.icu"}
+          </button>
+          {intervalsConfigured && unsavedHint && <p className="settings-note">{unsavedHint}</p>}
+          {trainingSyncStatus && <p className="integration-result">{trainingSyncStatus}</p>}
+          <span className="label">CALENDAR AND LIBRARY</span>
+          <label className="settings-toggle">
+            <input
+              type="checkbox"
+              disabled={!intervalsConfigured || intervalsBusy !== null}
+              checked={intervalsStatus.settings.calendar}
+              onChange={(event) => void setMirrorSetting({ calendar: event.target.checked })}
+            />
+            <span>
+              Show today's planned workout
+              <small>Pulls the next seven days of planned rides from your Intervals.icu calendar onto the home screen and the ride picker.</small>
+            </span>
+          </label>
+          <label className="settings-toggle">
+            <input
+              type="checkbox"
+              disabled={!intervalsConfigured || intervalsBusy !== null}
+              checked={intervalsStatus.settings.library}
+              onChange={(event) => void setMirrorSetting({ library: event.target.checked })}
+            />
+            <span>
+              Mirror the workout library
+              <small>Cycling workouts from your Intervals.icu library appear in Workouts, read-only, labelled with their folder. Turning this off removes them.</small>
+            </span>
+          </label>
+          <p className="settings-note">Synced when blake.bike starts and when you press Sync now. {describeLastSynced(intervalsStatus.lastSyncedAt)}.</p>
+          {intervalsStatus.lastError && <p className="settings-note warn">Last sync failed: {intervalsStatus.lastError}</p>}
+          <button
+            className="secondary"
+            disabled={!intervalsConfigured || intervalsBusy !== null || (!intervalsStatus.settings.calendar && !intervalsStatus.settings.library)}
+            onClick={() => void syncMirrors()}
+          >
+            {intervalsBusy === "mirrors" ? "Syncing…" : "Sync now"}
+          </button>
+          {mirrorSyncStatus && <p className="integration-result">{mirrorSyncStatus}</p>}
+        </div>
+      </section>
+      <section className="card settings-card"><div><span className="label">DATA & DIAGNOSTICS</span><h2>Local-first by design</h2><p>Every finalized ride is stored in SQLite and as a persistent Garmin-compatible FIT file. Missing FIT files are regenerated automatically.</p></div><div className="data-locations"><div className="log-location"><span>Ride Files</span><code>{rideFilesPath}</code><button className="secondary" onClick={() => void api.revealRideFiles().catch(() => undefined)}>Show Ride Files</button></div><div className="log-location"><span>Log file</span><code>{logPath}</code><button className="secondary" onClick={() => void api.revealLogFile().catch(() => undefined)}>Show in folder</button><button className="secondary" onClick={() => void navigator.clipboard.writeText(logPath)}>Copy path</button></div><div className="log-location"><span>Known devices</span><p className="settings-note">Devices you have connected are remembered on this computer so they can be reconnected without scanning. Forgetting them does not disconnect anything.</p><button className="danger-button" onClick={() => void onForgetDevices()}>Forget all devices</button></div></div></section>
+      <section className="card settings-card">
+        <div>
+          <span className="label">DEVELOPER</span>
+          <h2>Developer mode</h2>
+          <p>Off by default. Turn it on to work on blake.bike without a trainer in the room; leave it off for real rides so a scan only ever offers your own hardware.</p>
+        </div>
+        <label className="settings-toggle">
+          <input
+            type="checkbox"
+            checked={devMode}
+            onChange={(event) => onDevMode(event.target.checked)}
+          />
+          <span>
+            Offer simulated devices
+            <small>Adds the simulated trainer, HR strap, power meter and cadence sensor to device scans. A simulator that is already connected stays connected until you disconnect it.</small>
+          </span>
+        </label>
+      </section>
+      <AboutCard />
+    </>
+  );
+}
+
+function AboutCard() {
+  const [version, setVersion] = useState<string | null>(null);
+  const [showNotes, setShowNotes] = useState(false);
+  useEffect(() => {
+    void api
+      .appVersion()
+      .then(setVersion)
+      .catch(() => undefined);
+  }, []);
+  const release = releaseFor(version);
+  const released = formatReleaseDate(release?.date ?? null);
+  return (
+    <section className="card settings-card about-card">
+      <div>
+        <span className="label">ABOUT</span>
+        <h2>blake.bike {version ?? release?.version ?? ""}</h2>
+        {release?.summary && <p>{release.summary}</p>}
+        {released && <p className="settings-note">Released {released}</p>}
+      </div>
+      <div className="settings-actions">
+        <button
+          className="secondary"
+          disabled={releases.length === 0}
+          onClick={() => setShowNotes(true)}
+        >
+          <Info size={16} /> Release notes
+        </button>
+        <button className="secondary" onClick={() => void api.openWebsite().catch(() => undefined)}>
+          <ExternalLink size={16} /> blake.bike
+        </button>
+      </div>
+      {showNotes && (
+        <ReleaseNotesModal
+          currentVersion={version ?? release?.version ?? null}
+          onClose={() => setShowNotes(false)}
+        />
+      )}
+    </section>
+  );
+}
+
+export function ReleaseNotesModal({
+  currentVersion,
+  onClose,
+}: {
+  currentVersion: string | null;
+  onClose: () => void;
+}) {
+  return (
+    <div className="modal-backdrop">
+      <div className="modal release-notes-modal">
+        <button className="modal-close" onClick={onClose} aria-label="Close release notes"><X /></button>
+        <span className="label">RELEASE NOTES</span>
+        <h2>What's new in blake.bike</h2>
+        <div className="release-list">
+          {releases.map((release) => (
+            <ReleaseEntry
+              key={release.version}
+              release={release}
+              installed={release.version === currentVersion}
+            />
+          ))}
+        </div>
+        <div className="modal-actions">
+          <button className="primary" onClick={onClose}>Close</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ReleaseEntry({ release, installed }: { release: Release; installed: boolean }) {
+  const released = formatReleaseDate(release.date);
+  return (
+    <article className="release-entry">
+      <header>
+        <h3>
+          {release.version}
+          {installed && <span className="release-installed">Installed</span>}
+        </h3>
+        {released && <span className="release-date">{released}</span>}
+      </header>
+      {release.summary && <p className="release-summary">{release.summary}</p>}
+      {release.sections.map((section) => (
+        <div className="release-section" key={section.title}>
+          <span className="label">{section.title.toUpperCase()}</span>
+          <ul>
+            {section.items.map((item) => (
+              <li key={item}>{item}</li>
+            ))}
+          </ul>
+        </div>
+      ))}
+    </article>
+  );
+}
+
+type ChartDomain = [number | string, number | string];
+const powerDomain: ChartDomain = [0, "dataMax + 50"];
+const heartRateDomain: ChartDomain = ["dataMin - 10", "dataMax + 10"];
+
+// Recharts' default tooltip is a white box; on the dark theme the lime and
+// pink series values were unreadable on it. Match the modal surface instead
+// and let each series keep its own color for the value.
+const chartTooltipContentStyle = {
+  background: "#1b1f1a",
+  border: "1px solid #373d34",
+  borderRadius: 9,
+  boxShadow: "0 14px 40px rgba(0,0,0,.5)",
+  padding: "8px 12px",
+} as const;
+const chartTooltipLabelStyle = { color: "#c9d0c3", fontSize: 12, marginBottom: 4 } as const;
+const chartTooltipItemStyle = { fontSize: 13, padding: 0 } as const;
+const chartTooltipCursor = { stroke: "#6b7566", strokeWidth: 1 } as const;
+
+const formatChartTime = (value: unknown) =>
+  formatDuration(Math.max(0, Math.round(Number(value) / 1000)));
+
+const noSelectionChange = () => undefined;
+
+const SessionAreaChart = memo(function SessionAreaChart({
+  samples,
+  dataKey,
+  unit,
+  color,
+  name,
+  domain,
+  selection = null,
+  onSelectionChange,
+}: {
+  samples: Array<Telemetry & { displayPowerWatts?: number; activeElapsedMs: number }>;
+  dataKey: "powerWatts" | "displayPowerWatts" | "heartRateBpm";
+  unit: string;
+  color: string;
+  name: string;
+  domain: ChartDomain;
+  /** Highlighted stretch of the ride, shared by every chart on the screen. */
+  selection?: ChartRange | null;
+  /** When provided, the rider can press and drag on the chart to select a range. */
+  onSelectionChange?: (range: ChartRange | null) => void;
+}) {
+  const gradientId = `fill-${dataKey}`;
+  const selectable = onSelectionChange !== undefined;
+  const drag = useChartRangeDrag(onSelectionChange ?? noSelectionChange);
+  return (
+    <div className={selectable ? "session-chart session-chart-selectable" : "session-chart"}>
+      <ResponsiveContainer width="100%" height={220}>
+        <AreaChart data={samples} {...(selectable ? drag : undefined)}>
+          <defs>
+            <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor={color} stopOpacity={0.42} />
+              <stop offset="100%" stopColor={color} stopOpacity={0} />
+            </linearGradient>
+          </defs>
+          <CartesianGrid strokeDasharray="4 4" vertical={false} />
+          <XAxis
+            dataKey="activeElapsedMs"
+            type="number"
+            domain={["dataMin", "dataMax"]}
+            tickFormatter={formatChartTime}
+            minTickGap={45}
+          />
+          <YAxis width={42} domain={domain} />
+          <Tooltip
+            labelFormatter={formatChartTime}
+            formatter={(value) => [`${value ?? "—"} ${unit}`, name]}
+            contentStyle={chartTooltipContentStyle}
+            labelStyle={chartTooltipLabelStyle}
+            itemStyle={chartTooltipItemStyle}
+            cursor={chartTooltipCursor}
+          />
+          {selection && (
+            <ReferenceArea
+              x1={selection.startMs}
+              x2={selection.endMs}
+              ifOverflow="discard"
+              fill={color}
+              fillOpacity={0.16}
+              stroke={color}
+              strokeOpacity={0.6}
+            />
+          )}
+          <Area
+            connectNulls={false}
+            type="monotone"
+            dataKey={dataKey}
+            stroke={color}
+            fill={`url(#${gradientId})`}
+            isAnimationActive={false}
+          />
+        </AreaChart>
+      </ResponsiveContainer>
+    </div>
+  );
+});
+
+/**
+ * Average, maximum, and minimum for the stretch highlighted on the charts.
+ * Shows a short hint until the rider drags a range.
+ */
+export function RangeSummaryStrip({
+  summary,
+  onClear,
+}: {
+  summary: RangeSummary | null;
+  onClear: () => void;
+}) {
+  if (!summary) {
+    return <p className="range-hint">Drag across a chart to see the average, maximum, and minimum for that section.</p>;
+  }
+  const { range, durationMs, power, heartRate } = summary;
+  return (
+    <div className="range-summary" role="status">
+      <div className="range-summary-span">
+        <span className="label">SELECTION</span>
+        <strong>{formatChartTime(range.startMs)} – {formatChartTime(range.endMs)}</strong>
+        <span>{formatChartTime(durationMs)} selected</span>
+      </div>
+      <Metric value={power ? `${power.average}` : "—"} unit="W average" />
+      <Metric value={power ? `${power.max}` : "—"} unit="W maximum" />
+      <Metric value={power ? `${power.min}` : "—"} unit="W minimum" />
+      <Metric value={heartRate ? `${heartRate.average}` : "—"} unit="bpm average" />
+      <Metric value={heartRate ? `${heartRate.max}` : "—"} unit="bpm maximum" />
+      <Metric value={heartRate ? `${heartRate.min}` : "—"} unit="bpm minimum" />
+      <button type="button" className="secondary" onClick={onClear}>Clear</button>
+    </div>
+  );
+}
+
+const TimeInZoneChart = memo(function TimeInZoneChart({
+  title,
+  zones,
+  seconds,
+}: {
+  title: string;
+  zones: ReturnType<typeof effectivePowerZones>;
+  seconds: number[];
+}) {
+  const data = zones.map((zone, index) => ({
+    name: zone.name,
+    seconds: Math.round(seconds[index] ?? 0),
+    fill: zoneColorAt(index),
+  }));
+  return (
+    <div className="card zone-chart">
+      <div className="chart-heading"><div><span className="label">TIME IN ZONE</span><h3>{title}</h3></div></div>
+      <ResponsiveContainer width="100%" height={Math.max(150, data.length * 30)}>
+        <BarChart data={data} layout="vertical" margin={{ left: 4, right: 12 }}>
+          <XAxis type="number" hide />
+          <YAxis type="category" dataKey="name" width={58} tick={{ fontSize: 10 }} />
+          <Tooltip
+            formatter={(value) => [formatDuration(Number(value)), "Time"]}
+            contentStyle={chartTooltipContentStyle}
+            labelStyle={chartTooltipLabelStyle}
+            itemStyle={chartTooltipItemStyle}
+            cursor={{ fill: "rgba(255,255,255,.06)" }}
+          />
+          <Bar dataKey="seconds" radius={[0, 4, 4, 0]} isAnimationActive={false}>
+            {data.map((entry) => <Cell key={entry.name} fill={entry.fill} />)}
+          </Bar>
+        </BarChart>
+      </ResponsiveContainer>
+    </div>
+  );
+});
+
+function ZoneEditor({
+  title,
+  unit,
+  mode,
+  zones,
+  syncFromIntervals,
+  onSyncFromIntervals,
+  onChange,
+  onReset,
+}: {
+  title: string;
+  unit: string;
+  mode: ZoneMode;
+  zones: ReturnType<typeof effectivePowerZones>;
+  /** Whether a sync from Intervals.icu replaces this set. */
+  syncFromIntervals: boolean;
+  onSyncFromIntervals: (enabled: boolean) => void;
+  onChange: (zones: ReturnType<typeof effectivePowerZones>) => void;
+  onReset: () => void;
+}) {
+  const update = (index: number, patch: Partial<(typeof zones)[number]>) =>
+    onChange(zones.map((zone, zoneIndex) => zoneIndex === index ? { ...zone, ...patch } : zone));
+  return (
+    <div className="zone-editor">
+      <div className="zone-editor-head">
+        <strong>{title}</strong>
+        <span>{zoneModeLabel[mode]}</span>
+        {mode !== "derived" && <button type="button" className="text-button" onClick={onReset}>Reset defaults</button>}
+      </div>
+      <label className="settings-toggle zone-sync-toggle">
+        <input
+          type="checkbox"
+          checked={syncFromIntervals}
+          onChange={(event) => onSyncFromIntervals(event.target.checked)}
+        />
+        <span>
+          Import {title.toLowerCase()} zones from Intervals.icu
+          <small>
+            {syncFromIntervals && mode === "custom"
+              ? "Import is on: the next sync replaces the boundaries you edited by hand."
+              : "Applied when you sync from Intervals.icu below."}
+          </small>
+        </span>
+      </label>
+      <div className="zone-boundaries">
+        {zones.map((zone, index) => (
+          <div className="zone-boundary" key={`${title}-${index}`}>
+            <i style={{ background: zoneColorAt(index) }} />
+            <input
+              aria-label={`${title} zone ${index + 1} name`}
+              value={zone.name}
+              onChange={(event) => update(index, { name: event.target.value })}
+            />
+            {zone.upperBound === null ? (
+              <span>and above</span>
+            ) : (
+              <label>
+                up to
+                <EditableNumberInput
+                  aria-label={`${title} zone ${index + 1} upper bound`}
+                  min={unit === "W" ? 1 : 30}
+                  max={unit === "W" ? 3000 : 250}
+                  value={zone.upperBound}
+                  onValueChange={(upperBound) => update(index, { upperBound })}
+                />
+                {unit}
+              </label>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function WorkoutTimeline({
+  steps,
+  ftpWatts,
+  biasPercent,
+  powerZones,
+  intervals,
+  workoutName,
+  currentIndex,
+  intervalElapsedSeconds,
+  elapsedSeconds,
+  totalSeconds,
+  paused,
+  onSkip,
+}: {
+  steps: WorkoutStep[];
+  ftpWatts: number;
+  biasPercent: number;
+  powerZones: readonly ZoneDefinition[];
+  /** Runner-aligned, bias-applied intervals; index-for-index the same blocks the profile draws. */
+  intervals: WorkoutInterval[];
+  workoutName: string;
+  currentIndex: number;
+  intervalElapsedSeconds: number;
+  elapsedSeconds: number;
+  totalSeconds: number;
+  paused: boolean;
+  onSkip: () => void;
+}) {
+  const current = intervals[currentIndex];
+  if (!current) return null;
+
+  const blockState = (_shape: unknown, index: number) => {
+    const state = index < currentIndex ? "completed" : index === currentIndex ? "current" : "upcoming";
+    const progress = state === "completed"
+      ? 1
+      : state === "current"
+        ? Math.min(1, intervalElapsedSeconds / Math.max(1, current.durationSeconds))
+        : 0;
+    return { className: state, state, progress };
+  };
+  const currentRemaining = Math.max(0, current.durationSeconds - intervalElapsedSeconds);
+  const workoutRemaining = Math.max(0, totalSeconds - elapsedSeconds);
+  const currentTarget = formatIntervalTarget(current.startWatts, current.endWatts);
+
+  return (
+    <section className="card workout-timeline" aria-label="Workout timeline">
+      <div className="timeline-heading">
+        <div>
+          <span className="label">{workoutName}</span>
+          <h3>Block {currentIndex + 1} of {intervals.length}</h3>
+          <span className="timeline-target">{currentTarget}{paused ? " · Paused" : ""}</span>
+        </div>
+        <div className="timeline-side">
+          <button className="secondary" onClick={onSkip}><SkipForward /> Skip block</button>
+          <div className="timeline-countdowns">
+            <div>
+              <span>Current block</span>
+              <strong>{formatDuration(currentRemaining)}</strong>
+            </div>
+            <div>
+              <span>Workout remaining</span>
+              <strong>{formatDuration(workoutRemaining)}</strong>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div className="workout-timeline-scroll">
+        <div
+          className="workout-timeline-track"
+          style={{ width: `${Math.max(100, intervals.length * 3)}%` }}
+        >
+          <WorkoutProfile
+            steps={steps}
+            ftpWatts={ftpWatts}
+            biasPercent={biasPercent}
+            powerZones={powerZones}
+            labels
+            segmentState={blockState}
+          />
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function DistanceMetric({ meters, unit }: { meters: number; unit: Profile["distanceUnit"] }) {
+  const formatted = formatDistance(meters, unit);
+  return <Metric value={formatted.value} unit={`${formatted.unit} estimated`} />;
+}
+
+function distanceSourceLabel(source: SessionSummary["distanceSource"]) {
+  if (source === "trainer") return "trainer speed";
+  if (source === "mixed") return "trainer speed and power model";
+  if (source === "power") return "flat-road power model";
+  return "no telemetry";
+}
+
+function LiveMetric({ icon: Icon, label, value, unit, accent = false, note, control }: { icon: typeof Activity; label: string; value: string | number; unit?: string; accent?: boolean; note?: string | null; control?: React.ReactNode }) {
+  return <div className={accent ? "live-metric accent" : "live-metric"}><span><Icon size={17}/>{label}{control && <span className="metric-control">{control}</span>}</span><strong>{value}{unit && <small>{unit}</small>}</strong>{note && <em className="metric-source">{note}</em>}</div>;
+}
+
+function newWorkout(): Workout {
+  const now = new Date().toISOString();
+  return { id: crypto.randomUUID(), name: "New workout", description: "", source: "local", version: 1, createdAt: now, updatedAt: now, steps: [{ kind: "steady", durationSeconds: 300, target: { unit: "percentFtp", value: 70 } }] };
+}
+
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function workingCopy(label: string) {
+  if (label.includes("connect")) return "Connecting…";
+  if (label.includes("scan")) return "Looking for devices…";
+  if (label.includes("export")) return "Preparing export…";
+  if (label.includes("sync")) return "Syncing with Intervals.icu…";
+  if (label.includes("stop workout")) return "Saving your ride…";
+  if (label.includes("save")) return "Saving…";
+  if (label.includes("delete") || label.includes("forget")) return "Removing…";
+  if (label.includes("restore")) return "Restoring…";
+  return "Working…";
+}
+
+function successCopy(label: string) {
+  if (label.includes("connect")) return label.includes("disconnect") ? "Disconnected" : "Connected and ready";
+  if (label.includes("scan")) return "Scan complete";
+  if (label.includes("export")) return "Export ready";
+  if (label.includes("sync")) return "Synced with Intervals.icu";
+  if (label.includes("stop workout")) return "Ride saved. Nice work!";
+  if (label.includes("save")) return "Saved";
+  if (label.includes("delete") || label.includes("forget")) return "Removed";
+  if (label.includes("restore")) return "Restored";
+  return "Done";
+}

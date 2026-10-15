@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc">
+  <title id="title">blake.bike</title>
+  <desc id="desc">A mountain route crossing the world, framed by an electric lime bicycle wheel.</desc>
+  <defs>
+    <linearGradient id="surface" x1="112" y1="72" x2="896" y2="944" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#263C35"/>
+      <stop offset=".55" stop-color="#15231E"/>
+      <stop offset="1" stop-color="#0C120F"/>
+    </linearGradient>
+    <linearGradient id="sky" x1="512" y1="210" x2="512" y2="780" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#547A83"/>
+      <stop offset=".58" stop-color="#284740"/>
+      <stop offset="1" stop-color="#14251D"/>
+    </linearGradient>
+    <linearGradient id="lime" x1="260" y1="192" x2="772" y2="838" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#E1FF78"/>
+      <stop offset=".5" stop-color="#C8FF32"/>
+      <stop offset="1" stop-color="#82C410"/>
+    </linearGradient>
+    <linearGradient id="road" x1="484" y1="520" x2="532" y2="806" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F2F6E9"/>
+      <stop offset="1" stop-color="#C8FF32"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0" cy="0" r="1" gradientTransform="translate(512 484) rotate(90) scale(430)" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#87C9B2" stop-opacity=".2"/>
+      <stop offset="1" stop-color="#87C9B2" stop-opacity="0"/>
+    </radialGradient>
+    <clipPath id="world">
+      <circle cx="512" cy="512" r="278"/>
+    </clipPath>
+    <filter id="shadow" x="120" y="120" width="784" height="784" filterUnits="userSpaceOnUse">
+      <feDropShadow dx="0" dy="20" stdDeviation="22" flood-color="#000" flood-opacity=".4"/>
+    </filter>
+  </defs>
+
+  <rect x="32" y="32" width="960" height="960" rx="224" fill="url(#surface)"/>
+  <rect x="49" y="49" width="926" height="926" rx="207" fill="none" stroke="#3A5046" stroke-width="6"/>
+  <circle cx="512" cy="494" r="430" fill="url(#glow)"/>
+
+  <g filter="url(#shadow)">
+    <circle cx="512" cy="512" r="318" fill="#101A15" stroke="url(#lime)" stroke-width="62"/>
+    <g clip-path="url(#world)">
+      <rect x="234" y="234" width="556" height="556" fill="url(#sky)"/>
+
+      <circle cx="660" cy="350" r="48" fill="#FFD875"/>
+      <circle cx="660" cy="350" r="70" fill="none" stroke="#FFD875" stroke-opacity=".18" stroke-width="22"/>
+
+      <path d="M202 544 350 392l82 78 105-144 95 128 61-68 134 158v92H202v-92Z" fill="#769087"/>
+      <path d="m350 392 36 34-30 5-28 29-23-22 45-46Zm187-66 48 65-39-17-31 23-31-14 53-57Zm156 60 37 44-28-11-24 20-25-9 40-44Z" fill="#EEF3ED"/>
+      <path d="M202 582 330 474l77 63 118-129 123 125 76-70 103 105v112H202v-98Z" fill="#294C3A"/>
+      <path d="m330 474 42 34-32-7-27 23-22-17 39-33Zm195-66 51 52-41-16-34 28-29-16 53-48Zm199 55 37 38-31-12-25 22-22-15 41-33Z" fill="#F5F7F0"/>
+
+      <path d="M196 630c83-61 158-70 228-34 67 35 127 26 183-19 64-51 137-46 220 14v227H196V630Z" fill="#183425"/>
+      <path d="M236 683c112-46 202-42 271 11 66 50 158 51 276 1v123H236V683Z" fill="#10261B"/>
+
+      <g fill="#31563D">
+        <path d="m292 530-34 78h24l-37 70h94l-37-70h24l-34-78Z"/>
+        <path d="m750 518-31 72h22l-34 65h86l-34-65h22l-31-72Z"/>
+      </g>
+
+      <path d="M515 528c-34 73 58 86 25 142-19 32-78 50-97 126h143c-4-70 50-101 32-150-21-57-96-55-103-118Z" fill="url(#road)"/>
+      <path d="M515 528c-6 64 76 70 59 123-12 37-74 59-80 145" fill="none" stroke="#1B3026" stroke-width="13" stroke-linecap="round" stroke-dasharray="34 27"/>
+    </g>
+
+    <circle cx="512" cy="512" r="278" fill="none" stroke="#D9FF67" stroke-opacity=".26" stroke-width="5"/>
+    <path d="M222 512a290 290 0 0 1 580 0" fill="none" stroke="#F0FFBF" stroke-opacity=".28" stroke-width="8" stroke-linecap="round"/>
+  </g>
+</svg>

@@ -1,0 +1,70 @@
+[package]
+name = "blakebike"
+version = "0.5.2"
+description = "Local-first smart bike trainer"
+authors = ["blake.bike contributors"]
+license = "GPL-3.0-or-later"
+repository = "https://github.com/bpeterman/blakebike"
+edition = "2024"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "blakebike_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+async-trait = "0.1"
+base64 = "0.22"
+btleplug = { version = "0.13", features = ["serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+csv = "1"
+futures = "0.3"
+quick-xml = { version = "0.38", features = ["serialize"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.37", features = ["bundled", "chrono", "uuid"] }
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serialport = { version = "4.8", default-features = false }
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
+fit-sdk-rust = "0.2.1"
+# Prevents system/display sleep while a ride is active (IOKit on macOS,
+# ScreenSaver + logind inhibit over D-Bus on Linux).
+keepawake = "0.6"
+
+# Read CBManager.authorization directly: btleplug folds "Unauthorized" into
+# CentralState::Unknown, which can't tell a denied permission from a radio
+# that is resetting. Same version btleplug already pulls in.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-core-bluetooth = { version = "0.3.2", default-features = false, features = ["std", "CBManager"] }
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"
+# start_paused / time::advance for deterministic timing tests.
+tokio = { version = "1", features = ["test-util"] }
+
+
+# Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+# Unwind so a panic in one task (a decoder, a BLE callback) is caught and
+# handled as a link loss instead of taking the whole ride down.
+panic = "unwind"
+strip = true

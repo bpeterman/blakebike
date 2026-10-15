@@ -1,0 +1,222 @@
+import { describe, expect, it } from "vitest";
+import {
+  calibrationSummary,
+  calibrationUnavailable,
+  calibrationVerb,
+  connectAllSummary,
+  deviceFitsRole,
+  driftLabel,
+  offsetDrift,
+  zeroOffsetIsDue,
+  deviceName,
+  knownToDeviceInfo,
+  formatAge,
+  formatRelativeDate,
+  formatUptime,
+  makeAndModel,
+  isConnected,
+  metricsFedBy,
+  readoutMark,
+  sourceNote,
+  deviceTransport,
+  transportLabel,
+} from "./devices";
+import type { CalibrationRecord, DeviceInfo, DeviceState, KnownConnectOutcome } from "./types";
+
+const device = (capabilities?: DeviceInfo["capabilities"]): DeviceInfo => ({
+  id: "x",
+  name: "X",
+  simulated: false,
+  rssi: -60,
+  capabilities,
+});
+
+describe("device roles", () => {
+  it("defaults old device records to BLE and labels ANT devices", () => {
+    expect(deviceTransport(device(["heartRate"]))).toBe("ble");
+    expect(transportLabel(device(["heartRate"]))).toBe("BLE");
+    expect(transportLabel({ ...device(["heartRate"]), transport: "ant" })).toBe("ANT+");
+  });
+
+  it("matches devices to roles by advertised service", () => {
+    expect(deviceFitsRole(device(["ftms"]), "trainer")).toBe(true);
+    expect(deviceFitsRole(device(["ftms"]), "heartRate")).toBe(false);
+    expect(deviceFitsRole(device(["heartRate"]), "heartRate")).toBe(true);
+    expect(deviceFitsRole(device(["cyclingPower"]), "power")).toBe(true);
+    expect(deviceFitsRole(device(["cyclingPower"]), "cadence")).toBe(true);
+    expect(deviceFitsRole(device(["csc"]), "cadence")).toBe(true);
+    expect(deviceFitsRole(device(["csc"]), "power")).toBe(false);
+  });
+
+  it("treats capability-less results as trainers only", () => {
+    expect(deviceFitsRole(device(), "trainer")).toBe(true);
+    expect(deviceFitsRole(device([]), "heartRate")).toBe(false);
+  });
+
+  it("reads connection state", () => {
+    const ready: DeviceState = { status: "ready", device: device(["ftms"]) };
+    expect(isConnected(ready)).toBe(true);
+    expect(isConnected({ status: "connecting", name: "K" })).toBe(false);
+    expect(isConnected(undefined)).toBe(false);
+    expect(deviceName(ready)).toBe("X");
+    expect(deviceName({ status: "idle" })).toBeNull();
+  });
+});
+
+describe("telemetry provenance", () => {
+  it("labels sources and fallbacks", () => {
+    expect(sourceNote({ role: "heartRate", fallback: false })).toBe("via heart rate");
+    expect(sourceNote({ role: "trainer", fallback: true })).toBe("fallback: trainer");
+    expect(sourceNote(null)).toBeNull();
+  });
+
+  it("lists which metrics a role feeds", () => {
+    const sources = {
+      power: { role: "power" as const, fallback: false },
+      cadence: { role: "power" as const, fallback: false },
+      heartRate: { role: "heartRate" as const, fallback: false },
+    };
+    expect(metricsFedBy("power", sources)).toEqual(["power", "cadence"]);
+    expect(metricsFedBy("trainer", sources)).toEqual([]);
+    expect(metricsFedBy("trainer", undefined)).toEqual([]);
+  });
+});
+
+describe("formatting", () => {
+  it("formats uptime and ages", () => {
+    expect(formatUptime(4_000)).toBe("4s");
+    expect(formatUptime(125_000)).toBe("2m 05s");
+    expect(formatUptime(3_725_000)).toBe("1h 02m");
+    expect(formatAge(400)).toBe("now");
+    expect(formatAge(7_500)).toBe("7s ago");
+    expect(formatAge(130_000)).toBe("2m ago");
+  });
+
+  it("joins make and model without repeating the brand", () => {
+    expect(makeAndModel("Wahoo", "KICKR CORE")).toBe("Wahoo · KICKR CORE");
+    expect(makeAndModel("Wahoo Fitness", "Wahoo Fitness KICKR")).toBe("Wahoo Fitness KICKR");
+    expect(makeAndModel("Garmin", null)).toBe("Garmin");
+    expect(makeAndModel(null, "  ")).toBeNull();
+    expect(makeAndModel(null, null)).toBeNull();
+  });
+
+  it("formats last-used dates relative to now", () => {
+    const now = Date.parse("2026-09-18T12:00:00Z");
+    expect(formatRelativeDate("2026-09-18T11:59:40Z", now)).toBe("just now");
+    expect(formatRelativeDate("2026-09-18T11:35:00Z", now)).toBe("25 min ago");
+    expect(formatRelativeDate("2026-09-18T07:00:00Z", now)).toBe("5 h ago");
+    expect(formatRelativeDate("2026-09-17T09:00:00Z", now)).toBe("yesterday");
+    expect(formatRelativeDate("2026-09-10T09:00:00Z", now)).toBe("8 days ago");
+    expect(formatRelativeDate("garbage", now)).toBe("unknown");
+  });
+
+  it("marks log levels", () => {
+    expect(readoutMark("ok")).toBe("✓");
+    expect(readoutMark("warn")).toBe("!");
+    expect(readoutMark("error")).toBe("✕");
+    expect(readoutMark("info")).toBe("›");
+  });
+});
+
+describe("connect all", () => {
+  const outcome = (role: KnownConnectOutcome["role"], name: string, status: KnownConnectOutcome["status"]): KnownConnectOutcome =>
+    ({ role, name, status, error: status === "failed" ? "Device was not seen within 10s" : null });
+
+  it("turns a remembered device into a connect request without a stale signal reading", () => {
+    expect(
+      knownToDeviceInfo({
+        id: "strap",
+        name: "HRM-Pro",
+        transport: "ant",
+        role: "heartRate",
+        capabilities: ["heartRate"],
+        simulated: false,
+        manufacturer: "Garmin",
+        model: null,
+        lastConnectedAt: "2026-09-01T00:00:00Z",
+      }),
+    ).toEqual({ id: "strap", name: "HRM-Pro", transport: "ant", simulated: false, rssi: null, capabilities: ["heartRate"] });
+  });
+
+  it("stays quiet when every device answered", () => {
+    expect(connectAllSummary([])).toBeNull();
+    expect(connectAllSummary([outcome("trainer", "KICKR", "connected"), outcome("heartRate", "HRM", "skipped")])).toBeNull();
+  });
+
+  it("names a sleeping sensor gently, without the raw error", () => {
+    const summary = connectAllSummary([
+      outcome("trainer", "KICKR CORE", "connected"),
+      outcome("heartRate", "HRM-Pro", "connected"),
+      outcome("power", "Assioma", "failed"),
+    ]);
+    expect(summary).toBe(
+      "Trainer and heart rate connected. Power meter (Assioma) didn’t answer, probably asleep. Wake it and press Connect on its card.",
+    );
+    expect(summary).not.toContain("10s");
+  });
+
+  it("handles nothing connecting and several sleepers", () => {
+    expect(connectAllSummary([outcome("power", "Assioma", "failed"), outcome("cadence", "Wahoo RPM", "failed")])).toBe(
+      "Power meter (Assioma) and cadence sensor (Wahoo RPM) didn’t answer, probably asleep. Wake them and press Connect on their card.",
+    );
+  });
+});
+
+describe("calibration", () => {
+  // A fixed clock: ages are read back against exactly the base they were
+  // built from, so a millisecond ticking mid-test cannot move an age across
+  // a boundary like "2 h ago".
+  const now = Date.parse("2026-09-18T12:00:00Z");
+  const zero = (offsetRaw: number | null, ageMs = 0): CalibrationRecord => ({
+    at: new Date(now - ageMs).toISOString(),
+    kind: "zeroOffset",
+    offsetRaw,
+  });
+
+  it("names the procedure per role and explains why the button is off", () => {
+    expect(calibrationVerb.trainer).toBe("Calibrate");
+    expect(calibrationVerb.power).toBe("Zero offset");
+    const ready: DeviceState = { status: "ready", device: device(["cyclingPower"]) };
+    const stats = { calibrationSupported: true, calibrating: false };
+    expect(calibrationUnavailable("power", ready, stats)).toBeNull();
+    expect(calibrationUnavailable("power", ready, { ...stats, calibrationSupported: false })).toMatch(/offset compensation/);
+    expect(calibrationUnavailable("trainer", ready, { ...stats, calibrationSupported: false })).toMatch(/FTMS spin-down/);
+    expect(calibrationUnavailable("power", ready, stats, true)).toBe("Zero offset is unavailable during a ride");
+    expect(calibrationUnavailable("trainer", { status: "controlling", device: device(["ftms"]) }, stats)).toMatch(/during a workout/);
+    // Not connected: nothing to explain, the button is not shown anyway.
+    expect(calibrationUnavailable("power", { status: "idle" }, stats)).toBeNull();
+  });
+
+  it("summarises the last calibration for a card line", () => {
+    expect(calibrationSummary(null, now)).toBeNull();
+    expect(calibrationSummary(zero(1023, 2 * 3_600_000), now)).toBe("Zeroed 2 h ago · offset 1023");
+    expect(calibrationSummary(zero(null, 30_000), now)).toBe("Zeroed just now");
+    expect(calibrationSummary({ at: new Date(now - 3 * 86_400_000).toISOString(), kind: "spinDown", offsetRaw: null }, now)).toBe("Spin-down 3 days ago");
+  });
+
+  it("measures drift against the previous zero and labels it", () => {
+    expect(offsetDrift(1023, null)).toBeNull();
+    expect(offsetDrift(1023, undefined)).toBeNull();
+    const steady = offsetDrift(1023, 1019)!;
+    expect(steady.delta).toBe(4);
+    expect(steady.tone).toBe("steady");
+    expect(driftLabel(steady)).toBe("+4");
+    const negative = offsetDrift(1000, 1019)!;
+    expect(driftLabel(negative)).toBe("−19");
+    expect(negative.tone).toBe("steady");
+    expect(driftLabel(offsetDrift(5, 5)!)).toBe("±0");
+    const large = offsetDrift(1100, 1000)!;
+    expect(large.tone).toBe("large");
+    expect(large.ratio).toBeCloseTo(0.1);
+    // A previous zero of exactly 0 cannot give a ratio; any move counts as large.
+    expect(offsetDrift(3, 0)!.tone).toBe("large");
+    expect(offsetDrift(0, 0)!.tone).toBe("steady");
+  });
+
+  it("nudges for a zero when there is no record or it is older than a day", () => {
+    expect(zeroOffsetIsDue(null, now)).toBe(true);
+    expect(zeroOffsetIsDue(zero(1000, 3_600_000), now)).toBe(false);
+    expect(zeroOffsetIsDue(zero(1000, 25 * 3_600_000), now)).toBe(true);
+    expect(zeroOffsetIsDue({ ...zero(1000), at: "garbage" }, now)).toBe(true);
+  });
+});
