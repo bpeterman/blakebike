@@ -3,17 +3,21 @@
 //! (network) and `Storage` (disk); the commands are thin wrappers over it.
 //!
 //! Both mirrors are read-only copies, safe to refresh on every launch. The
-//! training-settings sync is deliberately not part of this: it rewrites the
-//! rider's FTP and zones and stays behind its own button.
+//! training-settings sync is deliberately not part of that: it rewrites the
+//! rider's FTP, weight and zones and stays behind its own button. Only its
+//! fetch lives here (`fetch_training_settings`); the command folds the result
+//! into the profile.
 
-use chrono::{DateTime, Duration, Local, Utc};
+use chrono::{DateTime, Duration, Local, NaiveDate, Utc};
 use serde::Serialize;
 use uuid::Uuid;
 
 use crate::{
     domain::{Workout, WorkoutOrigin},
     formats::import_zwo,
-    intervals::{IntervalsAthlete, IntervalsClient, IntervalsError},
+    intervals::{
+        CyclingSettings, FtpSource, IntervalsAthlete, IntervalsClient, IntervalsError, RiderWeight,
+    },
     storage::{IntervalsSyncSettings, Storage},
 };
 
@@ -131,6 +135,47 @@ async fn save_api_key_with(
     storage.save_intervals_api_key(api_key)?;
     storage.save_intervals_athlete(&athlete)?;
     Ok(athlete)
+}
+
+/// Everything a training-settings sync reads from Intervals.icu.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrainingFetch {
+    pub cycling: CyclingSettings,
+    /// The modeled eFTP; fetched only when it is the rider's FTP source.
+    pub estimated_ftp: Option<u16>,
+    /// Fetched only when weight sync is on; `None` also when Intervals.icu
+    /// has no usable weight.
+    pub weight: Option<RiderWeight>,
+}
+
+/// Read what a training-settings sync needs, asking only for what the
+/// rider's settings use: the cycling settings always, the eFTP and the
+/// weight only when wanted. Any failed request fails the whole fetch, so a
+/// sync never writes half a result. `today` is the rider's local date.
+pub async fn fetch_training_settings(
+    client: &IntervalsClient,
+    athlete_id: &str,
+    settings: IntervalsSyncSettings,
+    today: NaiveDate,
+) -> Result<TrainingFetch, String> {
+    let cycling = client.cycling_settings(athlete_id).await?.ok_or_else(|| {
+        "Intervals.icu has no cycling (Ride) settings for this athlete".to_string()
+    })?;
+    let estimated_ftp = if settings.ftp_source == FtpSource::EstimatedFtp {
+        client.estimated_ftp(athlete_id).await?
+    } else {
+        None
+    };
+    let weight = if settings.rider_weight {
+        client.rider_weight(athlete_id, today).await?
+    } else {
+        None
+    };
+    Ok(TrainingFetch {
+        cycling,
+        estimated_ftp,
+        weight,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
@@ -352,7 +397,10 @@ async fn sync_library(
 mod tests {
     use super::*;
     use crate::{
-        intervals::test_support::{Route, json, serve_routes},
+        intervals::{
+            WeightSource,
+            test_support::{Route, json, serve_routes},
+        },
         storage::IntervalsSyncState,
     };
     use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
@@ -729,6 +777,112 @@ mod tests {
         let state = storage.intervals_sync_state().unwrap();
         assert_eq!(state.last_synced_at, Some(report.synced_at));
         assert_eq!(state.last_error, None);
+    }
+
+    const SPORT_SETTINGS: &str = r#"[{"types":["Ride","VirtualRide"],"ftp":280,"indoor_ftp":265}]"#;
+
+    fn training_routes(wellness: &str) -> Vec<Route> {
+        vec![
+            json("GET /api/v1/athlete/i1/sport-settings ", SPORT_SETTINGS),
+            json("GET /api/v1/athlete/i1/mmp-model?", r#"{"ftp":301}"#),
+            json("GET /api/v1/athlete/i1/wellness?", wellness),
+            json(
+                "GET /api/v1/athlete/i1 ",
+                r#"{"id":"i1","icu_weight":74.0}"#,
+            ),
+        ]
+    }
+
+    /// `METHOD /path` of each request, without the query, in arrival order.
+    fn request_paths(requests: Vec<String>) -> Vec<String> {
+        requests
+            .iter()
+            .map(|request| {
+                let mut parts = request.split(' ');
+                let method = parts.next().unwrap_or_default();
+                let target = parts.next().unwrap_or_default();
+                let path = target.split('?').next().unwrap_or_default();
+                format!("{method} {path}")
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn fetches_only_what_the_training_settings_ask_for() {
+        let today: NaiveDate = "2026-10-14".parse().unwrap();
+        let fetch = |settings: IntervalsSyncSettings, wellness: &'static str, count: usize| async move {
+            let (base_url, server) = serve_routes(training_routes(wellness), count);
+            let client = IntervalsClient::with_base_url("secret", &base_url).unwrap();
+            let fetched = fetch_training_settings(&client, "i1", settings, today)
+                .await
+                .unwrap();
+            (fetched, request_paths(server.join().unwrap()))
+        };
+        let logged = r#"[{"id":"2026-10-13","weight":72.4}]"#;
+
+        // Defaults: indoor FTP, weight on, a recent wellness weight. No eFTP
+        // request and no athlete-settings request.
+        let (fetched, requests) = fetch(IntervalsSyncSettings::default(), logged, 2).await;
+        assert_eq!(fetched.cycling.indoor_ftp, Some(265));
+        assert_eq!(fetched.estimated_ftp, None);
+        assert_eq!(
+            fetched.weight,
+            Some(RiderWeight {
+                kg: 72.4,
+                source: WeightSource::Wellness,
+                date: Some("2026-10-13".parse().unwrap()),
+            })
+        );
+        assert_eq!(
+            requests,
+            [
+                "GET /api/v1/athlete/i1/sport-settings",
+                "GET /api/v1/athlete/i1/wellness",
+            ]
+        );
+
+        // No logged weight: the athlete settings weight, one more request.
+        let (fetched, requests) = fetch(IntervalsSyncSettings::default(), "[]", 3).await;
+        assert_eq!(fetched.weight.unwrap().source, WeightSource::Settings);
+        assert_eq!(requests[2], "GET /api/v1/athlete/i1");
+
+        // Weight sync off and eFTP preferred: settings and the power model only.
+        let settings = IntervalsSyncSettings {
+            ftp_source: FtpSource::EstimatedFtp,
+            rider_weight: false,
+            ..IntervalsSyncSettings::default()
+        };
+        let (fetched, requests) = fetch(settings, logged, 2).await;
+        assert_eq!(fetched.estimated_ftp, Some(301));
+        assert_eq!(fetched.weight, None);
+        assert_eq!(requests[1], "GET /api/v1/athlete/i1/mmp-model");
+    }
+
+    #[tokio::test]
+    async fn a_failed_weight_request_fails_the_whole_fetch() {
+        let (base_url, server) = serve_routes(
+            vec![
+                json("GET /api/v1/athlete/i1/sport-settings ", SPORT_SETTINGS),
+                Route {
+                    prefix: "GET /api/v1/athlete/i1/wellness?",
+                    status: "500 Internal Server Error",
+                    content_type: "text/plain",
+                    body: "down".into(),
+                },
+            ],
+            2,
+        );
+        let client = IntervalsClient::with_base_url("secret", &base_url).unwrap();
+        let error = fetch_training_settings(
+            &client,
+            "i1",
+            IntervalsSyncSettings::default(),
+            "2026-10-14".parse().unwrap(),
+        )
+        .await
+        .unwrap_err();
+        server.join().unwrap();
+        assert_eq!(error, "Intervals.icu wellness request failed (HTTP 500)");
     }
 
     /// `sync_intervals` against a test listener.

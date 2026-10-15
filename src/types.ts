@@ -12,6 +12,16 @@ export type Profile = {
   distanceUnit: "km" | "mi";
 };
 
+export const KG_PER_LB = 0.45359237;
+
+/** A stored kilogram weight in the rider's display unit, to 0.1. */
+export const displayedWeight = (kg: number, unit: Profile["weightUnit"]): number =>
+  Number((unit === "lb" ? kg / KG_PER_LB : kg).toFixed(1));
+
+/** A weight entered in the rider's display unit, in kilograms. */
+export const storedWeight = (value: number, unit: Profile["weightUnit"]): number =>
+  unit === "lb" ? value * KG_PER_LB : value;
+
 export type PowerTarget =
   | { unit: "watts"; value: number }
   | { unit: "percentFtp"; value: number };
@@ -113,6 +123,8 @@ export type IntervalsSyncSettings = {
   calendar: boolean;
   library: boolean;
   ftpSource: FtpSource;
+  /** Off keeps the rider weight entered by hand. */
+  riderWeight: boolean;
 };
 
 /** Mirrors `IntervalsStatus` in intervals_sync.rs. */
@@ -129,7 +141,7 @@ export const disconnectedIntervalsStatus: IntervalsStatus = {
   configured: false,
   athleteId: null,
   athleteName: null,
-  settings: { calendar: true, library: true, ftpSource: "indoorFtp" },
+  settings: { calendar: true, library: true, ftpSource: "indoorFtp", riderWeight: true },
   lastSyncedAt: null,
   lastError: null,
 };
@@ -558,6 +570,21 @@ export type ZoneSetOutcome =
   | { status: "imported" | "unchanged" | "syncOff" | "notConfigured" }
   | { status: "invalid"; reason: string };
 
+/** Which Intervals.icu number a synced weight came from. Mirrors `WeightSource` in intervals.rs. */
+export type WeightSource = "wellness" | "settings";
+
+/** The rider weight's fate in a training-settings sync. Mirrors `WeightOutcome` in commands.rs. */
+export type WeightOutcome =
+  | {
+      status: "synced";
+      kg: number;
+      previousKg: number;
+      source: WeightSource;
+      /** The wellness day (YYYY-MM-DD); null for the undated settings weight. */
+      date: string | null;
+    }
+  | { status: "syncOff" | "notFound" };
+
 /** Mirrors `TrainingSyncResult` in commands.rs. */
 export type TrainingSyncResult = {
   profile: Profile;
@@ -565,6 +592,7 @@ export type TrainingSyncResult = {
   ftp: { watts: number; previousWatts: number; source: FtpSource };
   /** null when Intervals.icu has no max HR and the local value was kept. */
   maxHeartRate: { bpm: number; previousBpm: number } | null;
+  weight: WeightOutcome;
   powerZones: ZoneSetOutcome;
   heartRateZones: ZoneSetOutcome;
 };
@@ -582,6 +610,33 @@ const describeZoneSet = (label: string, outcome: ZoneSetOutcome): string => {
     case "invalid":
       return `${label} zones not imported: ${outcome.reason}`;
   }
+};
+
+const describeWeight = (outcome: WeightOutcome, unit: Profile["weightUnit"]): string => {
+  switch (outcome.status) {
+    case "syncOff":
+      return "Weight not synced (you keep your own)";
+    case "notFound":
+      return "Intervals.icu has no weight; yours is unchanged";
+    case "synced": {
+      const weight = displayedWeight(outcome.kg, unit);
+      const previous = displayedWeight(outcome.previousKg, unit);
+      const source =
+        outcome.source === "settings"
+          ? "settings"
+          : `wellness log of ${formatDay(outcome.date)}`;
+      const change = weight === previous ? "unchanged" : `was ${previous} ${unit}`;
+      return `Weight ${weight} ${unit} from your Intervals.icu ${source} (${change})`;
+    }
+  }
+};
+
+/** A YYYY-MM-DD local date as the rider's locale writes a short day, e.g. "Oct 12". */
+const formatDay = (date: string | null): string => {
+  const parsed = new Date(`${date ?? ""}T00:00:00`);
+  return Number.isNaN(parsed.getTime())
+    ? "an unknown day"
+    : parsed.toLocaleDateString(undefined, { month: "short", day: "numeric" });
 };
 
 /** The status line shown after a training-settings sync, one clause per item. */
@@ -603,6 +658,7 @@ export const describeTrainingSync = (result: TrainingSyncResult): string => {
         : `was ${result.maxHeartRate.previousBpm} bpm`;
     clauses.push(`Max HR ${result.maxHeartRate.bpm} bpm (${change})`);
   }
+  clauses.push(describeWeight(result.weight, result.profile.weightUnit));
   clauses.push(describeZoneSet("Power", result.powerZones));
   clauses.push(describeZoneSet("Heart-rate", result.heartRateZones));
   return clauses.join(" · ");

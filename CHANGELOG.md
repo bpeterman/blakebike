@@ -19,6 +19,10 @@ Conventions:
 
 ## [Unreleased]
 
+### Added
+
+- **Sync from Intervals.icu** now updates your rider weight too, which feeds the distance estimate and W/kg. It takes your newest Intervals.icu wellness weight from the last 90 days (the weight Intervals.icu itself uses for W/kg), or the weight in your Intervals.icu settings if you have not logged one. The result says which weight was used, from which day, and what it replaced. To keep the weight you enter by hand, turn off **Sync rider weight** in the Intervals.icu card.
+
 ## [0.5.2] - 2026-10-15
 
 blake.bike can find Bluetooth devices on Macs where macOS was quietly blocking it.

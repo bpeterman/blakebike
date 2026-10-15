@@ -448,15 +448,18 @@ impl RideDisplayPreferences {
     }
 }
 
-/// Which Intervals.icu mirrors run on launch and on "Sync now", and which
-/// FTP a training-settings sync reaches for. The mirrors are both on by
-/// default once a key is saved; the Settings card shows and edits all three.
+/// Which Intervals.icu mirrors run on launch and on "Sync now", which FTP a
+/// training-settings sync reaches for, and whether it also takes the rider
+/// weight. Everything is on by default once a key is saved; the Settings card
+/// shows and edits all of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct IntervalsSyncSettings {
     pub calendar: bool,
     pub library: bool,
     pub ftp_source: FtpSource,
+    /// Off keeps the weight the rider entered by hand.
+    pub rider_weight: bool,
 }
 
 impl Default for IntervalsSyncSettings {
@@ -465,6 +468,7 @@ impl Default for IntervalsSyncSettings {
             calendar: true,
             library: true,
             ftp_source: FtpSource::default(),
+            rider_weight: true,
         }
     }
 }

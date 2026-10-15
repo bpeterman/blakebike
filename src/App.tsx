@@ -96,6 +96,8 @@ import {
   compileWorkoutIntervals,
   defaultTrainingZoneSettings,
   describeTrainingSync,
+  displayedWeight,
+  storedWeight,
   deviceRoleLabel,
   deviceRoles,
   formatDistance,
@@ -1916,8 +1918,6 @@ export function RideDetailModal({ session, profile, trainingZones, onClose, onEx
   );
 }
 
-const KG_PER_LB = 0.45359237;
-
 const rideFieldIcons: Record<RideMetric, typeof Activity> = {
   power: Zap,
   cadence: RefreshCw,
@@ -1930,14 +1930,6 @@ const rideFieldIcons: Record<RideMetric, typeof Activity> = {
   time: Timer,
   targetPower: Target,
 };
-
-function displayedWeight(kg: number, unit: Profile["weightUnit"]) {
-  return Number((unit === "lb" ? kg / KG_PER_LB : kg).toFixed(1));
-}
-
-function storedWeight(value: number, unit: Profile["weightUnit"]) {
-  return unit === "lb" ? value * KG_PER_LB : value;
-}
 
 export function SettingsPage({
   profile,
@@ -2133,7 +2125,7 @@ export function SettingsPage({
         <div>
           <span className="label">INTERVALS.ICU</span>
           <h2>Intervals.icu</h2>
-          <p>Your planned workouts and workout library are mirrored here, read-only, and refreshed when blake.bike starts and whenever you press Sync now. Syncing training settings pulls your FTP and maximum heart rate from your cycling settings; power and heart-rate zones are imported only when you turn them on in Training zones above.</p>
+          <p>Your planned workouts and workout library are mirrored here, read-only, and refreshed when blake.bike starts and whenever you press Sync now. Syncing training settings pulls your FTP and maximum heart rate from your cycling settings and, unless you turn it off, your weight; power and heart-rate zones are imported only when you turn them on in Training zones above.</p>
           <span className={`integration-status ${intervalsConfigured ? "configured" : ""}`}>
             {!intervalsConfigured
               ? "API key not configured"
@@ -2186,6 +2178,18 @@ export function SettingsPage({
             </select>
           </label>
           <p className="settings-note">The next sync takes your FTP from this number and scales your power zones from it. If Intervals.icu has no value there, the sync falls back to one it does have and the result says which was used.</p>
+          <label className="settings-toggle">
+            <input
+              type="checkbox"
+              disabled={!intervalsConfigured || intervalsBusy !== null}
+              checked={intervalsStatus.settings.riderWeight}
+              onChange={(event) => void setMirrorSetting({ riderWeight: event.target.checked })}
+            />
+            <span>
+              Sync rider weight
+              <small>Takes your newest Intervals.icu wellness weight from the last 90 days, the weight Intervals.icu uses for W/kg, or the weight in your Intervals.icu settings if you have not logged one. Turn this off to keep the weight you enter above.</small>
+            </span>
+          </label>
           <button
             className="primary"
             disabled={!intervalsConfigured || intervalsBusy !== null || unsavedHint !== null}

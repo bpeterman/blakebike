@@ -359,26 +359,40 @@ describe("zone provenance and sync reporting", () => {
       zones: imported,
       ftp: { watts: 265, previousWatts: 250, source: "indoorFtp" },
       maxHeartRate: { bpm: 190, previousBpm: 190 },
+      weight: { status: "synced", kg: 72.4, previousKg: 75, source: "wellness", date: "2026-10-12" },
       powerZones: { status: "imported" },
       heartRateZones: { status: "unchanged" },
     };
+    const day = new Date("2026-10-12T00:00:00").toLocaleDateString(undefined, { month: "short", day: "numeric" });
     expect(describeTrainingSync(base)).toBe(
-      "FTP 265 W from your Intervals.icu indoor FTP (was 250 W) · Max HR 190 bpm (unchanged) · Power zones imported · Heart-rate zones already up to date",
+      `FTP 265 W from your Intervals.icu indoor FTP (was 250 W) · Max HR 190 bpm (unchanged) · Weight 72.4 kg from your Intervals.icu wellness log of ${day} (was 75 kg) · Power zones imported · Heart-rate zones already up to date`,
     );
     expect(
       describeTrainingSync({
         ...base,
         ftp: { watts: 250, previousWatts: 250, source: "ftp" },
         maxHeartRate: null,
+        weight: { status: "notFound" },
         powerZones: { status: "invalid", reason: "Intervals.icu returned power zones that do not increase" },
         heartRateZones: { status: "notConfigured" },
       }),
     ).toBe(
-      "FTP 250 W from your Intervals.icu FTP (unchanged) · Intervals.icu has no max HR; yours is unchanged · Power zones not imported: Intervals.icu returned power zones that do not increase · Intervals.icu has no heart-rate zones",
+      "FTP 250 W from your Intervals.icu FTP (unchanged) · Intervals.icu has no max HR; yours is unchanged · Intervals.icu has no weight; yours is unchanged · Power zones not imported: Intervals.icu returned power zones that do not increase · Intervals.icu has no heart-rate zones",
     );
     expect(describeTrainingSync({ ...base, powerZones: { status: "syncOff" } })).toContain(
       "Power zones not imported (import is off)",
     );
+    expect(describeTrainingSync({ ...base, weight: { status: "syncOff" } })).toContain(
+      "Weight not synced (you keep your own)",
+    );
+    // Within display rounding is unchanged, in the rider's unit.
+    expect(
+      describeTrainingSync({
+        ...base,
+        profile: { ...base.profile, weightUnit: "lb" },
+        weight: { status: "synced", kg: 72.43, previousKg: 72.45, source: "settings", date: null },
+      }),
+    ).toContain("Weight 159.7 lb from your Intervals.icu settings (unchanged)");
   });
 });
 
