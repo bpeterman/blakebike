@@ -241,7 +241,8 @@ p { color: #8d9587; font-size: 13px; }
 .bias-stepper button.secondary { min-width: 30px; height: 28px; padding: 0 8px; font-size: 15px; line-height: 1; }
 .bias-stepper strong { min-width: 46px; color: #e9eee4; font-size: 14px; text-align: center; font-variant-numeric: tabular-nums; }
 .bias-stepper strong.active { color: #c8ff32; }
-.bias-reset { width: 34px; justify-content: end; }
+.bias-reset { white-space: nowrap; }
+/* Hidden rather than removed, so it keeps its own width and the − / % / + controls never shift. */
 .bias-reset.placeholder { visibility: hidden; }
 .metric-control { margin-left: auto; }
 .metric-control-group { display: grid; gap: 7px; }
