@@ -121,7 +121,7 @@ pub fn encode_activity(detail: &SessionDetail) -> Result<Vec<u8>, String> {
         MesgNum::Activity,
         vec![
             datetime_field(253, "timestamp", ended_at),
-            float_field(0, "total_timer_time", f64::from(summary.elapsed_seconds)),
+            float_field(0, "total_timer_time", f64::from(session.timer_seconds)),
             uint_field(1, "num_sessions", 1),
             enum_field(2, "type", "manual"),
             enum_field(3, "event", "activity"),
@@ -511,8 +511,13 @@ impl Totals {
             points,
             0.0,
         );
-        // Kept as it always was: riding time on both clocks.
-        totals.elapsed_seconds = f64::from(summary.elapsed_seconds);
+        // FIT keeps both: timer time leaves pauses out, elapsed time is the
+        // wall clock from start to end.
+        totals.elapsed_seconds = f64::from(
+            summary
+                .wall_clock_seconds()
+                .unwrap_or(summary.elapsed_seconds),
+        );
         totals.average_power_watts = summary.average_power_watts;
         totals.max_power_watts = summary.max_power_watts;
         totals.average_cadence_rpm = summary.average_cadence_rpm;
@@ -928,6 +933,28 @@ mod tests {
         ];
         let (laps, _) = lap_messages(&detail);
         assert_eq!(laps.len(), 2);
+    }
+
+    #[test]
+    fn timer_time_leaves_pauses_out_and_elapsed_time_keeps_them() {
+        let mut detail = detail();
+        // Two seconds ridden across a ride that took ninety on the wall clock.
+        detail.summary.ended_at = Some(detail.summary.started_at + chrono::Duration::seconds(90));
+        let bytes = encode_activity(&detail).unwrap();
+        let (messages, errors) = Decoder::builder(&bytes).build().read_all();
+        assert!(errors.is_empty(), "{errors:?}");
+        let time = |name: &str, field: &str| {
+            messages
+                .iter()
+                .find(|message| message.name == name)
+                .and_then(|message| message.field(field))
+                .and_then(|field| field.value.as_f64())
+        };
+        for summary in ["lap", "session"] {
+            assert_eq!(time(summary, "total_timer_time"), Some(2.0), "{summary}");
+            assert_eq!(time(summary, "total_elapsed_time"), Some(90.0), "{summary}");
+        }
+        assert_eq!(time("activity", "total_timer_time"), Some(2.0));
     }
 
     #[test]

@@ -424,7 +424,12 @@ export type RunnerState =
       status: "running";
       sessionId: string;
       workoutName: string;
+      /** Where the ride is in the workout: riding time plus any skipped blocks. */
       elapsedSeconds: number;
+      /** Time actually ridden: pauses and skipped blocks left out. */
+      movingSeconds: number;
+      /** Time since the ride started, pauses included. */
+      wallClockSeconds: number;
       totalSeconds: number | null;
       intervalIndex: number;
       intervalElapsedSeconds: number;
@@ -438,6 +443,11 @@ export type RunnerState =
       manualErg: boolean;
       /** The rider has overridden this interval's target. */
       overrideActive: boolean;
+      /**
+       * Every planned interval is done and the ride carries on as a free ride
+       * in the same session (manualErg is true too) until the rider ends it.
+       */
+      workoutComplete: boolean;
       biasPercent: number;
       /** Manual laps marked so far this ride, oldest first. */
       laps: LapMark[];
@@ -449,6 +459,8 @@ export type RunnerState =
       sessionId: string;
       workoutName: string;
       elapsedSeconds: number;
+      movingSeconds: number;
+      wallClockSeconds: number;
       totalSeconds: number | null;
       intervalIndex: number;
       intervalElapsedSeconds: number;
@@ -457,6 +469,7 @@ export type RunnerState =
       plannedTargetWatts: number | null;
       manualErg: boolean;
       overrideActive: boolean;
+      workoutComplete: boolean;
       biasPercent: number;
       laps: LapMark[];
       control?: ControlStatus;
@@ -471,6 +484,7 @@ export type SessionSummary = {
   workoutName: string;
   startedAt: string;
   endedAt: string | null;
+  /** Time actually ridden: pauses and skipped blocks left out. */
   elapsedSeconds: number;
   averagePowerWatts: number;
   maxPowerWatts: number;
@@ -480,6 +494,20 @@ export type SessionSummary = {
   distanceWeightKg: number;
   completed: boolean;
   recordingWarning?: string | null;
+};
+
+/**
+ * How long a saved ride took on the wall clock, start to end with pauses
+ * included; null while it is still open. Mirrors
+ * `SessionSummary::wall_clock_seconds` in `domain.rs`, which the FIT file's
+ * elapsed time uses, so it never reads less than the time ridden.
+ */
+export const sessionWallClockSeconds = (
+  summary: Pick<SessionSummary, "startedAt" | "endedAt" | "elapsedSeconds">,
+): number | null => {
+  if (summary.endedAt === null) return null;
+  const seconds = Math.floor((Date.parse(summary.endedAt) - Date.parse(summary.startedAt)) / 1000);
+  return Math.max(summary.elapsedSeconds, seconds);
 };
 
 export type SessionDetail = {

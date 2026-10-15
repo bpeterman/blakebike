@@ -46,6 +46,22 @@ describe("SourceSelect", () => {
     ]);
   });
 
+  it("reports a switch back to Auto", () => {
+    const onChange = vi.fn();
+    render(
+      <SourceSelect
+        metric="heartRate"
+        choice={{ mode: "role", role: "trainer" }}
+        onChange={onChange}
+      />,
+    );
+
+    fireEvent.change(screen.getByRole("combobox", { name: "Heart rate source" }), {
+      target: { value: "auto" },
+    });
+    expect(onChange).toHaveBeenCalledWith({ mode: "auto" });
+  });
+
   it("updates one preference without changing the others", () => {
     expect(
       withSourcePreference(defaultSourcePreferences, "cadence", {
