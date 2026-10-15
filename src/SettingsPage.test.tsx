@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ComponentProps } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -378,6 +378,28 @@ describe("Intervals.icu settings", () => {
     });
   });
 
+  it("adds one lap timer per screen and sets up its countdown drill", () => {
+    const onSaveRideDisplayPreferences = vi.fn();
+    renderSettings({ onSaveRideDisplayPreferences });
+
+    const [addToRide] = screen.getAllByRole("button", { name: "Add lap timer" });
+    fireEvent.click(addToRide);
+    // A screen holds one lap timer.
+    expect(screen.getAllByRole("button", { name: "Add lap timer" })[0]).toBeDisabled();
+    expect(screen.queryByLabelText("Drill work seconds")).not.toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText("Lap timer mode"), { target: { value: "countdown" } });
+    fireEvent.change(screen.getByLabelText("Drill work seconds"), { target: { value: "20" } });
+    fireEvent.change(screen.getByLabelText("Drill rest seconds"), { target: { value: "0" } });
+
+    fireEvent.click(screen.getByRole("button", { name: "Save ride layout" }));
+    const saved = onSaveRideDisplayPreferences.mock.calls[0][0];
+    expect(saved.screens[0].items.at(-1)).toEqual({
+      kind: "lapTimer",
+      timer: { mode: "countdown", workSeconds: 20, restSeconds: 0 },
+    });
+  });
+
   it("only offers scopes and aggregates the chosen metric has", () => {
     render(
       <SettingsPage
@@ -414,6 +436,32 @@ describe("Intervals.icu settings", () => {
     fireEvent.change(screen.getAllByLabelText("Metric")[0], { target: { value: "distance" } });
     expect(screen.getAllByLabelText("Measured over")[0]).toBeDisabled();
     expect(screen.getAllByLabelText("Shown as")[0]).toBeDisabled();
+  });
+
+  it("offers riding time and total time with pauses as separate time fields", () => {
+    const onSaveRideDisplayPreferences = vi.fn();
+    renderSettings({ onSaveRideDisplayPreferences });
+
+    // The default Ride screen's elapsed slot.
+    const slot = defaultRideDisplayPreferences.screens[0].items.findIndex(
+      (item) => item.kind === "field" && item.field.metric === "time" && item.field.aggregate === "total",
+    );
+    const shownAs = screen.getAllByLabelText("Shown as")[slot];
+    expect(
+      within(shownAs).getAllByRole("option").map((option) => [option.getAttribute("value"), option.textContent]),
+    ).toEqual([
+      ["total", "Elapsed (riding)"],
+      ["remaining", "Remaining"],
+      ["wallClock", "Total (with pauses)"],
+    ]);
+
+    fireEvent.change(shownAs, { target: { value: "wallClock" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save ride layout" }));
+    expect(onSaveRideDisplayPreferences.mock.calls[0][0].screens[0].items[slot]).toEqual({
+      kind: "field",
+      field: { metric: "time", scope: "ride", aggregate: "wallClock" },
+      span: 1,
+    });
   });
 
   it("adds and removes screens, but never the last one", () => {

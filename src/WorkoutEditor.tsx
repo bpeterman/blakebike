@@ -1,39 +1,53 @@
-import { useCallback, useMemo, useRef, useState } from "react";
-import { Plus, Trash2, X } from "lucide-react";
-import type { PowerTarget, Workout, WorkoutStep, ZoneDefinition } from "./types";
+import { useCallback, useMemo, useRef, useState, type FocusEvent } from "react";
+import { ChevronDown, ChevronUp, Plus, Repeat, Trash2, Ungroup, X } from "lucide-react";
+import type { PowerTarget, Workout, ZoneDefinition } from "./types";
 import { formatDuration, workoutDuration } from "./types";
 import { EditableNumberInput } from "./EditableNumberInput";
 import { Metric } from "./Metric";
 import { WorkoutProfile } from "./WorkoutProfile";
 import { useDialog } from "./useDialog";
 import { profileSegments, profileStats } from "./workoutProfileModel";
-import type { LeafStep, StepPath } from "./workoutSteps";
+import {
+  appendNode,
+  canMoveNode,
+  formatStepPath,
+  fromStepNodes,
+  groupNodes,
+  MAX_REPETITIONS,
+  MIN_REPETITIONS,
+  moveNode,
+  nodeAtPath,
+  nodePath,
+  removeNode,
+  stepsProblem,
+  toStepNodes,
+  ungroupNode,
+  updateNode,
+  type LeafStep,
+  type MoveDirection,
+  type StepNode,
+  type StepPath,
+} from "./workoutSteps";
 
 /**
- * A top-level step with an identity that survives reordering and deletion.
- * Ids exist only while the editor is open; `toWorkout` strips them.
+ * The steps live in a tree whose nodes carry ids that survive reordering,
+ * grouping, and deletion, at any depth. Ids exist only while the editor is
+ * open; `toWorkout` strips them.
  */
-type EditorRow = { id: string; step: WorkoutStep };
-
 type EditorState = {
   meta: Omit<Workout, "steps">;
-  rows: EditorRow[];
+  nodes: StepNode[];
 };
 
-let nextRowId = 0;
-const newRowId = () => `row-${(nextRowId += 1)}`;
+let nextNodeId = 0;
+const newNodeId = () => `step-${(nextNodeId += 1)}`;
 
 const toEditorState = (workout: Workout): EditorState => {
   const { steps, ...meta } = structuredClone(workout);
-  return { meta, rows: steps.map((step) => ({ id: newRowId(), step })) };
+  return { meta, nodes: toStepNodes(steps, newNodeId) };
 };
 
-const toWorkout = (state: EditorState): Workout => ({
-  ...state.meta,
-  steps: state.rows.map((row) => row.step),
-});
-
-const defaultStep = (kind: LeafStep["kind"]): WorkoutStep => {
+const defaultStep = (kind: LeafStep["kind"]): LeafStep => {
   switch (kind) {
     case "steady":
       return { kind, durationSeconds: 300, target: { unit: "percentFtp", value: 75 } };
@@ -49,17 +63,39 @@ const defaultStep = (kind: LeafStep["kind"]): WorkoutStep => {
   }
 };
 
-// Kind-narrowed updates: a patch can only land on a step that has the field.
-const withDuration = (step: WorkoutStep, durationSeconds: number): WorkoutStep =>
-  step.kind === "repeat" ? step : { ...step, durationSeconds };
-const withSteadyTarget = (step: WorkoutStep, target: PowerTarget): WorkoutStep =>
+const leafNode = (step: LeafStep): StepNode => ({ id: newNodeId(), kind: "leaf", step });
+
+/** A fresh repeat starts as a classic work/recovery pair so it is useful straight away. */
+const defaultRepeat = (): StepNode => ({
+  id: newNodeId(),
+  kind: "repeat",
+  repetitions: 4,
+  children: [
+    leafNode({ kind: "steady", durationSeconds: 60, target: { unit: "percentFtp", value: 110 } }),
+    leafNode({ kind: "steady", durationSeconds: 60, target: { unit: "percentFtp", value: 55 } }),
+  ],
+});
+
+// Kind-narrowed updates: a patch can only land on a node that has the field.
+const withLeaf = (node: StepNode, update: (step: LeafStep) => LeafStep): StepNode =>
+  node.kind === "leaf" ? { ...node, step: update(node.step) } : node;
+const withRepetitions = (node: StepNode, repetitions: number): StepNode =>
+  node.kind === "repeat" ? { ...node, repetitions } : node;
+const withDuration = (step: LeafStep, durationSeconds: number): LeafStep => ({ ...step, durationSeconds });
+const withSteadyTarget = (step: LeafStep, target: PowerTarget): LeafStep =>
   step.kind === "steady" ? { ...step, target } : step;
-const withRampStart = (step: WorkoutStep, start: PowerTarget): WorkoutStep =>
+const withRampStart = (step: LeafStep, start: PowerTarget): LeafStep =>
   step.kind === "ramp" ? { ...step, start } : step;
-const withRampEnd = (step: WorkoutStep, end: PowerTarget): WorkoutStep =>
+const withRampEnd = (step: LeafStep, end: PowerTarget): LeafStep =>
   step.kind === "ramp" ? { ...step, end } : step;
 
-const stepLabel = (step: WorkoutStep) => (step.kind === "freeRide" ? "FREE" : step.kind.toUpperCase());
+const stepLabel = (step: LeafStep) => (step.kind === "freeRide" ? "FREE" : step.kind.toUpperCase());
+
+const LEAF_KINDS: readonly { kind: LeafStep["kind"]; label: string }[] = [
+  { kind: "steady", label: "Steady" },
+  { kind: "ramp", label: "Ramp" },
+  { kind: "freeRide", label: "Free ride" },
+];
 
 export function WorkoutEditor({
   initial,
@@ -75,60 +111,250 @@ export function WorkoutEditor({
   save: (workout: Workout) => void;
 }) {
   const [state, setState] = useState(() => toEditorState(initial));
-  const [highlightedRowId, setHighlightedRowId] = useState<string | null>(null);
+  const [highlightedId, setHighlightedId] = useState<string | null>(null);
+  const [selectedIds, setSelectedIds] = useState<ReadonlySet<string>>(() => new Set());
   const rowElements = useRef(new Map<string, HTMLDivElement>());
   const dialogRef = useDialog<HTMLDivElement>(close);
+  const { nodes } = state;
 
-  const steps = useMemo(() => state.rows.map((row) => row.step), [state.rows]);
+  const steps = useMemo(() => fromStepNodes(nodes), [nodes]);
   const stats = useMemo(
     () => profileStats(profileSegments(steps, ftpWatts), ftpWatts),
     [steps, ftpWatts],
   );
+  const problem = useMemo(() => stepsProblem(steps), [steps]);
 
   const setMeta = (patch: Partial<EditorState["meta"]>) =>
     setState((current) => ({ ...current, meta: { ...current.meta, ...patch } }));
-  const updateRow = (id: string, update: (step: WorkoutStep) => WorkoutStep) =>
-    setState((current) => ({
-      ...current,
-      rows: current.rows.map((row) => (row.id === id ? { ...row, step: update(row.step) } : row)),
-    }));
-  const removeRow = (id: string) => {
-    setState((current) => ({ ...current, rows: current.rows.filter((row) => row.id !== id) }));
-    setHighlightedRowId((current) => (current === id ? null : current));
+  const editNodes = (edit: (nodes: StepNode[]) => StepNode[]) =>
+    setState((current) => ({ ...current, nodes: edit(current.nodes) }));
+  const updateLeaf = (id: string, update: (step: LeafStep) => LeafStep) =>
+    editNodes((current) => updateNode(current, id, (node) => withLeaf(node, update)));
+  const forget = (id: string) => {
+    setHighlightedId((current) => (current === id ? null : current));
+    setSelectedIds((current) => {
+      if (!current.has(id)) return current;
+      const next = new Set(current);
+      next.delete(id);
+      return next;
+    });
   };
-  const addStep = (kind: LeafStep["kind"]) =>
-    setState((current) => ({
-      ...current,
-      rows: [...current.rows, { id: newRowId(), step: defaultStep(kind) }],
-    }));
+  const remove = (id: string) => {
+    editNodes((current) => removeNode(current, id));
+    forget(id);
+  };
+  const ungroup = (id: string) => {
+    editNodes((current) => ungroupNode(current, id));
+    forget(id);
+  };
+  const move = (id: string, direction: MoveDirection) => editNodes((current) => moveNode(current, id, direction));
+  const append = (parentId: string | null, node: StepNode) =>
+    editNodes((current) => appendNode(current, parentId, node));
+  const toggleSelected = (id: string) =>
+    setSelectedIds((current) => {
+      const next = new Set(current);
+      if (!next.delete(id)) next.add(id);
+      return next;
+    });
+  const group = (ids: readonly string[]) => {
+    const repeat = { id: newNodeId(), repetitions: MIN_REPETITIONS };
+    // Validity is checked against the tree being rendered, so the update can trust it.
+    if (groupNodes(nodes, ids, repeat) === null) return;
+    editNodes((current) => groupNodes(current, ids, repeat) ?? current);
+    setSelectedIds(new Set());
+  };
 
-  // Top-level rows map to single-element paths. Nested paths will resolve
-  // through the same rows once repeat groups become editable.
-  const highlightedPath = useMemo<StepPath | null>(() => {
-    const index = state.rows.findIndex((row) => row.id === highlightedRowId);
-    return index === -1 ? null : [index];
-  }, [state.rows, highlightedRowId]);
-  const rowIdAtPath = useCallback(
-    (path: StepPath | null) => (path === null ? null : state.rows[path[0]]?.id ?? null),
-    [state.rows],
+  // A selection only counts while its rows still exist; it can be grouped
+  // when the rows are neighbours under the same parent.
+  const selection = useMemo(
+    () => [...selectedIds].filter((id) => nodePath(nodes, id) !== null),
+    [selectedIds, nodes],
+  );
+  const selectionGroupable = useMemo(
+    () => selection.length > 0 && groupNodes(nodes, selection, { id: "", repetitions: MIN_REPETITIONS }) !== null,
+    [selection, nodes],
+  );
+
+  const highlightedPath = useMemo<StepPath | null>(
+    () => (highlightedId === null ? null : nodePath(nodes, highlightedId)),
+    [nodes, highlightedId],
+  );
+  const idAtPath = useCallback(
+    (path: StepPath | null) => (path === null ? null : nodeAtPath(nodes, path)?.id ?? null),
+    [nodes],
   );
   const highlightFromChart = useCallback(
-    (path: StepPath | null) => setHighlightedRowId(rowIdAtPath(path)),
-    [rowIdAtPath],
+    (path: StepPath | null) => setHighlightedId(idAtPath(path)),
+    [idAtPath],
   );
   const selectFromChart = useCallback(
     (path: StepPath) => {
-      const id = rowIdAtPath(path);
+      const id = idAtPath(path);
       const element = id === null ? undefined : rowElements.current.get(id);
       if (!element) return;
       element.scrollIntoView?.({ block: "nearest" });
-      element.querySelector<HTMLInputElement>("input:not([disabled])")?.focus();
+      element.querySelector<HTMLInputElement>('input[type="number"]:not([disabled])')?.focus();
     },
-    [rowIdAtPath],
+    [idAtPath],
   );
 
-  const workout = toWorkout(state);
-  const canSave = workout.name.trim().length > 0 && workout.steps.length > 0;
+  const workout: Workout = { ...state.meta, steps };
+  const canSave = workout.name.trim().length > 0 && workout.steps.length > 0 && problem === null;
+
+  // Hover and focus live on each row, never on a repeat's whole body, so a
+  // child row highlights itself rather than its group.
+  const rowProps = (id: string) => ({
+    "data-row-id": id,
+    "data-highlighted": highlightedId === id ? "true" : undefined,
+    ref: (element: HTMLDivElement | null) => {
+      if (element) rowElements.current.set(id, element);
+      else rowElements.current.delete(id);
+    },
+    onMouseEnter: () => setHighlightedId(id),
+    onMouseLeave: () => setHighlightedId((current) => (current === id ? null : current)),
+    onFocus: () => setHighlightedId(id),
+    onBlur: (event: FocusEvent<HTMLDivElement>) => {
+      const next = event.relatedTarget;
+      if (!(next instanceof Node && event.currentTarget.contains(next))) {
+        setHighlightedId((current) => (current === id ? null : current));
+      }
+    },
+  });
+
+  const rowActions = (node: StepNode, label: string) => (
+    <div className="step-actions">
+      <button
+        className="icon-button"
+        aria-label={`Move block ${label} up`}
+        disabled={!canMoveNode(nodes, node.id, -1)}
+        onClick={() => move(node.id, -1)}
+      >
+        <ChevronUp size={16} />
+      </button>
+      <button
+        className="icon-button"
+        aria-label={`Move block ${label} down`}
+        disabled={!canMoveNode(nodes, node.id, 1)}
+        onClick={() => move(node.id, 1)}
+      >
+        <ChevronDown size={16} />
+      </button>
+      {node.kind === "leaf" ? (
+        <button className="icon-button" aria-label={`Repeat block ${label}`} onClick={() => group([node.id])}>
+          <Repeat size={16} />
+        </button>
+      ) : (
+        <button className="icon-button" aria-label={`Ungroup block ${label}`} onClick={() => ungroup(node.id)}>
+          <Ungroup size={16} />
+        </button>
+      )}
+      <button className="icon-button danger" aria-label={`Remove block ${label}`} onClick={() => remove(node.id)}>
+        <Trash2 size={16} />
+      </button>
+    </div>
+  );
+
+  const selectBox = (id: string, label: string) => (
+    <input
+      type="checkbox"
+      className="step-select"
+      aria-label={`Select block ${label}`}
+      checked={selectedIds.has(id)}
+      onChange={() => toggleSelected(id)}
+    />
+  );
+
+  const renderNodes = (list: readonly StepNode[], prefix: StepPath) =>
+    list.map((node, index) => {
+      const label = formatStepPath([...prefix, index]);
+      if (node.kind === "repeat") {
+        const once = workoutDuration(fromStepNodes(node.children));
+        return (
+          <div className="repeat-group" key={node.id} data-group-id={node.id}>
+            <div className="step-editor repeat-header" {...rowProps(node.id)}>
+              {selectBox(node.id, label)}
+              <span className="step-kind repeat">REPEAT</span>
+              <div className="step-fields">
+                <label>
+                  Repeats
+                  <EditableNumberInput
+                    min={MIN_REPETITIONS}
+                    max={MAX_REPETITIONS}
+                    step={1}
+                    value={node.repetitions}
+                    onValueChange={(repetitions) =>
+                      editNodes((current) => updateNode(current, node.id, (found) => withRepetitions(found, repetitions)))
+                    }
+                  />
+                </label>
+                <span className="repeat-summary">
+                  {node.repetitions} × {formatDuration(once)} = {formatDuration(node.repetitions * once)}
+                </span>
+              </div>
+              {rowActions(node, label)}
+            </div>
+            <div className="repeat-children">
+              {node.children.length === 0 ? (
+                <p className="repeat-empty">This repeat is empty. Add a step or remove it.</p>
+              ) : (
+                renderNodes(node.children, [...prefix, index])
+              )}
+              <div className="add-steps nested">
+                <span>Add to repeat</span>
+                {LEAF_KINDS.map(({ kind, label: kindLabel }) => (
+                  <button
+                    key={kind}
+                    aria-label={`Add ${kindLabel.toLowerCase()} to repeat ${label}`}
+                    onClick={() => append(node.id, leafNode(defaultStep(kind)))}
+                  >
+                    <Plus />{kindLabel}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+        );
+      }
+      const { step } = node;
+      return (
+        <div className="step-editor" key={node.id} {...rowProps(node.id)}>
+          {selectBox(node.id, label)}
+          <span className={`step-kind ${step.kind}`}>{stepLabel(step)}</span>
+          <div className="step-fields">
+            <label>
+              Duration (sec)
+              <EditableNumberInput
+                min={1}
+                value={step.durationSeconds}
+                onValueChange={(durationSeconds) => updateLeaf(node.id, (current) => withDuration(current, durationSeconds))}
+              />
+            </label>
+            {step.kind === "steady" && (
+              <TargetInput
+                label="Power"
+                target={step.target}
+                onChange={(target) => updateLeaf(node.id, (current) => withSteadyTarget(current, target))}
+              />
+            )}
+            {step.kind === "ramp" && (
+              <>
+                <TargetInput
+                  label="Start"
+                  target={step.start}
+                  onChange={(start) => updateLeaf(node.id, (current) => withRampStart(current, start))}
+                />
+                <TargetInput
+                  label="End"
+                  target={step.end}
+                  onChange={(end) => updateLeaf(node.id, (current) => withRampEnd(current, end))}
+                />
+              </>
+            )}
+          </div>
+          {rowActions(node, label)}
+        </div>
+      );
+    });
 
   return (
     <div
@@ -193,80 +419,26 @@ export function WorkoutEditor({
           </div>
         </section>
 
-        <div className="step-list">
-          {state.rows.map((row, index) => {
-            const { step } = row;
-            return (
-              <div
-                className="step-editor"
-                key={row.id}
-                data-row-id={row.id}
-                data-highlighted={highlightedRowId === row.id ? "true" : undefined}
-                ref={(element) => {
-                  if (element) rowElements.current.set(row.id, element);
-                  else rowElements.current.delete(row.id);
-                }}
-                onMouseEnter={() => setHighlightedRowId(row.id)}
-                onMouseLeave={() => setHighlightedRowId((current) => (current === row.id ? null : current))}
-                onFocus={() => setHighlightedRowId(row.id)}
-                onBlur={(event) => {
-                  if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
-                    setHighlightedRowId((current) => (current === row.id ? null : current));
-                  }
-                }}
-              >
-                <span className={`step-kind ${step.kind}`}>{stepLabel(step)}</span>
-                <label>
-                  Duration (sec)
-                  <EditableNumberInput
-                    min={1}
-                    value={step.kind === "repeat" ? workoutDuration(step.steps) : step.durationSeconds}
-                    disabled={step.kind === "repeat"}
-                    onValueChange={(durationSeconds) => updateRow(row.id, (current) => withDuration(current, durationSeconds))}
-                  />
-                </label>
-                {step.kind === "steady" && (
-                  <TargetInput
-                    label="Power"
-                    target={step.target}
-                    onChange={(target) => updateRow(row.id, (current) => withSteadyTarget(current, target))}
-                  />
-                )}
-                {step.kind === "ramp" && (
-                  <>
-                    <TargetInput
-                      label="Start"
-                      target={step.start}
-                      onChange={(start) => updateRow(row.id, (current) => withRampStart(current, start))}
-                    />
-                    <TargetInput
-                      label="End"
-                      target={step.end}
-                      onChange={(end) => updateRow(row.id, (current) => withRampEnd(current, end))}
-                    />
-                  </>
-                )}
-                {step.kind === "repeat" && (
-                  <span className="repeat-summary">{step.repetitions}× repeat group</span>
-                )}
-                <button
-                  className="icon-button danger"
-                  aria-label={`Remove block ${index + 1}`}
-                  onClick={() => removeRow(row.id)}
-                >
-                  <Trash2 size={16} />
-                </button>
-              </div>
-            );
-          })}
-        </div>
+        <div className="step-list">{renderNodes(nodes, [])}</div>
         <div className="add-steps">
           <span>Add block</span>
-          <button onClick={() => addStep("steady")}><Plus />Steady</button>
-          <button onClick={() => addStep("ramp")}><Plus />Ramp</button>
-          <button onClick={() => addStep("freeRide")}><Plus />Free ride</button>
+          {selection.length > 0 && (
+            <button
+              className="group-selection"
+              disabled={!selectionGroupable}
+              title={selectionGroupable ? undefined : "Select neighbouring blocks at the same level to repeat them"}
+              onClick={() => group(selection)}
+            >
+              <Repeat />Repeat {selection.length} selected
+            </button>
+          )}
+          {LEAF_KINDS.map(({ kind, label }) => (
+            <button key={kind} onClick={() => append(null, leafNode(defaultStep(kind)))}><Plus />{label}</button>
+          ))}
+          <button onClick={() => append(null, defaultRepeat())}><Plus />Repeat</button>
         </div>
         <div className="editor-actions">
+          {problem !== null && <span className="editor-problem" role="status">{problem}</span>}
           <button className="secondary" onClick={close}>Cancel</button>
           <button className="primary" disabled={!canSave} onClick={() => save(workout)}>Save workout</button>
         </div>

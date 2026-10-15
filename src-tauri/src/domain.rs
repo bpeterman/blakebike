@@ -317,7 +317,7 @@ impl PowerTarget {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Interval {
     pub duration_seconds: u32,
@@ -357,6 +357,23 @@ pub struct SessionSummary {
     pub recording_warning: Option<String>,
 }
 
+impl SessionSummary {
+    /// How long the ride took on the wall clock, start to end with pauses
+    /// included; `None` while it is still open. `elapsed_seconds` is the time
+    /// actually ridden, so this is never less than that: the two come from
+    /// separate clocks, and a second's disagreement must not make a ride look
+    /// shorter than it was ridden.
+    pub fn wall_clock_seconds(&self) -> Option<u32> {
+        let ended_at = self.ended_at?;
+        let seconds = (ended_at - self.started_at).num_seconds().max(0);
+        Some(
+            u32::try_from(seconds)
+                .unwrap_or(u32::MAX)
+                .max(self.elapsed_seconds),
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DistanceSource {
@@ -365,11 +382,24 @@ pub enum DistanceSource {
     Mixed,
 }
 
+/// The moment the rider pressed Lap, on both clocks: riding time (which stops
+/// while paused) and wall time (which lines up with the samples). Each mark
+/// ends one lap and starts the next. Mirrors `LapMark` in `src/types.ts`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LapMark {
+    pub elapsed_seconds: u32,
+    pub timestamp_ms: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionDetail {
     pub summary: SessionSummary,
     pub samples: Vec<Telemetry>,
+    /// Manual laps, oldest first; empty when the rider marked none.
+    #[serde(default)]
+    pub laps: Vec<LapMark>,
 }
 
 #[cfg(test)]
@@ -392,6 +422,87 @@ mod tests {
         assert_eq!(intervals.len(), 2);
         assert_eq!(intervals[0].start_watts, Some(240));
         assert_eq!(workout.duration_seconds(), 60);
+    }
+
+    #[test]
+    fn wall_clock_spans_start_to_end_and_never_undercuts_riding_time() {
+        let started_at = DateTime::parse_from_rfc3339("2026-10-14T07:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut summary = SessionSummary {
+            id: Uuid::nil(),
+            workout_id: None,
+            workout_name: "Ride".into(),
+            started_at,
+            ended_at: None,
+            elapsed_seconds: 600,
+            average_power_watts: 0,
+            max_power_watts: 0,
+            average_cadence_rpm: None,
+            estimated_distance_meters: 0.0,
+            distance_source: None,
+            distance_weight_kg: 84.0,
+            completed: true,
+            recording_warning: None,
+        };
+        assert_eq!(summary.wall_clock_seconds(), None);
+        summary.ended_at = Some(started_at + chrono::Duration::seconds(900));
+        assert_eq!(summary.wall_clock_seconds(), Some(900));
+        summary.ended_at = Some(started_at + chrono::Duration::seconds(599));
+        assert_eq!(summary.wall_clock_seconds(), Some(600));
+    }
+
+    #[test]
+    fn round_trips_editor_repeats_and_compiles_them_in_order() {
+        // The shape the workout editor saves: a repeat holding mixed steps and a nested repeat.
+        let steps = serde_json::json!([
+            { "kind": "steady", "durationSeconds": 600, "target": { "unit": "percentFtp", "value": 55 } },
+            { "kind": "repeat", "repetitions": 3, "steps": [
+                { "kind": "steady", "durationSeconds": 120, "target": { "unit": "percentFtp", "value": 110 } },
+                { "kind": "ramp", "durationSeconds": 60,
+                  "start": { "unit": "watts", "value": 150 }, "end": { "unit": "watts", "value": 100 } },
+                { "kind": "repeat", "repetitions": 2, "steps": [
+                    { "kind": "freeRide", "durationSeconds": 15 }
+                ] }
+            ] }
+        ]);
+        let parsed: Vec<WorkoutStep> = serde_json::from_value(steps.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), steps);
+
+        let workout = Workout::new("Editor", parsed);
+        workout.validate().unwrap();
+        assert_eq!(workout.duration_seconds(), 600 + 3 * (120 + 60 + 2 * 15));
+        let shape: Vec<(u32, Option<u16>)> = workout
+            .compile(200)
+            .iter()
+            .map(|interval| (interval.duration_seconds, interval.start_watts))
+            .collect();
+        let iteration = [(120, Some(220)), (60, Some(150)), (15, None), (15, None)];
+        let mut expected = vec![(600, Some(110))];
+        for _ in 0..3 {
+            expected.extend(iteration);
+        }
+        assert_eq!(shape, expected);
+    }
+
+    #[test]
+    fn rejects_repeats_the_editor_also_refuses() {
+        let repeat = |repetitions, steps| {
+            Workout::new("Repeat", vec![WorkoutStep::Repeat { repetitions, steps }]).validate()
+        };
+        let step = || {
+            vec![WorkoutStep::FreeRide {
+                duration_seconds: 30,
+            }]
+        };
+        assert!(repeat(2, step()).is_ok());
+        assert!(repeat(20, step()).is_ok());
+        assert!(repeat(1, step()).is_err());
+        assert!(repeat(21, step()).is_err());
+        assert_eq!(
+            repeat(2, vec![]).unwrap_err(),
+            "A repeat group cannot be empty"
+        );
     }
 
     #[test]

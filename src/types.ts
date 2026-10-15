@@ -408,13 +408,28 @@ export type Telemetry = {
 /** How the trainer is keeping up with the ride (absent on older payloads). */
 export type ControlStatus = "ok" | "degraded" | "lost";
 
+/**
+ * The moment the rider pressed Lap, on both clocks: riding time (which stops
+ * while paused) and wall time (which lines up with the samples). Each mark
+ * ends one lap and starts the next. Mirrors `LapMark` in `domain.rs`.
+ */
+export type LapMark = {
+  elapsedSeconds: number;
+  timestampMs: number;
+};
+
 export type RunnerState =
   | { status: "idle" }
   | {
       status: "running";
       sessionId: string;
       workoutName: string;
+      /** Where the ride is in the workout: riding time plus any skipped blocks. */
       elapsedSeconds: number;
+      /** Time actually ridden: pauses and skipped blocks left out. */
+      movingSeconds: number;
+      /** Time since the ride started, pauses included. */
+      wallClockSeconds: number;
       totalSeconds: number | null;
       intervalIndex: number;
       intervalElapsedSeconds: number;
@@ -428,7 +443,14 @@ export type RunnerState =
       manualErg: boolean;
       /** The rider has overridden this interval's target. */
       overrideActive: boolean;
+      /**
+       * Every planned interval is done and the ride carries on as a free ride
+       * in the same session (manualErg is true too) until the rider ends it.
+       */
+      workoutComplete: boolean;
       biasPercent: number;
+      /** Manual laps marked so far this ride, oldest first. */
+      laps: LapMark[];
       control?: ControlStatus;
       recordingWarning?: string | null;
     }
@@ -437,6 +459,8 @@ export type RunnerState =
       sessionId: string;
       workoutName: string;
       elapsedSeconds: number;
+      movingSeconds: number;
+      wallClockSeconds: number;
       totalSeconds: number | null;
       intervalIndex: number;
       intervalElapsedSeconds: number;
@@ -445,7 +469,9 @@ export type RunnerState =
       plannedTargetWatts: number | null;
       manualErg: boolean;
       overrideActive: boolean;
+      workoutComplete: boolean;
       biasPercent: number;
+      laps: LapMark[];
       control?: ControlStatus;
       recordingWarning?: string | null;
     }
@@ -458,6 +484,7 @@ export type SessionSummary = {
   workoutName: string;
   startedAt: string;
   endedAt: string | null;
+  /** Time actually ridden: pauses and skipped blocks left out. */
   elapsedSeconds: number;
   averagePowerWatts: number;
   maxPowerWatts: number;
@@ -469,9 +496,24 @@ export type SessionSummary = {
   recordingWarning?: string | null;
 };
 
+/**
+ * How long a saved ride took on the wall clock, start to end with pauses
+ * included; null while it is still open. Mirrors
+ * `SessionSummary::wall_clock_seconds` in `domain.rs`, which the FIT file's
+ * elapsed time uses, so it never reads less than the time ridden.
+ */
+export const sessionWallClockSeconds = (
+  summary: Pick<SessionSummary, "startedAt" | "endedAt" | "elapsedSeconds">,
+): number | null => {
+  if (summary.endedAt === null) return null;
+  const seconds = Math.floor((Date.parse(summary.endedAt) - Date.parse(summary.startedAt)) / 1000);
+  return Math.max(summary.elapsedSeconds, seconds);
+};
+
 export type SessionDetail = {
   summary: SessionSummary;
   samples: Telemetry[];
+  laps: LapMark[];
 };
 
 export type ZoneDefinition = {
@@ -878,13 +920,14 @@ export type RideKeyAction =
   | { kind: "screen"; delta: number }
   | { kind: "pause" }
   | { kind: "skip" }
+  | { kind: "lap" }
   | { kind: "end" };
 
 /**
  * Keyboard shortcuts on the live ride view: ↑/↓ nudge the target by 5 W,
  * Shift+↑/↓ nudge the workout bias by 1 %, ←/→ page between ride screens,
- * Space pauses/resumes, S skips the current workout block, and Escape
- * brings up the end-ride confirmation. Held keys do not repeat.
+ * Space pauses/resumes, S skips the current workout block, L marks a lap,
+ * and Escape brings up the end-ride confirmation. Held keys do not repeat.
  */
 export const rideKeyAction = (
   key: string,
@@ -897,6 +940,7 @@ export const rideKeyAction = (
     }
     if (key === " ") return { kind: "pause" };
     if (key === "s" || key === "S") return { kind: "skip" };
+    if (key === "l" || key === "L") return { kind: "lap" };
     if (key === "Escape") return { kind: "end" };
   }
   const delta = manualPowerDeltaForKey(key, repeat);

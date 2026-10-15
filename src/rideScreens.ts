@@ -1,9 +1,10 @@
 /**
  * The rider's ride-screen layout: several screens, each an ordered list of
- * field slots and panels. Persisted as one document (`ride_display_preferences`);
+ * field slots, panels and at most one lap timer. Persisted as one document (`ride_display_preferences`);
  * `RideDisplayPreferences` in `storage.rs` mirrors this shape and the same
  * normalization rules.
  */
+import { normalizeLapTimerSettings, type LapTimerSettings } from "./lapTimer";
 import {
   isRideField,
   isRidePanelId,
@@ -19,7 +20,9 @@ export type RideSlotSpan = (typeof rideSlotSpans)[number];
 
 export type RideScreenItem =
   | { kind: "field"; field: RideField; span: RideSlotSpan }
-  | { kind: "panel"; panel: RidePanelId };
+  | { kind: "panel"; panel: RidePanelId }
+  /** Laps are ride-wide, so a second timer on one screen would only repeat the first. */
+  | { kind: "lapTimer"; timer: LapTimerSettings };
 
 export type RideScreen = {
   id: string;
@@ -78,6 +81,7 @@ export const defaultRideDisplayPreferences: RideDisplayPreferences = {
         field("energy", "total"),
         field("calories", "total"),
         field("power", "average", "interval"),
+        field("ftpPercent"),
         field("heartRate", "average"),
         panel("heartRateChart"),
         panel("timeInZone"),
@@ -89,34 +93,62 @@ export const defaultRideDisplayPreferences: RideDisplayPreferences = {
 const isSpan = (value: unknown): value is RideSlotSpan =>
   (rideSlotSpans as readonly unknown[]).includes(value);
 
-/** Identity of a slot, so a screen cannot hold the same thing twice. */
-const itemKey = (item: RideScreenItem): string =>
-  item.kind === "field" ? `field:${rideFieldKey(item.field)}` : `panel:${item.panel}`;
+/**
+ * Identity of a slot, so a screen cannot hold the same thing twice. Also the
+ * React key for the slot, on the ride screen and in the editor.
+ */
+export const rideScreenItemKey = (item: RideScreenItem): string => {
+  switch (item.kind) {
+    case "field":
+      return `field:${rideFieldKey(item.field)}`;
+    case "panel":
+      return `panel:${item.panel}`;
+    case "lapTimer":
+      return "lapTimer";
+  }
+};
+
+const isKnownItem = (item: RideScreenItem): boolean => {
+  switch (item.kind) {
+    case "field":
+      return isRideField(item.field);
+    case "panel":
+      return isRidePanelId(item.panel);
+    case "lapTimer":
+      return true;
+    default:
+      // A slot kind from a newer version.
+      return false;
+  }
+};
+
+const normalizeItem = (item: RideScreenItem): RideScreenItem => {
+  switch (item.kind) {
+    case "field":
+      return { kind: "field", field: item.field, span: isSpan(item.span) ? item.span : 1 };
+    case "panel":
+      return item;
+    case "lapTimer":
+      return { kind: "lapTimer", timer: normalizeLapTimerSettings(item.timer) };
+  }
+};
 
 const normalizeItems = (items: readonly RideScreenItem[]): RideScreenItem[] => {
   const seen = new Set<string>();
   const result: RideScreenItem[] = [];
   for (const item of items) {
     if (result.length === MAX_RIDE_SCREEN_ITEMS) break;
-    if (item.kind === "field") {
-      if (!isRideField(item.field)) continue;
-    } else if (!isRidePanelId(item.panel)) {
-      continue;
-    }
-    const key = itemKey(item);
+    if (!isKnownItem(item)) continue;
+    const key = rideScreenItemKey(item);
     if (seen.has(key)) continue;
     seen.add(key);
-    result.push(
-      item.kind === "field"
-        ? { kind: "field", field: item.field, span: isSpan(item.span) ? item.span : 1 }
-        : item,
-    );
+    result.push(normalizeItem(item));
   }
   return result;
 };
 
 /**
- * Drops fields and panels this version does not know, screens left with
+ * Drops slots this version does not know, screens left with
  * nothing on them, and anything past the caps — then guarantees the rider is
  * never left without a screen to ride on.
  */
