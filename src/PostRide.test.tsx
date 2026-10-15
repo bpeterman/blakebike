@@ -39,6 +39,7 @@ const running: RunnerState = {
   plannedTargetWatts: 200,
   manualErg: false,
   overrideActive: false,
+  workoutComplete: false,
   biasPercent: 100,
 };
 

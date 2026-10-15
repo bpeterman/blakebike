@@ -44,6 +44,7 @@ const runner: RunnerState = {
   plannedTargetWatts: null,
   manualErg: true,
   overrideActive: false,
+  workoutComplete: false,
   biasPercent: 100,
 };
 
@@ -340,6 +341,7 @@ describe("Ride charts", () => {
       plannedTargetWatts: 200,
       manualErg: false,
       overrideActive: false,
+      workoutComplete: false,
       biasPercent: 100,
     };
     const commonProps = {
@@ -397,6 +399,74 @@ describe("Ride charts", () => {
     expect(screen.getByRole("button", { name: "Reset override · 200 W" })).toBeInTheDocument();
   });
 
+  it("shows a finished workout as complete while the ride carries on as a free ride", () => {
+    const freeRiding: RunnerState = {
+      status: "running",
+      sessionId: "session",
+      workoutName: structuredWorkout.name,
+      elapsedSeconds: 200,
+      movingSeconds: 200,
+      wallClockSeconds: 200,
+      totalSeconds: 150,
+      intervalIndex: 5,
+      intervalElapsedSeconds: 50,
+      distanceMeters: 0,
+      targetPowerWatts: 100,
+      plannedTargetWatts: null,
+      manualErg: true,
+      overrideActive: false,
+      workoutComplete: true,
+      biasPercent: 100,
+    };
+    const perform = vi.fn(async () => undefined);
+    const { container } = render(
+      <Ride
+        workouts={[structuredWorkout]}
+        selectedWorkout={structuredWorkout.id}
+        setSelectedWorkout={vi.fn()}
+        connected
+        onConnect={vi.fn()}
+        runner={freeRiding}
+        telemetry={telemetry}
+        telemetryHistory={[telemetry]}
+        powerSmoothing="instant"
+        onPowerSmoothing={vi.fn()}
+        sourcePreferences={defaultSourcePreferences}
+        onSourcePreference={vi.fn()}
+        hub={hub}
+        profile={profile}
+        trainingZones={defaultTrainingZoneSettings}
+        displayPreferences={defaultRideDisplayPreferences}
+        perform={perform}
+      />,
+    );
+
+    const notice = screen.getByText("Workout complete · free riding").closest(".notice");
+    expect(notice).toHaveAttribute("role", "status");
+    expect(notice).toHaveTextContent("manual ERG at 100 W");
+    // Every block reads as done; nothing is left to skip or bias.
+    expect(screen.getByRole("heading", { name: "Workout complete" })).toBeInTheDocument();
+    const timelineBlocks = [...container.querySelectorAll<SVGPolygonElement>(".workout-timeline polygon[data-state]")];
+    expect(timelineBlocks.map((block) => block.dataset.state)).toEqual([
+      "completed", "completed", "completed", "completed", "completed",
+    ]);
+    expect(
+      [...container.querySelectorAll(".timeline-countdowns strong")].map((node) => node.textContent),
+    ).toEqual(["0:50", "2:30"]);
+    expect(screen.queryByRole("button", { name: "Skip block" })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Workout bias")).not.toBeInTheDocument();
+    expect(screen.getByText("Workout complete · free riding · manual ERG")).toBeInTheDocument();
+    expect(container.querySelector(".manual-erg-stepper input")).toHaveValue(100);
+    expect(screen.getByText("+0:50")).toBeInTheDocument();
+
+    // Skip and bias keys do nothing; the arrows still steer manual ERG.
+    fireEvent.keyDown(window, { key: "s" });
+    fireEvent.keyDown(window, { key: "ArrowUp", shiftKey: true });
+    expect(perform).not.toHaveBeenCalled();
+    fireEvent.keyDown(window, { key: "ArrowUp" });
+    expect(perform).toHaveBeenCalledWith(expect.any(Function), "adjust manual power");
+  });
+
   it("labels timeline blocks with biased targets and durations that follow the bias", () => {
     const structuredRunner: RunnerState = {
       status: "running",
@@ -413,6 +483,7 @@ describe("Ride charts", () => {
       plannedTargetWatts: 200,
       manualErg: false,
       overrideActive: false,
+      workoutComplete: false,
       biasPercent: 100,
     };
     const commonProps = {

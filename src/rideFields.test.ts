@@ -13,6 +13,8 @@ import {
   resolveRideField,
   type RideAggregate,
   type RideFieldContext,
+  type RideMetric,
+  type RideScope,
 } from "./rideFields";
 import type { Profile, Telemetry } from "./types";
 
@@ -159,6 +161,44 @@ describe("ride fields", () => {
     expect(
       resolveRideField({ metric: "time", scope: "ride", aggregate: "wallClock" }, context({ totalSeconds: null, wallClockSeconds: 75 })),
     ).toEqual({ label: "TOTAL TIME", value: "1:15" });
+  });
+
+  it("shows power as a share of FTP, smoothed and averaged like the watts", () => {
+    const resolved = (metric: RideMetric, scope: RideScope = "ride", aggregate: RideAggregate = "current", overrides: Partial<RideFieldContext> = {}) =>
+      resolveRideField({ metric, scope, aggregate }, context(overrides));
+
+    // 260 W smoothed against a 200 W FTP.
+    expect(resolved("ftpPercent")).toEqual({ label: "% FTP", value: "130", unit: "%" });
+    expect(resolved("ftpPercent", "ride", "average")).toEqual({
+      label: "AVG % FTP",
+      value: "125",
+      unit: "%",
+    });
+    expect(resolved("ftpPercent", "interval", "average")).toEqual({
+      label: "BLOCK AVG % FTP",
+      value: "150",
+      unit: "%",
+    });
+    expect(resolved("ftpPercent", "ride", "max")).toEqual({ label: "MAX % FTP", value: "150", unit: "%" });
+    expect(resolved("targetFtpPercent")).toEqual({ label: "TARGET % FTP", value: "125", unit: "%" });
+    expect(resolved("targetFtpPercent", "ride", "current", { targetPowerWatts: null })).toEqual({
+      label: "TARGET % FTP",
+      value: "Free",
+    });
+    expect(rideScopesFor("ftpPercent")).toEqual(["ride", "interval"]);
+    expect(rideAggregatesFor("ftpPercent", "ride")).toEqual(["current", "average", "max"]);
+    expect(rideAggregatesFor("targetFtpPercent", "ride")).toEqual(["current"]);
+  });
+
+  it("reads a missing FTP or weight as no reading, not as infinity", () => {
+    const unset = { profile: { ...profile, ftpWatts: 0, riderWeightKg: 0 } };
+    for (const aggregate of ["current", "average", "max"] as const) {
+      expect(resolveRideField({ metric: "ftpPercent", scope: "ride", aggregate }, context(unset))?.value).toBe("—");
+    }
+    expect(resolveRideField({ metric: "targetFtpPercent", scope: "ride", aggregate: "current" }, context(unset)))
+      .toEqual({ label: "TARGET % FTP", value: "—", unit: "%" });
+    expect(resolveRideField({ metric: "wattsPerKilogram", scope: "ride", aggregate: "average" }, context(unset)))
+      .toEqual({ label: "AVG W/KG", value: "—", unit: "W/kg" });
   });
 
   it("holds exactly the fields and panels the Rust side accepts", () => {

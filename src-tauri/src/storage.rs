@@ -156,7 +156,7 @@ const RIDE_PANELS: [&str; 6] = [
 /// Every field a rider can put on a screen, as `metric:scope:aggregate`.
 /// Mirrors the table built in `src/rideFields.ts`; a field missing from here
 /// is dropped on load, so the two lists have to agree.
-const RIDE_FIELDS: [&str; 34] = [
+const RIDE_FIELDS: [&str; 40] = [
     "power:ride:current",
     "power:ride:average",
     "power:ride:max",
@@ -180,6 +180,11 @@ const RIDE_FIELDS: [&str; 34] = [
     "wattsPerKilogram:ride:current",
     "wattsPerKilogram:ride:average",
     "wattsPerKilogram:interval:average",
+    "ftpPercent:ride:current",
+    "ftpPercent:ride:average",
+    "ftpPercent:ride:max",
+    "ftpPercent:interval:average",
+    "ftpPercent:interval:max",
     "energy:ride:total",
     "energy:interval:total",
     "calories:ride:total",
@@ -191,6 +196,7 @@ const RIDE_FIELDS: [&str; 34] = [
     "time:interval:remaining",
     "distance:ride:total",
     "targetPower:ride:current",
+    "targetFtpPercent:ride:current",
 ];
 
 const MAX_RIDE_SCREENS: usize = 8;
@@ -285,6 +291,7 @@ fn default_screens() -> Vec<RideScreen> {
                 field("energy:ride:total", 1),
                 field("calories:ride:total", 1),
                 field("power:interval:average", 1),
+                field("ftpPercent:ride:current", 1),
                 field("heartRate:ride:average", 1),
                 panel("heartRateChart"),
                 panel("timeInZone"),

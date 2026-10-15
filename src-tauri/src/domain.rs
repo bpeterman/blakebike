@@ -317,7 +317,7 @@ impl PowerTarget {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Interval {
     pub duration_seconds: u32,
@@ -437,6 +437,59 @@ mod tests {
         assert_eq!(summary.wall_clock_seconds(), Some(900));
         summary.ended_at = Some(started_at + chrono::Duration::seconds(599));
         assert_eq!(summary.wall_clock_seconds(), Some(600));
+    }
+
+    #[test]
+    fn round_trips_editor_repeats_and_compiles_them_in_order() {
+        // The shape the workout editor saves: a repeat holding mixed steps and a nested repeat.
+        let steps = serde_json::json!([
+            { "kind": "steady", "durationSeconds": 600, "target": { "unit": "percentFtp", "value": 55 } },
+            { "kind": "repeat", "repetitions": 3, "steps": [
+                { "kind": "steady", "durationSeconds": 120, "target": { "unit": "percentFtp", "value": 110 } },
+                { "kind": "ramp", "durationSeconds": 60,
+                  "start": { "unit": "watts", "value": 150 }, "end": { "unit": "watts", "value": 100 } },
+                { "kind": "repeat", "repetitions": 2, "steps": [
+                    { "kind": "freeRide", "durationSeconds": 15 }
+                ] }
+            ] }
+        ]);
+        let parsed: Vec<WorkoutStep> = serde_json::from_value(steps.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), steps);
+
+        let workout = Workout::new("Editor", parsed);
+        workout.validate().unwrap();
+        assert_eq!(workout.duration_seconds(), 600 + 3 * (120 + 60 + 2 * 15));
+        let shape: Vec<(u32, Option<u16>)> = workout
+            .compile(200)
+            .iter()
+            .map(|interval| (interval.duration_seconds, interval.start_watts))
+            .collect();
+        let iteration = [(120, Some(220)), (60, Some(150)), (15, None), (15, None)];
+        let mut expected = vec![(600, Some(110))];
+        for _ in 0..3 {
+            expected.extend(iteration);
+        }
+        assert_eq!(shape, expected);
+    }
+
+    #[test]
+    fn rejects_repeats_the_editor_also_refuses() {
+        let repeat = |repetitions, steps| {
+            Workout::new("Repeat", vec![WorkoutStep::Repeat { repetitions, steps }]).validate()
+        };
+        let step = || {
+            vec![WorkoutStep::FreeRide {
+                duration_seconds: 30,
+            }]
+        };
+        assert!(repeat(2, step()).is_ok());
+        assert!(repeat(20, step()).is_ok());
+        assert!(repeat(1, step()).is_err());
+        assert!(repeat(21, step()).is_err());
+        assert_eq!(
+            repeat(2, vec![]).unwrap_err(),
+            "A repeat group cannot be empty"
+        );
     }
 
     #[test]
