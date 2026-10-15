@@ -273,6 +273,7 @@ dependencies = [
  "fit-sdk-rust",
  "futures",
  "keepawake",
+ "objc2-core-bluetooth",
  "proptest",
  "quick-xml 0.38.4",
  "reqwest 0.12.28",

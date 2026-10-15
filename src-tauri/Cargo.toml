@@ -46,6 +46,12 @@ fit-sdk-rust = "0.2.1"
 # ScreenSaver + logind inhibit over D-Bus on Linux).
 keepawake = "0.6"
 
+# Read CBManager.authorization directly: btleplug folds "Unauthorized" into
+# CentralState::Unknown, which can't tell a denied permission from a radio
+# that is resetting. Same version btleplug already pulls in.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-core-bluetooth = { version = "0.3.2", default-features = false, features = ["std", "CBManager"] }
+
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"
