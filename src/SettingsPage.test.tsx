@@ -222,12 +222,12 @@ describe("Intervals.icu settings", () => {
     const library = screen.getByRole("checkbox", { name: /Mirror the workout library/ });
     const calendar = screen.getByRole("checkbox", { name: /Show today's planned workout/ });
     fireEvent.click(library);
-    expect(onIntervalsSyncSettings).toHaveBeenCalledWith({ calendar: true, library: false, ftpSource: "indoorFtp" });
+    expect(onIntervalsSyncSettings).toHaveBeenCalledWith({ calendar: true, library: false, ftpSource: "indoorFtp", riderProfile: true });
     // One round trip at a time: the other toggle waits until this one lands.
     expect(calendar).toBeDisabled();
     await waitFor(() => expect(calendar).toBeEnabled());
     fireEvent.click(calendar);
-    expect(onIntervalsSyncSettings).toHaveBeenLastCalledWith({ calendar: false, library: true, ftpSource: "indoorFtp" });
+    expect(onIntervalsSyncSettings).toHaveBeenLastCalledWith({ calendar: false, library: true, ftpSource: "indoorFtp", riderProfile: true });
   });
 
   it("saves the FTP source and reports the eFTP the sync used", async () => {
@@ -244,6 +244,8 @@ describe("Intervals.icu settings", () => {
       zones: defaultTrainingZoneSettings,
       ftp: { watts: 301, previousWatts: 280, source: "estimatedFtp" },
       maxHeartRate: null,
+      weight: { status: "syncOff" },
+      name: { status: "syncOff" },
       powerZones: { status: "syncOff" },
       heartRateZones: { status: "syncOff" },
     });
@@ -251,6 +253,43 @@ describe("Intervals.icu settings", () => {
     expect(
       await screen.findByText(/FTP 301 W from your Intervals\.icu eFTP \(was 280 W\)/),
     ).toBeInTheDocument();
+  });
+
+  it("lets the rider keep their own weight and name and reports synced ones", async () => {
+    const onIntervalsSyncSettings = vi.fn(() => Promise.resolve());
+    const onProfileUpdate = vi.fn();
+    renderSettings({
+      intervalsStatus: connectedStatus,
+      onIntervalsSyncSettings,
+      onProfileUpdate,
+      profile: { ...profile, weightUnit: "lb" },
+    });
+    const toggle = screen.getByRole("checkbox", { name: /Sync rider profile \(weight, name\)/ });
+    expect(toggle).toBeChecked();
+    fireEvent.click(toggle);
+    expect(onIntervalsSyncSettings).toHaveBeenCalledWith({
+      ...connectedStatus.settings,
+      riderProfile: false,
+    });
+
+    const updated: Profile = { ...profile, name: "Ana", riderWeightKg: 72.5, weightUnit: "lb" };
+    vi.mocked(api.syncTrainingSettings).mockResolvedValue({
+      profile: updated,
+      zones: defaultTrainingZoneSettings,
+      ftp: { watts: 220, previousWatts: 220, source: "indoorFtp" },
+      maxHeartRate: null,
+      weight: { status: "synced", kg: 72.5, previousKg: 75, source: "settings", date: null },
+      name: { status: "synced", name: "Ana", previous: "Blake" },
+      powerZones: { status: "syncOff" },
+      heartRateZones: { status: "syncOff" },
+    });
+    const sync = await screen.findByRole("button", { name: "Sync from Intervals.icu" });
+    await waitFor(() => expect(sync).toBeEnabled());
+    fireEvent.click(sync);
+    expect(
+      await screen.findByText(/Weight 159\.8 lb from your Intervals\.icu settings \(was 165\.3 lb\) · Name Ana \(was Blake\)/),
+    ).toBeInTheDocument();
+    expect(onProfileUpdate).toHaveBeenCalledWith(updated);
   });
 
   it("runs Sync now through App and reports what changed", async () => {
@@ -297,6 +336,8 @@ describe("Intervals.icu settings", () => {
       zones,
       ftp: { watts: 267, previousWatts: 220, source: "indoorFtp" },
       maxHeartRate: { bpm: 192, previousBpm: 190 },
+      weight: { status: "notFound" },
+      name: { status: "notFound" },
       powerZones: { status: "imported" },
       heartRateZones: { status: "syncOff" },
     });
@@ -305,7 +346,7 @@ describe("Intervals.icu settings", () => {
     expect(api.saveTrainingZones).not.toHaveBeenCalled();
     expect(
       screen.getByText(
-        "FTP 267 W from your Intervals.icu indoor FTP (was 220 W) · Max HR 192 bpm (was 190 bpm) · Power zones imported · Heart-rate zones not imported (import is off)",
+        "FTP 267 W from your Intervals.icu indoor FTP (was 220 W) · Max HR 192 bpm (was 190 bpm) · Intervals.icu has no weight; yours is unchanged · Intervals.icu has no name; yours is unchanged · Power zones imported · Heart-rate zones not imported (import is off)",
       ),
     ).toBeInTheDocument();
     expect(syncButton()).toBeEnabled();

@@ -203,6 +203,78 @@ impl IntervalsClient {
         Ok(in_range(model.ftp, 50.0, 500.0))
     }
 
+    /// The rider's first name and the weight a sync should use, as of
+    /// `today` (the rider's local date). Two requests: the wellness days and
+    /// the athlete record.
+    ///
+    /// Weight: the newest wellness weight from the last `WELLNESS_WEIGHT_DAYS`
+    /// wins. It is a dated measurement (a scale sync or a logged entry), and
+    /// it is the weight Intervals.icu itself uses for that day's W/kg. The
+    /// athlete settings weight (`icu_weight`) carries no date, so it cannot be
+    /// shown to be newer; it is the fallback for a rider who does not log
+    /// weight.
+    ///
+    /// Name: `firstname`, else the first word of the full `name`.
+    pub async fn rider_profile(
+        &self,
+        athlete_id: &str,
+        today: NaiveDate,
+    ) -> Result<RiderProfile, IntervalsError> {
+        let wellness = self.wellness_weight(athlete_id, today).await?;
+        #[derive(Deserialize)]
+        struct Athlete {
+            firstname: Option<String>,
+            name: Option<String>,
+            icu_weight: Option<f64>,
+        }
+        let athlete: Athlete = self
+            .get_json(&format!("/api/v1/athlete/{athlete_id}"), "athlete settings")
+            .await?;
+        Ok(RiderProfile {
+            first_name: first_name(athlete.firstname, athlete.name),
+            weight: wellness.or_else(|| {
+                weight_kg(athlete.icu_weight).map(|kg| RiderWeight {
+                    kg,
+                    source: WeightSource::Settings,
+                    date: None,
+                })
+            }),
+        })
+    }
+
+    async fn wellness_weight(
+        &self,
+        athlete_id: &str,
+        today: NaiveDate,
+    ) -> Result<Option<RiderWeight>, IntervalsError> {
+        /// A wellness day; `id` is its local date. `fields` drops nulls, so
+        /// a day without a weight has none.
+        #[derive(Deserialize)]
+        struct Wellness {
+            id: String,
+            weight: Option<f64>,
+        }
+        let oldest = today - chrono::Duration::days(WELLNESS_WEIGHT_DAYS);
+        let days: Vec<Wellness> = self
+            .get_json(
+                &format!(
+                    "/api/v1/athlete/{athlete_id}/wellness?oldest={oldest}&newest={today}&fields=id,weight"
+                ),
+                "wellness",
+            )
+            .await?;
+        Ok(days
+            .into_iter()
+            .filter_map(|day| {
+                Some(RiderWeight {
+                    kg: weight_kg(day.weight)?,
+                    source: WeightSource::Wellness,
+                    date: Some(day.id.parse::<NaiveDate>().ok()?),
+                })
+            })
+            .max_by_key(|weight| weight.date))
+    }
+
     /// Planned cycling workouts between two local dates, inclusive, with
     /// their structure decoded from the ZWO Intervals.icu attaches when asked
     /// with `ext=zwo`. A ZWO that cannot be read is a per-event failure.
@@ -347,6 +419,55 @@ pub enum FtpSource {
 pub struct CyclingFtp {
     pub watts: u16,
     pub source: FtpSource,
+}
+
+/// How far back a sync looks for a wellness weight before falling back to
+/// the athlete settings weight.
+pub const WELLNESS_WEIGHT_DAYS: i64 = 90;
+
+/// Which Intervals.icu number a rider weight came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WeightSource {
+    /// A dated wellness entry.
+    Wellness,
+    /// The weight in the athlete settings (`icu_weight`).
+    Settings,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RiderWeight {
+    /// Within the 30–250 kg storage accepts, to 0.1 kg.
+    pub kg: f32,
+    pub source: WeightSource,
+    /// The wellness day; `None` for the undated settings weight.
+    pub date: Option<NaiveDate>,
+}
+
+/// What a sync takes from the athlete's own record; each part is `None`
+/// when Intervals.icu has nothing usable.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RiderProfile {
+    pub first_name: Option<String>,
+    pub weight: Option<RiderWeight>,
+}
+
+/// `firstname` trimmed, else the first word of the full `name`; blank
+/// values count as missing.
+fn first_name(firstname: Option<String>, name: Option<String>) -> Option<String> {
+    non_empty(firstname.map(|first| first.trim().to_string())).or_else(|| {
+        name.as_deref()
+            .and_then(|full| full.split_whitespace().next())
+            .map(str::to_string)
+    })
+}
+
+/// A weight Intervals.icu reported, if storage would accept it, rounded to
+/// the 0.1 kg the Settings form shows.
+fn weight_kg(value: Option<f64>) -> Option<f32> {
+    value
+        .filter(|value| value.is_finite() && (30.0..=250.0).contains(value))
+        .map(|value| ((value * 10.0).round() / 10.0) as f32)
 }
 
 /// One zone set as Intervals.icu stores it: increasing upper bounds (bpm for
@@ -899,6 +1020,98 @@ mod tests {
             assert_eq!(client.estimated_ftp("i1").await.unwrap(), None);
             server.join().unwrap();
         }
+    }
+
+    fn day(date: &str) -> NaiveDate {
+        date.parse().unwrap()
+    }
+
+    /// `rider_profile` against a listener serving these two bodies.
+    async fn rider_profile_from(wellness: &str, athlete: &str) -> (RiderProfile, Vec<String>) {
+        let (base_url, server) = serve_routes(
+            vec![
+                json("GET /api/v1/athlete/i1/wellness?", wellness),
+                json("GET /api/v1/athlete/i1 ", athlete),
+            ],
+            2,
+        );
+        let client = IntervalsClient::with_base_url("secret", &base_url).unwrap();
+        let profile = client.rider_profile("i1", day("2026-10-14")).await.unwrap();
+        (profile, server.join().unwrap())
+    }
+
+    #[tokio::test]
+    async fn the_newest_usable_wellness_weight_beats_the_settings_weight() {
+        // Out of order, a day without a weight, an implausible reading and an
+        // unreadable id: the newest usable day wins over `icu_weight`.
+        let wellness = r#"[
+          {"id":"2026-10-10","weight":72.84},
+          {"id":"2026-10-13"},
+          {"id":"2026-10-12","weight":72.36},
+          {"id":"2026-10-14","weight":7.2},
+          {"id":"not-a-date","weight":71.0},
+          {"id":"2026-09-01","weight":74.0}
+        ]"#;
+        let (profile, requests) = rider_profile_from(
+            wellness,
+            r#"{"id":"i1","firstname":"Blake","name":"Blake Peterman","icu_weight":74.0}"#,
+        )
+        .await;
+        assert_eq!(
+            profile,
+            RiderProfile {
+                first_name: Some("Blake".into()),
+                weight: Some(RiderWeight {
+                    kg: 72.4,
+                    source: WeightSource::Wellness,
+                    date: Some(day("2026-10-12")),
+                }),
+            }
+        );
+        assert!(requests[0].starts_with(
+            "GET /api/v1/athlete/i1/wellness?oldest=2026-07-16&newest=2026-10-14&fields=id,weight "
+        ));
+        assert!(requests[1].starts_with("GET /api/v1/athlete/i1 "));
+    }
+
+    #[tokio::test]
+    async fn falls_back_to_the_settings_weight_and_the_first_word_of_the_name() {
+        let no_weights = r#"[{"id":"2026-10-12"},{"id":"2026-10-13","weight":null}]"#;
+        let (profile, _) = rider_profile_from(
+            no_weights,
+            r#"{"id":"i1","firstname":"  ","name":"  Blake  Peterman ","icu_weight":73.5,"weight":80}"#,
+        )
+        .await;
+        assert_eq!(
+            profile,
+            RiderProfile {
+                first_name: Some("Blake".into()),
+                weight: Some(RiderWeight {
+                    kg: 73.5,
+                    source: WeightSource::Settings,
+                    date: None,
+                }),
+            }
+        );
+
+        // Nothing usable: blank names, no or an implausible weight.
+        for athlete in [
+            r#"{"id":"i1"}"#,
+            r#"{"id":"i1","firstname":"","name":" ","icu_weight":0}"#,
+        ] {
+            let (profile, _) = rider_profile_from(no_weights, athlete).await;
+            assert_eq!(
+                profile,
+                RiderProfile {
+                    first_name: None,
+                    weight: None,
+                }
+            );
+        }
+
+        // A first name is trimmed.
+        let (profile, _) = rider_profile_from("[]", r#"{"id":"i1","firstname":" Ana "}"#).await;
+        assert_eq!(profile.first_name.as_deref(), Some("Ana"));
     }
 
     #[tokio::test]

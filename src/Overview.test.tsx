@@ -154,3 +154,10 @@ describe("today's plan on the home screen", () => {
     expect(screen.queryByRole("region", { name: "Today's plan" })).not.toBeInTheDocument();
   });
 });
+
+describe("home greeting", () => {
+  it("greets the rider by the profile name an Intervals.icu sync can fill in", () => {
+    renderOverview({ profile: { ...profile, name: "Ana" } });
+    expect(screen.getByRole("heading", { name: "Ready to ride, Ana?" })).toBeInTheDocument();
+  });
+});

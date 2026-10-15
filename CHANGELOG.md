@@ -21,6 +21,7 @@ Conventions:
 
 ### Added
 
+- **Sync from Intervals.icu** now updates your rider weight and first name too. The weight feeds the distance estimate and W/kg. It comes from your newest Intervals.icu wellness weight from the last 90 days (the weight Intervals.icu itself uses for W/kg), or from your Intervals.icu settings if you have not logged one. The name fills the home-screen greeting. The result says which weight was used, from which day, and what each value replaced. To keep the weight and name you enter by hand, turn off **Sync rider profile (weight, name)** in the Intervals.icu card.
 - A lap timer for ride screens. Add it in **Settings → Ride screens**, then tap **Lap** or press **L** while riding: it shows the current and last lap times with their average cadence and power. Set it to **Countdown drill** for repeating on/off efforts (30 s on / 30 s off, or one repeating length) with a beep and a flash at every change. Laps stop with the ride clock when you pause, and they are saved with the ride as laps in its FIT file, so Garmin Connect and Intervals.icu show them too.
 - A **Total time** ride field that keeps counting through pauses, beside **Elapsed**, which counts only the time you ride. Add it in Settings → Ride screens under Time → Whole ride → Total (with pauses). Ride detail shows both too.
 
