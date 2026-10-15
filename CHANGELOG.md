@@ -19,6 +19,15 @@ Conventions:
 
 ## [Unreleased]
 
+### Added
+
+- A **Total time** ride field that keeps counting through pauses, beside **Elapsed**, which counts only the time you ride. Add it in Settings → Ride screens under Time → Whole ride → Total (with pauses). Ride detail shows both too.
+
+### Fixed
+
+- FIT files now report pauses the way Garmin and Intervals.icu expect: timer time leaves pauses out, and elapsed time is the wall clock from start to finish. Before, both were set to the time ridden.
+- Skipping a workout block no longer counts the skipped time as time ridden, in Elapsed, the saved ride, or its FIT file.
+
 ## [0.5.2] - 2026-10-15
 
 blake.bike can find Bluetooth devices on Macs where macOS was quietly blocking it.

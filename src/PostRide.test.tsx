@@ -29,6 +29,8 @@ const running: RunnerState = {
   sessionId: "session",
   workoutName: "Threshold",
   elapsedSeconds: 60,
+  movingSeconds: 60,
+  wallClockSeconds: 60,
   totalSeconds: 60,
   intervalIndex: 0,
   intervalElapsedSeconds: 60,
@@ -148,6 +150,22 @@ describe("post-ride flow", () => {
     expect(onGarmin).toHaveBeenCalledWith(session.summary);
     expect(onExportFit).toHaveBeenCalledWith(session.summary);
     expect(onExport).toHaveBeenCalledWith(session.summary);
+  });
+
+  it("shows the time ridden beside the total time, pauses included", () => {
+    render(
+      <RideDetailModal
+        session={{ ...session, summary: { ...session.summary, elapsedSeconds: 1_500 } }}
+        profile={profile}
+        trainingZones={defaultTrainingZoneSettings}
+        onClose={vi.fn()}
+        onGarmin={vi.fn()}
+        onExportFit={vi.fn()}
+        onExport={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("moving time").closest(".metric")).toHaveTextContent("25:00");
+    expect(screen.getByText("total time").closest(".metric")).toHaveTextContent("30:00");
   });
 
   it("never claims a ride was saved when finalization reports a problem", () => {

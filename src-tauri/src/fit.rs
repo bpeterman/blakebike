@@ -91,6 +91,16 @@ pub fn encode_activity(detail: &SessionDetail) -> Result<Vec<u8>, String> {
     let ended_at = summary.ended_at.unwrap_or_else(|| {
         started_at + chrono::Duration::seconds(i64::from(summary.elapsed_seconds))
     });
+    // FIT keeps both: timer time leaves pauses out, elapsed time is the wall
+    // clock from start to end.
+    let times = SummaryTimes {
+        timer_seconds: f64::from(summary.elapsed_seconds),
+        elapsed_seconds: f64::from(
+            summary
+                .wall_clock_seconds()
+                .unwrap_or(summary.elapsed_seconds),
+        ),
+    };
     let distance = estimate_distance(&detail.samples, summary.distance_weight_kg);
     let stats = RideStats::from_samples(&detail.samples, &distance, summary.elapsed_seconds);
     let mut messages = vec![
@@ -115,12 +125,14 @@ pub fn encode_activity(detail: &SessionDetail) -> Result<Vec<u8>, String> {
     messages.push(lap_message(
         summary,
         ended_at,
+        times,
         &stats,
         distance.total_meters,
     ));
     messages.push(session_message(
         summary,
         ended_at,
+        times,
         &stats,
         distance.total_meters,
     ));
@@ -128,7 +140,7 @@ pub fn encode_activity(detail: &SessionDetail) -> Result<Vec<u8>, String> {
         MesgNum::Activity,
         vec![
             datetime_field(253, "timestamp", ended_at),
-            float_field(0, "total_timer_time", f64::from(summary.elapsed_seconds)),
+            float_field(0, "total_timer_time", times.timer_seconds),
             uint_field(1, "num_sessions", 1),
             enum_field(2, "type", "manual"),
             enum_field(3, "event", "activity"),
@@ -334,10 +346,11 @@ fn event_message(timestamp: DateTime<Utc>, event_type: &'static str) -> Message 
 fn lap_message(
     summary: &SessionSummary,
     ended_at: DateTime<Utc>,
+    times: SummaryTimes,
     stats: &RideStats,
     total_distance_meters: f64,
 ) -> Message {
-    let mut fields = common_summary_fields(summary, ended_at, stats, SummaryKind::Lap);
+    let mut fields = common_summary_fields(summary, ended_at, times, stats, SummaryKind::Lap);
     fields.push(float_field(9, "total_distance", total_distance_meters));
     fields.extend([
         enum_field(23, "intensity", "active"),
@@ -351,10 +364,11 @@ fn lap_message(
 fn session_message(
     summary: &SessionSummary,
     ended_at: DateTime<Utc>,
+    times: SummaryTimes,
     stats: &RideStats,
     total_distance_meters: f64,
 ) -> Message {
-    let mut fields = common_summary_fields(summary, ended_at, stats, SummaryKind::Session);
+    let mut fields = common_summary_fields(summary, ended_at, times, stats, SummaryKind::Session);
     fields.push(float_field(9, "total_distance", total_distance_meters));
     fields.extend([
         enum_field(5, "sport", "cycling"),
@@ -373,9 +387,19 @@ enum SummaryKind {
     Session,
 }
 
+/// A lap's or session's two durations, in seconds.
+#[derive(Clone, Copy)]
+struct SummaryTimes {
+    /// Riding time: pauses left out.
+    timer_seconds: f64,
+    /// Wall clock: pauses included.
+    elapsed_seconds: f64,
+}
+
 fn common_summary_fields(
     summary: &SessionSummary,
     ended_at: DateTime<Utc>,
+    times: SummaryTimes,
     stats: &RideStats,
     kind: SummaryKind,
 ) -> Vec<Field> {
@@ -393,8 +417,8 @@ fn common_summary_fields(
         enum_field(0, "event", event),
         enum_field(1, "event_type", "stop"),
         datetime_field(2, "start_time", summary.started_at),
-        float_field(7, "total_elapsed_time", f64::from(summary.elapsed_seconds)),
-        float_field(8, "total_timer_time", f64::from(summary.elapsed_seconds)),
+        float_field(7, "total_elapsed_time", times.elapsed_seconds),
+        float_field(8, "total_timer_time", times.timer_seconds),
         uint_field(
             avg_power,
             "avg_power",
@@ -648,6 +672,28 @@ mod tests {
             .unwrap();
         assert!(total_distance > 8.0);
         assert!((total_distance - distances.last().unwrap()).abs() < 0.01);
+    }
+
+    #[test]
+    fn timer_time_leaves_pauses_out_and_elapsed_time_keeps_them() {
+        let mut detail = detail();
+        // Two seconds ridden across a ride that took ninety on the wall clock.
+        detail.summary.ended_at = Some(detail.summary.started_at + chrono::Duration::seconds(90));
+        let bytes = encode_activity(&detail).unwrap();
+        let (messages, errors) = Decoder::builder(&bytes).build().read_all();
+        assert!(errors.is_empty(), "{errors:?}");
+        let time = |name: &str, field: &str| {
+            messages
+                .iter()
+                .find(|message| message.name == name)
+                .and_then(|message| message.field(field))
+                .and_then(|field| field.value.as_f64())
+        };
+        for summary in ["lap", "session"] {
+            assert_eq!(time(summary, "total_timer_time"), Some(2.0), "{summary}");
+            assert_eq!(time(summary, "total_elapsed_time"), Some(90.0), "{summary}");
+        }
+        assert_eq!(time("activity", "total_timer_time"), Some(2.0));
     }
 
     #[test]

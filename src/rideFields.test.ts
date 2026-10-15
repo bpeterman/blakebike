@@ -4,12 +4,14 @@ import storageSource from "../src-tauri/src/storage.rs?raw";
 import {
   isRideField,
   rideAggregatesFor,
+  rideFieldChoiceLabel,
   rideFieldKey,
   rideFieldLabel,
   rideFields,
   ridePanelIds,
   rideScopesFor,
   resolveRideField,
+  type RideAggregate,
   type RideFieldContext,
 } from "./rideFields";
 import type { Profile, Telemetry } from "./types";
@@ -47,6 +49,8 @@ const context = (overrides: Partial<RideFieldContext> = {}): RideFieldContext =>
   intervalHistory: history.slice(90),
   displayPowerWatts: 260,
   elapsedSeconds: 120,
+  movingSeconds: 120,
+  wallClockSeconds: 120,
   totalSeconds: 600,
   intervalElapsedSeconds: 30,
   intervalTotalSeconds: 120,
@@ -136,6 +140,27 @@ describe("ride fields", () => {
       .toEqual({ label: "TARGET", value: "Free" });
   });
 
+  it("keeps riding time, total time and the workout's position apart", () => {
+    // Ten minutes in on the wall clock: a minute paused, and a two-minute block
+    // skipped, so the workout is further along than the rider has ridden.
+    const paused = context({
+      elapsedSeconds: 660,
+      movingSeconds: 540,
+      wallClockSeconds: 600,
+      totalSeconds: 1_800,
+    });
+    const time = (aggregate: RideAggregate) =>
+      resolveRideField({ metric: "time", scope: "ride", aggregate }, paused);
+    expect(time("total")).toEqual({ label: "ELAPSED", value: "9:00" });
+    expect(time("wallClock")).toEqual({ label: "TOTAL TIME", value: "10:00" });
+    // What is left counts from the workout's position, skipped block and all.
+    expect(time("remaining")).toEqual({ label: "REMAINING", value: "19:00" });
+    // A free ride has a total time too.
+    expect(
+      resolveRideField({ metric: "time", scope: "ride", aggregate: "wallClock" }, context({ totalSeconds: null, wallClockSeconds: 75 })),
+    ).toEqual({ label: "TOTAL TIME", value: "1:15" });
+  });
+
   it("holds exactly the fields and panels the Rust side accepts", () => {
     // The two lists are written twice, once per language. This is what stops
     // them drifting: a field only one side knows is dropped on load.
@@ -155,6 +180,13 @@ describe("ride fields", () => {
     expect(rideAggregatesFor("power", "ride")).toEqual(["current", "average", "max"]);
     expect(rideAggregatesFor("power", "interval")).toEqual(["average", "max"]);
     expect(rideAggregatesFor("wattsPerKilogram", "interval")).toEqual(["average"]);
-    expect(rideAggregatesFor("time", "ride")).toEqual(["total", "remaining"]);
+    expect(rideAggregatesFor("time", "ride")).toEqual(["total", "remaining", "wallClock"]);
+    // The runner keeps one wall clock, for the whole ride.
+    expect(rideAggregatesFor("time", "interval")).toEqual(["total", "remaining"]);
+    expect(rideFieldChoiceLabel({ metric: "time", scope: "ride", aggregate: "total" })).toBe("Elapsed (riding)");
+    expect(rideFieldChoiceLabel({ metric: "time", scope: "ride", aggregate: "wallClock" })).toBe(
+      "Total (with pauses)",
+    );
+    expect(rideFieldChoiceLabel({ metric: "power", scope: "ride", aggregate: "average" })).toBe("Average");
   });
 });

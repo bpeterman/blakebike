@@ -34,6 +34,8 @@ const runner: RunnerState = {
   sessionId: "session",
   workoutName: "Free Ride",
   elapsedSeconds: 30,
+  movingSeconds: 30,
+  wallClockSeconds: 30,
   totalSeconds: null,
   intervalIndex: 0,
   intervalElapsedSeconds: 30,
@@ -213,7 +215,7 @@ describe("Ride charts", () => {
   });
 
   it("shows pace-and-progress fields, hiding time remaining on an open-ended ride", () => {
-    const freeRide = { ...runner, elapsedSeconds: 125, distanceMeters: 5_000 };
+    const freeRide = { ...runner, elapsedSeconds: 125, movingSeconds: 125, wallClockSeconds: 125, distanceMeters: 5_000 };
     const { container, rerender } = render(
       <Ride
         workouts={[]}
@@ -267,6 +269,34 @@ describe("Ride charts", () => {
     expect(container.querySelector('[data-ride-field="time:ride:remaining"]')).toHaveTextContent("7:55");
   });
 
+  it("holds elapsed through a pause while total time keeps counting", () => {
+    const { container } = render(
+      <Ride
+        workouts={[]}
+        selectedWorkout={null}
+        setSelectedWorkout={vi.fn()}
+        connected
+        onConnect={vi.fn()}
+        runner={{ ...runner, status: "paused", movingSeconds: 1_510, wallClockSeconds: 1_745 }}
+        telemetry={telemetry}
+        telemetryHistory={[telemetry]}
+        powerSmoothing="instant"
+        onPowerSmoothing={vi.fn()}
+        sourcePreferences={defaultSourcePreferences}
+        onSourcePreference={vi.fn()}
+        hub={hub}
+        profile={profile}
+        trainingZones={defaultTrainingZoneSettings}
+        displayPreferences={screenWith("time:ride:total", "time:ride:wallClock")}
+        perform={async () => undefined}
+      />,
+    );
+    expect(container.querySelector('[data-ride-field="time:ride:total"]')).toHaveTextContent("ELAPSED25:10");
+    expect(container.querySelector('[data-ride-field="time:ride:wallClock"]')).toHaveTextContent(
+      "TOTAL TIME29:05",
+    );
+  });
+
   it("shows a dash for average power before any ride time", () => {
     const { container } = render(
       <Ride
@@ -300,6 +330,8 @@ describe("Ride charts", () => {
       sessionId: "session",
       workoutName: structuredWorkout.name,
       elapsedSeconds: 70,
+      movingSeconds: 70,
+      wallClockSeconds: 70,
       totalSeconds: 150,
       intervalIndex: 1,
       intervalElapsedSeconds: 10,
@@ -371,6 +403,8 @@ describe("Ride charts", () => {
       sessionId: "session",
       workoutName: structuredWorkout.name,
       elapsedSeconds: 70,
+      movingSeconds: 70,
+      wallClockSeconds: 70,
       totalSeconds: 150,
       intervalIndex: 1,
       intervalElapsedSeconds: 10,

@@ -2,8 +2,8 @@ import { useEffect, useState } from "react";
 import { ChevronDown, ChevronUp, Plus, Trash2 } from "lucide-react";
 import {
   firstRideField,
-  rideAggregateLabels,
   rideAggregatesFor,
+  rideFieldChoiceLabel,
   rideFieldKey,
   rideFieldLabel,
   rideFields,
@@ -341,13 +341,14 @@ function FieldRow({
         <select
           value={field.aggregate}
           disabled={aggregates.length === 1}
-          onChange={(event) =>
-            change({ ...field, aggregate: event.target.value as RideField["aggregate"] })
-          }
+          onChange={(event) => {
+            const aggregate = aggregates.find((option) => option === event.target.value);
+            if (aggregate !== undefined) change({ ...field, aggregate });
+          }}
         >
           {aggregates.map((aggregate) => (
             <option key={aggregate} value={aggregate}>
-              {rideAggregateLabels[aggregate]}
+              {rideFieldChoiceLabel({ ...field, aggregate })}
             </option>
           ))}
         </select>
