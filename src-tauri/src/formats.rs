@@ -262,6 +262,39 @@ mod tests {
     }
 
     #[test]
+    fn exports_nested_repeats_unrolled_in_ride_order() {
+        let workout = Workout::new(
+            "Repeats",
+            vec![
+                WorkoutStep::Steady {
+                    duration_seconds: 300,
+                    target: PowerTarget::PercentFtp(55),
+                },
+                WorkoutStep::Repeat {
+                    repetitions: 2,
+                    steps: vec![
+                        WorkoutStep::Steady {
+                            duration_seconds: 60,
+                            target: PowerTarget::PercentFtp(120),
+                        },
+                        WorkoutStep::Repeat {
+                            repetitions: 2,
+                            steps: vec![WorkoutStep::FreeRide {
+                                duration_seconds: 10,
+                            }],
+                        },
+                    ],
+                },
+            ],
+        );
+        let xml = export_zwo(&workout, 200);
+        assert_eq!(xml.matches("<SteadyState").count(), 3);
+        assert_eq!(xml.matches("<FreeRide").count(), 4);
+        let reimported = import_zwo(&xml).unwrap();
+        assert_eq!(reimported.compile(200), workout.compile(200));
+    }
+
+    #[test]
     fn escapes_names_when_exporting() {
         let workout = Workout::new(
             "Threshold & chill",

@@ -25,13 +25,15 @@ export function SourceSelect({
       <select
         aria-label={label}
         value={value}
-        onChange={(event) =>
-          onChange(
-            event.target.value === "auto"
-              ? { mode: "auto" }
-              : { mode: "role", role: event.target.value as DeviceRole },
-          )
-        }
+        onChange={(event) => {
+          if (event.target.value === "auto") {
+            onChange({ mode: "auto" });
+            return;
+          }
+          // Resolve the option back to one of this metric's roles instead of trusting the raw string.
+          const role = metricRoles[metric].find((candidate) => candidate === event.target.value);
+          if (role) onChange({ mode: "role", role });
+        }}
       >
         <option value="auto">{autoLabel}</option>
         {metricRoles[metric].map((role) => (

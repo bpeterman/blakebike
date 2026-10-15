@@ -154,6 +154,139 @@ describe("WorkoutEditor", () => {
     ]);
   });
 
+  describe("repeat blocks", () => {
+    const intervals: Workout = {
+      ...workout,
+      steps: [
+        steady(600, 55),
+        { kind: "repeat", repetitions: 3, steps: [steady(120, 110), steady(60, 50)] },
+        steady(300, 50),
+      ],
+    };
+    const group = (container: HTMLElement) => container.querySelector<HTMLElement>(".repeat-group")!;
+    const childRows = (container: HTMLElement) =>
+      [...group(container).querySelectorAll<HTMLDivElement>(".repeat-children .step-editor")];
+    const save = () => fireEvent.click(screen.getByRole("button", { name: "Save workout" }));
+
+    it("edits an existing repeat's count and children and previews every iteration", () => {
+      const { container, save: onSave } = renderEditor(intervals);
+      expect(blocks(container)).toHaveLength(1 + 3 * 2 + 1);
+      expect(within(group(container)).getByText("3 × 3:00 = 9:00")).toBeInTheDocument();
+
+      fireEvent.change(screen.getByLabelText("Repeats"), { target: { value: "5" } });
+      expect(blocks(container)).toHaveLength(1 + 5 * 2 + 1);
+      expect(container.querySelector("[data-repeat='1'] text")).toHaveTextContent("5×");
+
+      const [work] = childRows(container);
+      fireEvent.change(within(work).getByLabelText("Duration (sec)"), { target: { value: "90" } });
+      fireEvent.click(screen.getByRole("button", { name: "Add ramp to repeat 2" }));
+      expect(blocks(container)).toHaveLength(1 + 5 * 3 + 1);
+      expect(blocks(container).filter((block) => block.dataset.path === "1.2")).toHaveLength(5);
+
+      save();
+      expect(onSave.mock.calls[0][0].steps).toEqual([
+        steady(600, 55),
+        {
+          kind: "repeat",
+          repetitions: 5,
+          steps: [
+            steady(90, 110),
+            steady(60, 50),
+            {
+              kind: "ramp",
+              durationSeconds: 300,
+              start: { unit: "percentFtp", value: 50 },
+              end: { unit: "percentFtp", value: 90 },
+            },
+          ],
+        },
+        steady(300, 50),
+      ]);
+    });
+
+    it("reorders and removes children while keeping each row's identity and draft", () => {
+      const { container, save: onSave } = renderEditor(intervals);
+      const [workId, restId] = childRows(container).map((row) => row.dataset.rowId);
+      fireEvent.click(screen.getByRole("button", { name: "Move block 2.2 up" }));
+      expect(childRows(container).map((row) => row.dataset.rowId)).toEqual([restId, workId]);
+      expect(within(childRows(container)[0]).getByLabelText("Power (% FTP)")).toHaveValue(50);
+      expect(blocks(container)[1].dataset.path).toBe("1.0");
+
+      fireEvent.click(screen.getByRole("button", { name: "Remove block 2.1" }));
+      expect(childRows(container).map((row) => row.dataset.rowId)).toEqual([workId]);
+      expect(within(childRows(container)[0]).getByLabelText("Power (% FTP)")).toHaveValue(110);
+
+      // Moving the last child down steps it out of the repeat.
+      fireEvent.click(screen.getByRole("button", { name: "Move block 2.1 down" }));
+      expect(screen.getByText("This repeat is empty. Add a step or remove it.")).toBeInTheDocument();
+      expect(screen.getByRole("status")).toHaveTextContent("Repeat 2 needs at least one step");
+      expect(screen.getByRole("button", { name: "Save workout" })).toBeDisabled();
+      fireEvent.click(screen.getByRole("button", { name: "Remove block 2" }));
+      save();
+      expect(onSave.mock.calls[0][0].steps).toEqual([steady(600, 55), steady(120, 110), steady(300, 50)]);
+    });
+
+    it("adds a work/recovery repeat from the block bar", () => {
+      const { container, save: onSave } = renderEditor();
+      fireEvent.click(screen.getByRole("button", { name: "Repeat" }));
+      expect(blocks(container)).toHaveLength(2 + 4 * 2);
+      save();
+      expect(onSave.mock.calls[0][0].steps[2]).toEqual({
+        kind: "repeat",
+        repetitions: 4,
+        steps: [steady(60, 110), steady(60, 55)],
+      });
+    });
+
+    it("turns a step or a selection of neighbouring steps into a repeat, and back", () => {
+      const { container, save: onSave } = renderEditor({ ...workout, steps: [steady(300, 75), steady(60, 120), steady(60, 50)] });
+      const ids = rows(container).map((row) => row.dataset.rowId);
+
+      fireEvent.click(screen.getByLabelText("Select block 1"));
+      fireEvent.click(screen.getByLabelText("Select block 3"));
+      expect(screen.getByRole("button", { name: "Repeat 2 selected" })).toBeDisabled();
+      fireEvent.click(screen.getByLabelText("Select block 1"));
+      fireEvent.click(screen.getByLabelText("Select block 2"));
+      fireEvent.click(screen.getByRole("button", { name: "Repeat 2 selected" }));
+      expect(screen.queryByRole("button", { name: /selected/ })).not.toBeInTheDocument();
+      expect(childRows(container).map((row) => row.dataset.rowId)).toEqual([ids[1], ids[2]]);
+      expect(blocks(container)).toHaveLength(1 + 2 * 2);
+
+      fireEvent.click(screen.getByRole("button", { name: "Repeat block 1" }));
+      save();
+      expect(onSave.mock.calls[0][0].steps).toEqual([
+        { kind: "repeat", repetitions: 2, steps: [steady(300, 75)] },
+        { kind: "repeat", repetitions: 2, steps: [steady(60, 120), steady(60, 50)] },
+      ]);
+
+      fireEvent.click(screen.getByRole("button", { name: "Ungroup block 2" }));
+      expect(rows(container).map((row) => row.dataset.rowId).slice(-2)).toEqual([ids[1], ids[2]]);
+    });
+
+    it("links nested rows and expanded blocks in both directions", () => {
+      const { container } = renderEditor(intervals);
+      const highlighted = () =>
+        blocks(container).flatMap((block) => (block.dataset.highlighted ? [block.dataset.path] : []));
+      fireEvent.mouseEnter(container.querySelector(".repeat-header")!);
+      expect(highlighted()).toEqual(["1.0", "1.1", "1.0", "1.1", "1.0", "1.1"]);
+      fireEvent.mouseEnter(childRows(container)[1]);
+      expect(highlighted()).toEqual(["1.1", "1.1", "1.1"]);
+
+      fireEvent.mouseEnter(blocks(container)[3]);
+      expect(childRows(container)[0]).toHaveAttribute("data-highlighted", "true");
+      expect(container.querySelector(".repeat-header")).not.toHaveAttribute("data-highlighted");
+      fireEvent.click(blocks(container)[4]);
+      expect(document.activeElement).toBe(within(childRows(container)[1]).getByLabelText("Duration (sec)"));
+    });
+
+    it("explains an out-of-range repeat count instead of saving it", () => {
+      renderEditor(intervals);
+      fireEvent.change(screen.getByLabelText("Repeats"), { target: { value: "25" } });
+      expect(screen.getByRole("status")).toHaveTextContent("Repeat 2 must run between 2 and 20 times");
+      expect(screen.getByRole("button", { name: "Save workout" })).toBeDisabled();
+    });
+  });
+
   it("only allows saving a named workout with at least one block", () => {
     const { container } = renderEditor({ ...workout, steps: [] });
     expect(screen.getByRole("button", { name: "Save workout" })).toBeDisabled();
