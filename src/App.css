@@ -7,6 +7,10 @@
   background: #10120f;
   color-scheme: dark;
   font-synthesis: none;
+  /* Dropdown chevrons for every <select>; a data URI can't follow currentColor, so each tint is its own image. */
+  --select-chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%238d9787' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  --select-chevron-hover: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%23dce5d3' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  --select-chevron-accent: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%23c8ff32' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
 }
@@ -246,9 +250,9 @@ p { color: #8d9587; font-size: 13px; }
 .metric-control { margin-left: auto; }
 .metric-control-group { display: grid; gap: 7px; }
 .smoothing-select, .source-choice-select { display: block; }
-.smoothing-select select, .live-metric .source-choice-select select { width: 100%; height: 24px; padding: 0 22px 0 8px; border: 1px solid #2d322b; border-radius: 6px; color: #9aa394; background: #131612 url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%23768071' stroke-width='1.5'/%3E%3C/svg%3E") no-repeat right 7px center; font-size: 9px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; appearance: none; -webkit-appearance: none; cursor: pointer; }
-.smoothing-select select:focus, .live-metric .source-choice-select select:focus { border-color: #718d2c; }
-.live-metric.accent .smoothing-select select, .live-metric.accent .source-choice-select select { border-color: #566d26; color: #c8ff32; }
+.smoothing-select select, .live-metric .source-choice-select select { height: 24px; padding: 0 22px 0 8px; border-color: #2d322b; border-radius: 6px; color: #9aa394; background-position: right 7px center; font-size: 9px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
+.live-metric.accent .smoothing-select select, .live-metric.accent .source-choice-select select { --select-chevron: var(--select-chevron-accent); border-color: #566d26; color: #c8ff32; }
+.live-metric.accent .smoothing-select select:not(:disabled):hover, .live-metric.accent .source-choice-select select:not(:disabled):hover { border-color: #8fb52f; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 .progress-meta { display: flex; align-items: center; gap: 12px; color: #7d8578; font-size: 11px; }
 .progress { height: 5px; flex: 1; overflow: hidden; border-radius: 8px; background: #30352e; }
@@ -277,8 +281,16 @@ p { color: #8d9587; font-size: 13px; }
 .settings-card form { display: grid; gap: 14px; }
 .settings-card input, .settings-card select { height: 38px; }
 label { display: grid; gap: 6px; color: #858e80; font-size: 11px; font-weight: 650; }
-input, textarea, select { width: 100%; padding: 10px 11px; border: 1px solid #383e35; border-radius: 7px; outline: 0; color: #edf2e8; background: #131612; }
+input, textarea, select { width: 100%; padding: 10px 11px; border: 1px solid #383e35; border-radius: 7px; outline: 0; color: #edf2e8; background-color: #131612; }
 input:focus, textarea:focus { border-color: #718d2c; }
+/* Every select reads as a dropdown: the native control keeps its keyboard and picker behavior, with the platform arrow
+   swapped for one chevron. Component rules restyle size and colors but never the background shorthand or right padding
+   below their chevron, so the label never runs under it. */
+select { padding-right: 30px; background-image: var(--select-chevron); background-repeat: no-repeat; background-position: right 11px center; background-size: 10px 6px; appearance: none; -webkit-appearance: none; cursor: pointer; transition: border-color .12s, color .12s; }
+select:not(:disabled):hover { --select-chevron: var(--select-chevron-hover); border-color: #566d26; color: #edf2e8; }
+select:not(:disabled):focus { border-color: #718d2c; }
+select:focus-visible { box-shadow: 0 0 0 2px rgba(200, 255, 50, .25); }
+select:disabled { cursor: not-allowed; opacity: .5; }
 textarea { min-height: 70px; resize: vertical; }
 .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .settings-card .primary { justify-self: start; }
@@ -301,8 +313,7 @@ textarea { min-height: 70px; resize: vertical; }
 .ride-screen-add .secondary { min-height: 32px; padding: 0 12px; font-size: 11px; }
 .ride-slot-controls { display: flex; align-items: center; gap: 8px; flex: 1; flex-wrap: wrap; }
 .ride-slot-kind { min-width: 44px; color: #768071; font-size: 9px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
-.ride-slot-controls select { height: 30px; padding: 0 8px; border: 1px solid #2d322b; border-radius: 7px; color: #dce5d3; background: #191c18; font-size: 12px; }
-.ride-slot-controls select:disabled { opacity: .5; }
+.ride-slot-controls select { height: 30px; padding: 0 26px 0 8px; border-color: #2d322b; color: #dce5d3; background-color: #191c18; background-position: right 9px center; font-size: 12px; }
 .ride-card-order { display: flex; gap: 4px; }
 .ride-card-order .icon-button { width: 32px; height: 30px; }
 .ride-card-order .icon-button:disabled { opacity: .28; cursor: default; }
@@ -569,7 +580,7 @@ textarea { min-height: 70px; resize: vertical; }
 .source-row { display: grid; grid-template-columns: 90px 1fr auto; align-items: center; gap: 12px; }
 .source-metric { color: #d7ddd2; font-size: 12px; font-weight: 700; }
 .source-row .source-choice-select, .source-row select { width: 100%; }
-.source-row select { padding: 9px 10px; }
+.source-row select { padding: 9px 30px 9px 10px; }
 .source-active { color: #c8ff32; font-size: 11px; white-space: nowrap; }
 .source-active.fallback { color: #e6c36a; }
 .source-active.none { color: #687061; }
