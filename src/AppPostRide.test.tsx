@@ -13,6 +13,8 @@ const running: RunnerState = {
   sessionId: "session",
   workoutName: "Threshold",
   elapsedSeconds: 60,
+  movingSeconds: 60,
+  wallClockSeconds: 60,
   totalSeconds: 60,
   intervalIndex: 0,
   intervalElapsedSeconds: 60,

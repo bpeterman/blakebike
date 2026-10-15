@@ -357,6 +357,23 @@ pub struct SessionSummary {
     pub recording_warning: Option<String>,
 }
 
+impl SessionSummary {
+    /// How long the ride took on the wall clock, start to end with pauses
+    /// included; `None` while it is still open. `elapsed_seconds` is the time
+    /// actually ridden, so this is never less than that: the two come from
+    /// separate clocks, and a second's disagreement must not make a ride look
+    /// shorter than it was ridden.
+    pub fn wall_clock_seconds(&self) -> Option<u32> {
+        let ended_at = self.ended_at?;
+        let seconds = (ended_at - self.started_at).num_seconds().max(0);
+        Some(
+            u32::try_from(seconds)
+                .unwrap_or(u32::MAX)
+                .max(self.elapsed_seconds),
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DistanceSource {
@@ -392,6 +409,34 @@ mod tests {
         assert_eq!(intervals.len(), 2);
         assert_eq!(intervals[0].start_watts, Some(240));
         assert_eq!(workout.duration_seconds(), 60);
+    }
+
+    #[test]
+    fn wall_clock_spans_start_to_end_and_never_undercuts_riding_time() {
+        let started_at = DateTime::parse_from_rfc3339("2026-10-14T07:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut summary = SessionSummary {
+            id: Uuid::nil(),
+            workout_id: None,
+            workout_name: "Ride".into(),
+            started_at,
+            ended_at: None,
+            elapsed_seconds: 600,
+            average_power_watts: 0,
+            max_power_watts: 0,
+            average_cadence_rpm: None,
+            estimated_distance_meters: 0.0,
+            distance_source: None,
+            distance_weight_kg: 84.0,
+            completed: true,
+            recording_warning: None,
+        };
+        assert_eq!(summary.wall_clock_seconds(), None);
+        summary.ended_at = Some(started_at + chrono::Duration::seconds(900));
+        assert_eq!(summary.wall_clock_seconds(), Some(900));
+        summary.ended_at = Some(started_at + chrono::Duration::seconds(599));
+        assert_eq!(summary.wall_clock_seconds(), Some(600));
     }
 
     #[test]

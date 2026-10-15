@@ -99,7 +99,15 @@ pub enum RunnerState {
     Running {
         session_id: Uuid,
         workout_name: String,
+        /// Where the ride is in the workout: riding time plus any skipped
+        /// intervals. Interval progress and time remaining count from this.
         elapsed_seconds: u32,
+        /// Time actually ridden: pauses and skipped intervals left out.
+        #[serde(default)]
+        moving_seconds: u32,
+        /// Time since the ride started, pauses included.
+        #[serde(default)]
+        wall_clock_seconds: u32,
         total_seconds: Option<u32>,
         interval_index: usize,
         interval_elapsed_seconds: u32,
@@ -128,6 +136,10 @@ pub enum RunnerState {
         session_id: Uuid,
         workout_name: String,
         elapsed_seconds: u32,
+        #[serde(default)]
+        moving_seconds: u32,
+        #[serde(default)]
+        wall_clock_seconds: u32,
         total_seconds: Option<u32>,
         interval_index: usize,
         interval_elapsed_seconds: u32,
@@ -160,7 +172,8 @@ pub enum RunnerState {
 /// Running totals kept by the timeline and folded into the session summary.
 #[derive(Debug, Default, Clone, Copy)]
 struct RideStats {
-    elapsed: u32,
+    /// Time actually ridden: pauses and skipped intervals are not in it.
+    moving_seconds: u32,
     power_total: u64,
     max_power: u16,
     cadence_total: f64,
@@ -180,7 +193,7 @@ impl RideStats {
     }
 
     fn apply(&self, summary: &mut SessionSummary) {
-        summary.elapsed_seconds = self.elapsed;
+        summary.elapsed_seconds = self.moving_seconds;
         summary.average_power_watts = if self.samples == 0 {
             0
         } else {
@@ -853,8 +866,12 @@ impl WorkoutRunner {
     }
 }
 
-/// Riding time on a monotonic clock: wall time minus pauses, plus whatever
-/// skipped intervals jumped over.
+/// The ride's three clocks, all on one monotonic start so they cannot drift
+/// apart:
+/// - **wall clock**: time since the ride started, pauses included;
+/// - **moving**: wall clock minus pauses, the time actually ridden;
+/// - **position**: moving plus whatever skipped intervals jumped over, which
+///   is where the ride is in the workout.
 #[derive(Debug, Clone, Copy)]
 struct RideClock {
     started: Instant,
@@ -893,19 +910,38 @@ impl RideClock {
         self.skipped += remainder;
     }
 
-    fn elapsed(&self, now: Instant) -> Duration {
+    fn wall_clock(&self, now: Instant) -> Duration {
+        now.saturating_duration_since(self.started)
+    }
+
+    fn moving(&self, now: Instant) -> Duration {
         let paused = self.paused_total
             + self
                 .pause_started
                 .map_or(Duration::ZERO, |at| now.saturating_duration_since(at));
-        now.saturating_duration_since(self.started)
-            .saturating_sub(paused)
-            + self.skipped
+        self.wall_clock(now).saturating_sub(paused)
     }
 
-    fn elapsed_seconds(&self, now: Instant) -> u64 {
-        self.elapsed(now).as_secs()
+    fn position(&self, now: Instant) -> Duration {
+        self.moving(now) + self.skipped
     }
+
+    /// All three clocks, read at one instant, in whole seconds.
+    fn read(&self, now: Instant) -> ClockReading {
+        ClockReading {
+            position: self.position(now).as_secs(),
+            moving: self.moving(now).as_secs() as u32,
+            wall_clock: self.wall_clock(now).as_secs() as u32,
+        }
+    }
+}
+
+/// One reading of [`RideClock`], in whole seconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClockReading {
+    position: u64,
+    moving: u32,
+    wall_clock: u32,
 }
 
 /// Everything the timeline needs for one ride.
@@ -981,7 +1017,7 @@ async fn run_timeline(ride: &mut Ride, stats: &mut RideStats) -> bool {
         let now = Instant::now();
         match controls.control.load(Ordering::Relaxed) {
             STOPPED => {
-                stats.elapsed = clock.elapsed_seconds(now) as u32;
+                stats.moving_seconds = clock.read(now).moving;
                 // A stopped free ride still counts as completed: it has no end.
                 return ride.standalone || ride.workout_complete;
             }
@@ -991,12 +1027,12 @@ async fn run_timeline(ride: &mut Ride, stats: &mut RideStats) -> bool {
                     controls.set_phase(Phase::Paused);
                     tracing::info!("Ride clock paused");
                 }
-                let elapsed = clock.elapsed_seconds(now);
-                stats.elapsed = elapsed as u32;
+                let reading = clock.read(now);
+                stats.moving_seconds = reading.moving;
                 publish(
                     ride,
                     true,
-                    elapsed,
+                    reading,
                     interval_index,
                     interval_start,
                     current_target,
@@ -1017,7 +1053,7 @@ async fn run_timeline(ride: &mut Ride, stats: &mut RideStats) -> bool {
                 // A skip that raced the end of the workout has nothing left to
                 // skip; the open free-ride tail must not jump the clock.
                 if !ride.workout_complete {
-                    let elapsed = clock.elapsed_seconds(now);
+                    let elapsed = clock.read(now).position;
                     let end =
                         interval_start + u64::from(ride.intervals[interval_index].duration_seconds);
                     clock.skip(Duration::from_secs(end.saturating_sub(elapsed)));
@@ -1032,8 +1068,9 @@ async fn run_timeline(ride: &mut Ride, stats: &mut RideStats) -> bool {
             tracing::info!("Ride clock resumed");
         }
 
-        let elapsed = clock.elapsed_seconds(now);
-        stats.elapsed = elapsed as u32;
+        let reading = clock.read(now);
+        stats.moving_seconds = reading.moving;
+        let elapsed = reading.position;
         // Advance through every interval that has ended; a skip or a long
         // stall can cross several short ones at once.
         loop {
@@ -1086,7 +1123,7 @@ async fn run_timeline(ride: &mut Ride, stats: &mut RideStats) -> bool {
         publish(
             ride,
             false,
-            elapsed,
+            reading,
             interval_index,
             interval_start,
             target,
@@ -1144,14 +1181,14 @@ fn enter_interval(ride: &Ride, index: usize, elapsed: u64, free_ride_watts: u16)
 async fn publish(
     ride: &Ride,
     paused: bool,
-    elapsed: u64,
+    clock: ClockReading,
     interval_index: usize,
     interval_start: u64,
     target: Option<u16>,
     distance_meters: f64,
 ) {
     let interval = &ride.intervals[interval_index];
-    let interval_elapsed = elapsed.saturating_sub(interval_start) as u32;
+    let interval_elapsed = clock.position.saturating_sub(interval_start) as u32;
     let planned = if interval.free_ride {
         None
     } else {
@@ -1162,7 +1199,9 @@ async fn publish(
         RunnerState::Paused {
             session_id: ride.session_id,
             workout_name: ride.name.clone(),
-            elapsed_seconds: elapsed as u32,
+            elapsed_seconds: clock.position as u32,
+            moving_seconds: clock.moving,
+            wall_clock_seconds: clock.wall_clock,
             total_seconds: ride.total_seconds,
             interval_index,
             interval_elapsed_seconds: interval_elapsed,
@@ -1180,7 +1219,9 @@ async fn publish(
         RunnerState::Running {
             session_id: ride.session_id,
             workout_name: ride.name.clone(),
-            elapsed_seconds: elapsed as u32,
+            elapsed_seconds: clock.position as u32,
+            moving_seconds: clock.moving,
+            wall_clock_seconds: clock.wall_clock,
             total_seconds: ride.total_seconds,
             interval_index,
             interval_elapsed_seconds: interval_elapsed,
@@ -1774,6 +1815,8 @@ mod tests {
             session_id: Uuid::nil(),
             workout_name: "Free Ride".into(),
             elapsed_seconds: 12,
+            moving_seconds: 12,
+            wall_clock_seconds: 20,
             total_seconds: None,
             interval_index: 0,
             interval_elapsed_seconds: 12,
@@ -1793,6 +1836,8 @@ mod tests {
         assert_eq!(json["targetPowerWatts"], 100);
         assert_eq!(json["manualErg"], true);
         assert_eq!(json["distanceMeters"], 1234.5);
+        assert_eq!(json["movingSeconds"], 12);
+        assert_eq!(json["wallClockSeconds"], 20);
         assert_eq!(json["biasPercent"], 100);
         assert_eq!(json["overrideActive"], false);
         assert_eq!(json["workoutComplete"], true);
@@ -1807,6 +1852,8 @@ mod tests {
             session_id: Uuid::nil(),
             workout_name: "Intervals".into(),
             elapsed_seconds: 75,
+            moving_seconds: 75,
+            wall_clock_seconds: 135,
             total_seconds: Some(300),
             interval_index: 1,
             interval_elapsed_seconds: 15,
@@ -1824,6 +1871,7 @@ mod tests {
 
         assert_eq!(json["intervalIndex"], 1);
         assert_eq!(json["intervalElapsedSeconds"], 15);
+        assert_eq!(json["wallClockSeconds"], 135);
         assert_eq!(json["control"], "ok");
     }
 
@@ -1879,26 +1927,32 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn ride_clock_excludes_pauses_and_jumps_on_skip() {
-        let start = Instant::now();
-        let mut clock = RideClock::new(start);
+    async fn ride_clock_separates_moving_wall_clock_and_workout_position() {
+        let reading = |position, moving, wall_clock| ClockReading {
+            position,
+            moving,
+            wall_clock,
+        };
+        let mut clock = RideClock::new(Instant::now());
         tokio::time::advance(Duration::from_secs(10)).await;
-        assert_eq!(clock.elapsed_seconds(Instant::now()), 10);
+        assert_eq!(clock.read(Instant::now()), reading(10, 10, 10));
+        // A pause stops riding time and the workout, not the wall clock.
         clock.pause(Instant::now());
         tokio::time::advance(Duration::from_secs(30)).await;
         assert!(clock.is_paused());
-        assert_eq!(clock.elapsed_seconds(Instant::now()), 10);
+        assert_eq!(clock.read(Instant::now()), reading(10, 10, 40));
         clock.resume(Instant::now());
         tokio::time::advance(Duration::from_secs(5)).await;
-        assert_eq!(clock.elapsed_seconds(Instant::now()), 15);
+        assert_eq!(clock.read(Instant::now()), reading(15, 15, 45));
+        // A skip moves the workout on; nobody rode that time.
         clock.skip(Duration::from_secs(45));
-        assert_eq!(clock.elapsed_seconds(Instant::now()), 60);
+        assert_eq!(clock.read(Instant::now()), reading(60, 15, 45));
         // Pausing twice or resuming twice is harmless.
         clock.pause(Instant::now());
         clock.pause(Instant::now());
         clock.resume(Instant::now());
         clock.resume(Instant::now());
-        assert_eq!(clock.elapsed_seconds(Instant::now()), 60);
+        assert_eq!(clock.read(Instant::now()), reading(60, 15, 45));
     }
 
     // ---- ride integration tests on the simulated trainer ------------------
@@ -2277,6 +2331,8 @@ mod tests {
         .await;
         let RunnerState::Paused {
             elapsed_seconds: at_pause,
+            moving_seconds: moving_at_pause,
+            wall_clock_seconds: wall_at_pause,
             ..
         } = paused
         else {
@@ -2284,8 +2340,16 @@ mod tests {
         };
         tokio::time::sleep(Duration::from_secs(5)).await;
         let still = rig.runner.state().await;
+        // Riding time holds; the wall clock keeps counting through the pause.
         assert!(
-            matches!(still, RunnerState::Paused { elapsed_seconds, .. } if elapsed_seconds == at_pause)
+            matches!(
+                still,
+                RunnerState::Paused { elapsed_seconds, moving_seconds, wall_clock_seconds, .. }
+                    if elapsed_seconds == at_pause
+                        && moving_seconds == moving_at_pause
+                        && wall_clock_seconds >= wall_at_pause + 4
+            ),
+            "{still:?}"
         );
         rig.runner.pause_or_resume().await.unwrap();
         rig.runner.stop().await.unwrap();
@@ -2351,6 +2415,17 @@ mod tests {
             ),
             "{second:?}"
         );
+        // The skipped block was never ridden, so it is not riding time.
+        let RunnerState::Running {
+            moving_seconds,
+            wall_clock_seconds,
+            ..
+        } = second
+        else {
+            panic!("{second:?}");
+        };
+        assert!(moving_seconds < 10, "{second:?}");
+        assert!(moving_seconds <= wall_clock_seconds, "{second:?}");
         // Skipping the last block runs the workout out into its free ride.
         rig.runner.skip().unwrap();
         wait_for(&rig.runner, |state| {
@@ -2372,7 +2447,7 @@ mod tests {
         assert!(rig.runner.skip().is_err(), "nothing is left to skip");
         assert_eq!(set_target_writes(&rig.hub), vec![120, 180, 100]);
         rig.runner.stop().await.unwrap();
-        wait_for(&rig.runner, |state| {
+        let finished = wait_for(&rig.runner, |state| {
             matches!(
                 state,
                 RunnerState::Finished {
@@ -2382,6 +2457,11 @@ mod tests {
             )
         })
         .await;
+        let RunnerState::Finished { session_id, .. } = finished else {
+            panic!("{finished:?}");
+        };
+        let saved = rig.storage.session(session_id).unwrap().unwrap().summary;
+        assert!(saved.elapsed_seconds < 10, "{saved:?}");
         rig.hub.disconnect().await;
     }
 

@@ -19,9 +19,18 @@ Conventions:
 
 ## [Unreleased]
 
+### Added
+
+- A **Total time** ride field that keeps counting through pauses, beside **Elapsed**, which counts only the time you ride. Add it in Settings → Ride screens under Time → Whole ride → Total (with pauses). Ride detail shows both too.
+
 ### Changed
 
 - Reaching the end of a structured workout no longer ends the ride. The same ride keeps recording as a free ride in manual ERG (held at your last target, or eased down to 100 W if the workout ended harder than that), the ride screen says **Workout complete · free riding**, and you end it with **End** when you're done. The saved ride and its FIT file include the extra riding, and the ride still counts as completed.
+
+### Fixed
+
+- FIT files now report pauses the way Garmin and Intervals.icu expect: timer time leaves pauses out, and elapsed time is the wall clock from start to finish. Before, both were set to the time ridden.
+- Skipping a workout block no longer counts the skipped time as time ridden, in Elapsed, the saved ride, or its FIT file.
 
 ## [0.5.2] - 2026-10-15
 

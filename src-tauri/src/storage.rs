@@ -156,7 +156,7 @@ const RIDE_PANELS: [&str; 6] = [
 /// Every field a rider can put on a screen, as `metric:scope:aggregate`.
 /// Mirrors the table built in `src/rideFields.ts`; a field missing from here
 /// is dropped on load, so the two lists have to agree.
-const RIDE_FIELDS: [&str; 39] = [
+const RIDE_FIELDS: [&str; 40] = [
     "power:ride:current",
     "power:ride:average",
     "power:ride:max",
@@ -191,6 +191,7 @@ const RIDE_FIELDS: [&str; 39] = [
     "calories:interval:total",
     "time:ride:total",
     "time:ride:remaining",
+    "time:ride:wallClock",
     "time:interval:total",
     "time:interval:remaining",
     "distance:ride:total",

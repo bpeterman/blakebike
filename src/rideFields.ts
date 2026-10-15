@@ -38,7 +38,11 @@ export type RideMetric =
 /** "interval" is the workout block being ridden — this app's version of a lap. */
 export type RideScope = "ride" | "interval";
 
-export type RideAggregate = "current" | "average" | "max" | "total" | "remaining";
+/**
+ * How a metric is read. For time, "total" is the time ridden and "wallClock"
+ * is the time since the ride started, pauses included.
+ */
+export type RideAggregate = "current" | "average" | "max" | "total" | "remaining" | "wallClock";
 
 export type RideField = {
   metric: RideMetric;
@@ -83,7 +87,12 @@ export type RideFieldContext = {
   intervalHistory: Telemetry[];
   /** Power as the ride screen shows it, after the rider's smoothing choice. */
   displayPowerWatts: number;
+  /** Where the ride is in the workout: riding time plus any skipped blocks. */
   elapsedSeconds: number;
+  /** Time actually ridden: pauses and skipped blocks left out. */
+  movingSeconds: number;
+  /** Time since the ride started, pauses included. */
+  wallClockSeconds: number;
   totalSeconds: number | null;
   intervalElapsedSeconds: number;
   /** Null on a free-ride block, which has no planned end. */
@@ -103,7 +112,16 @@ export type RideFieldValue = {
 
 type Resolver = (context: RideFieldContext) => Omit<RideFieldValue, "label"> | null;
 
-type Definition = { label: string; resolve: Resolver };
+type Definition = {
+  label: string;
+  /**
+   * What the editor calls this field among its metric's other aggregates,
+   * when the aggregate's own name would not say it (time "Total" is the time
+   * ridden, which riders know as elapsed).
+   */
+  choice?: string;
+  resolve: Resolver;
+};
 
 const MISSING = "—";
 
@@ -230,9 +248,15 @@ const timeDefinition = (scope: RideScope, aggregate: RideAggregate): Definition 
   const remaining = aggregate === "remaining";
   return {
     label: scope === "interval" ? (remaining ? "BLOCK LEFT" : "BLOCK TIME") : remaining ? "REMAINING" : "ELAPSED",
+    choice: remaining ? undefined : "Elapsed (riding)",
     resolve: (context) => {
+      if (!remaining) {
+        return {
+          value: formatDuration(scope === "interval" ? context.intervalElapsedSeconds : context.movingSeconds),
+        };
+      }
+      // Time left counts from where the workout is, so a skipped block is gone.
       const elapsed = scope === "interval" ? context.intervalElapsedSeconds : context.elapsedSeconds;
-      if (!remaining) return { value: formatDuration(elapsed) };
       const total = scope === "interval" ? context.intervalTotalSeconds : context.totalSeconds;
       // An open-ended ride (or a free-ride block) has no time left in it, so
       // the slot is dropped rather than shown empty.
@@ -269,6 +293,16 @@ for (const scope of ["ride", "interval"] as const) {
   define({ metric: "time", scope, aggregate: "total" }, timeDefinition(scope, "total"));
   define({ metric: "time", scope, aggregate: "remaining" }, timeDefinition(scope, "remaining"));
 }
+
+// The runner keeps one wall clock for the whole ride, not one per block.
+define(
+  { metric: "time", scope: "ride", aggregate: "wallClock" },
+  {
+    label: "TOTAL TIME",
+    choice: "Total (with pauses)",
+    resolve: (context) => ({ value: formatDuration(context.wallClockSeconds) }),
+  },
+);
 
 // Distance is estimated by the runner over the whole ride; it does not keep a
 // per-block total, so there is no block-scoped distance to offer.
@@ -335,6 +369,7 @@ export const rideAggregateLabels: Record<RideAggregate, string> = {
   max: "Maximum",
   total: "Total",
   remaining: "Remaining",
+  wallClock: "Wall clock",
 };
 
 /** Metrics that have at least one field, in the order the editor offers them. */
@@ -357,6 +392,10 @@ export const firstRideField = (metric: RideMetric): RideField =>
 
 export const isRideField = (field: RideField): boolean =>
   definitions.has(rideFieldKey(field));
+
+/** How the editor names a field among the aggregates its metric offers. */
+export const rideFieldChoiceLabel = (field: RideField): string =>
+  definitions.get(rideFieldKey(field))?.definition.choice ?? rideAggregateLabels[field.aggregate];
 
 /** The tile heading for a field, or null if the combination does not exist. */
 export const rideFieldLabel = (field: RideField): string | null =>

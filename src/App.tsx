@@ -112,6 +112,7 @@ import {
   powerSmoothingOptions,
   rideKeyAction,
   timeInZones,
+  sessionWallClockSeconds,
   withActiveElapsed,
   withSmoothedPower,
   workoutDuration,
@@ -1290,6 +1291,8 @@ export function Ride({
       ? rideable.find((workout) => workout.name === runner.workoutName)
       : undefined);
   const elapsed = runner.status === "running" || runner.status === "paused" ? runner.elapsedSeconds : 0;
+  const movingSeconds = runner.status === "running" || runner.status === "paused" ? runner.movingSeconds : 0;
+  const wallClockSeconds = runner.status === "running" || runner.status === "paused" ? runner.wallClockSeconds : 0;
   const total = runner.status === "running" || runner.status === "paused" ? runner.totalSeconds : selected ? workoutDuration(selected.steps) : 0;
   const progress = total ? Math.min(100, (elapsed / total) * 100) : 0;
   const riding = runner.status === "running" || runner.status === "paused";
@@ -1320,8 +1323,9 @@ export function Ride({
     [telemetryHistory, powerSmoothing],
   );
   const chartHistory = useMemo(
-    () => downsampleTelemetry(withActiveElapsed(smoothedHistory, elapsed)),
-    [elapsed, smoothedHistory],
+    // The time axis is riding time, the same one the saved ride's chart uses.
+    () => downsampleTelemetry(withActiveElapsed(smoothedHistory, movingSeconds)),
+    [movingSeconds, smoothedHistory],
   );
   const powerZones = useMemo(
     () => effectivePowerZones(trainingZones, profile.ftpWatts),
@@ -1446,6 +1450,8 @@ export function Ride({
     intervalHistory,
     displayPowerWatts: displayedPower,
     elapsedSeconds: elapsed,
+    movingSeconds,
+    wallClockSeconds,
     totalSeconds: openEnded ? null : total === 0 ? null : total,
     intervalElapsedSeconds: riding ? runner.intervalElapsedSeconds : 0,
     intervalTotalSeconds,
@@ -1884,6 +1890,7 @@ export function RideDetailModal({ session, profile, trainingZones, onClose, onEx
     [session],
   );
   const samples = useMemo(() => downsampleTelemetry(activeSamples), [activeSamples]);
+  const wallClockSeconds = sessionWallClockSeconds(session.summary);
   const rangeSummary = useMemo(
     () => (range ? summarizeRange(activeSamples, range) : null),
     [activeSamples, range],
@@ -1919,7 +1926,8 @@ export function RideDetailModal({ session, profile, trainingZones, onClose, onEx
         </div>
         {session.summary.recordingWarning && <RecordingWarning message={session.summary.recordingWarning} />}
         <div className="detail-metrics">
-          <Metric value={formatDuration(session.summary.elapsedSeconds)} unit="duration" />
+          <Metric value={formatDuration(session.summary.elapsedSeconds)} unit="moving time" />
+          {wallClockSeconds !== null && <Metric value={formatDuration(wallClockSeconds)} unit="total time" />}
           <Metric value={`${session.summary.averagePowerWatts}`} unit="W average" />
           <Metric value={`${session.summary.maxPowerWatts}`} unit="W maximum" />
           <Metric value={`${Math.round(session.summary.averageCadenceRpm ?? 0)}`} unit="rpm average" />
