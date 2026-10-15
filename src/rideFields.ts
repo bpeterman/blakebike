@@ -27,11 +27,13 @@ export type RideMetric =
   | "heartRate"
   | "speed"
   | "wattsPerKilogram"
+  | "ftpPercent"
   | "distance"
   | "energy"
   | "calories"
   | "time"
-  | "targetPower";
+  | "targetPower"
+  | "targetFtpPercent";
 
 /** "interval" is the workout block being ridden — this app's version of a lap. */
 export type RideScope = "ride" | "interval";
@@ -128,6 +130,30 @@ type SampledMetric = {
 
 const whole = (unit: string) => (value: number) => ({ value: String(Math.round(value)), unit });
 
+/**
+ * Power divided by something about the rider, read through the same smoothing
+ * and averaging as the watts it comes from. A divisor that is not set yet (no
+ * FTP, no weight) reads as missing rather than as infinity.
+ */
+const relativePower = (
+  metric: RideMetric,
+  label: string,
+  divisor: (profile: Profile) => number,
+  format: SampledMetric["format"],
+): SampledMetric => {
+  const relative = (watts: number, context: RideFieldContext): number | null => {
+    const by = divisor(context.profile);
+    return by > 0 ? watts / by : null;
+  };
+  return {
+    metric,
+    label,
+    live: (context) => relative(context.displayPowerWatts, context),
+    sample: (sample, context) => relative(sample.powerWatts, context),
+    format,
+  };
+};
+
 const sampledMetrics: SampledMetric[] = [
   {
     metric: "power",
@@ -157,14 +183,14 @@ const sampledMetrics: SampledMetric[] = [
     sample: (sample) => sample.speedKph,
     format: (value, context) => formatSpeed(value, context.profile.distanceUnit),
   },
-  {
-    metric: "wattsPerKilogram",
-    label: "W/KG",
+  relativePower(
+    "wattsPerKilogram",
+    "W/KG",
     // Rider weight alone: the bike is not what the rider is lifting up a climb.
-    live: (context) => context.displayPowerWatts / context.profile.riderWeightKg,
-    sample: (sample, context) => sample.powerWatts / context.profile.riderWeightKg,
-    format: (value) => ({ value: value.toFixed(2), unit: "W/kg" }),
-  },
+    (profile) => profile.riderWeightKg,
+    (value) => ({ value: value.toFixed(2), unit: "W/kg" }),
+  ),
+  relativePower("ftpPercent", "% FTP", (profile) => profile.ftpWatts / 100, whole("%")),
 ];
 
 const sampledDefinition = (
@@ -215,10 +241,10 @@ const timeDefinition = (scope: RideScope, aggregate: RideAggregate): Definition 
   };
 };
 
-const definitions = new Map<string, Definition>();
+const definitions = new Map<string, { field: RideField; definition: Definition }>();
 
 const define = (field: RideField, definition: Definition) => {
-  definitions.set(rideFieldKey(field), definition);
+  definitions.set(rideFieldKey(field), { field, definition });
 };
 
 for (const metric of sampledMetrics) {
@@ -265,15 +291,22 @@ define(
   },
 );
 
+define(
+  { metric: "targetFtpPercent", scope: "ride", aggregate: "current" },
+  {
+    label: "TARGET % FTP",
+    resolve: (context) => {
+      if (context.targetPowerWatts === null) return { value: "Free" };
+      const ftp = context.profile.ftpWatts;
+      return ftp > 0
+        ? { value: String(Math.round((context.targetPowerWatts * 100) / ftp)), unit: "%" }
+        : { value: MISSING, unit: "%" };
+    },
+  },
+);
+
 /** Every field a rider can choose, in the order the editor offers them. */
-export const rideFields: RideField[] = [...definitions.keys()].map((key) => {
-  const [metric, scope, aggregate] = key.split(":");
-  return {
-    metric: metric as RideMetric,
-    scope: scope as RideScope,
-    aggregate: aggregate as RideAggregate,
-  };
-});
+export const rideFields: RideField[] = [...definitions.values()].map(({ field }) => field);
 
 /** Editor-facing names. The tile headings are upper-case; these are not. */
 export const rideMetricLabels: Record<RideMetric, string> = {
@@ -282,11 +315,13 @@ export const rideMetricLabels: Record<RideMetric, string> = {
   heartRate: "Heart rate",
   speed: "Speed",
   wattsPerKilogram: "Watts per kilogram",
+  ftpPercent: "Percent of FTP",
   distance: "Distance",
   energy: "Energy",
   calories: "Calories",
   time: "Time",
   targetPower: "Target power",
+  targetFtpPercent: "Target percent of FTP",
 };
 
 export const rideScopeLabels: Record<RideScope, string> = {
@@ -325,7 +360,7 @@ export const isRideField = (field: RideField): boolean =>
 
 /** The tile heading for a field, or null if the combination does not exist. */
 export const rideFieldLabel = (field: RideField): string | null =>
-  definitions.get(rideFieldKey(field))?.label ?? null;
+  definitions.get(rideFieldKey(field))?.definition.label ?? null;
 
 /**
  * The value to show for a field, or null when the field has nothing to say on
@@ -336,7 +371,7 @@ export const resolveRideField = (
   field: RideField,
   context: RideFieldContext,
 ): RideFieldValue | null => {
-  const definition = definitions.get(rideFieldKey(field));
+  const definition = definitions.get(rideFieldKey(field))?.definition;
   if (definition === undefined) return null;
   const resolved = definition.resolve(context);
   return resolved === null ? null : { label: definition.label, ...resolved };
