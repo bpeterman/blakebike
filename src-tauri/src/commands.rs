@@ -18,7 +18,7 @@ use crate::{
     domain::{PlannedWorkout, Profile, SessionDetail, SessionSummary, Workout},
     fit::ensure_ride_file,
     formats::{export_zwo, import_zwo},
-    intervals::{FtpSource, IntervalsClient, WeightSource, ZoneBoundaries},
+    intervals::{FtpSource, IntervalsClient, RiderProfile, WeightSource, ZoneBoundaries},
     intervals_sync::{self, IntervalsStatus, IntervalsSyncReport, TrainingFetch, resolve_athlete},
     runner::RunnerState,
     storage::{
@@ -49,6 +49,7 @@ pub struct TrainingSyncResult {
     /// `None` when Intervals.icu has no max HR; the local value is kept.
     pub max_heart_rate: Option<MaxHeartRateOutcome>,
     pub weight: WeightOutcome,
+    pub name: NameOutcome,
     pub power_zones: ZoneSetOutcome,
     pub heart_rate_zones: ZoneSetOutcome,
 }
@@ -88,6 +89,18 @@ pub enum WeightOutcome {
     /// The rider keeps their own weight.
     SyncOff,
     /// Intervals.icu has no usable weight; the local value is kept.
+    NotFound,
+}
+
+/// The rider name's fate in a training-settings sync.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "status", rename_all = "camelCase")]
+pub enum NameOutcome {
+    /// `profile.name` now holds the athlete's first name.
+    Synced { name: String, previous: String },
+    /// The rider keeps their own name.
+    SyncOff,
+    /// Intervals.icu has no first or full name; the local value is kept.
     NotFound,
 }
 
@@ -395,9 +408,10 @@ pub async fn planned_workouts(state: State<'_, AppState>) -> Result<Vec<PlannedW
     blocking(move || storage.planned_workouts()).await
 }
 
-/// Pull FTP, max HR, rider weight (unless the rider keeps their own) and
-/// (when the rider has asked for them) the power and heart-rate zones from
-/// Intervals.icu. If any request fails nothing is written.
+/// Pull FTP, max HR, the rider weight and first name (unless the rider keeps
+/// their own) and (when the rider has asked for them) the power and
+/// heart-rate zones from Intervals.icu. If any request fails nothing is
+/// written.
 #[tauri::command]
 pub async fn sync_training_settings(
     state: State<'_, AppState>,
@@ -427,6 +441,8 @@ pub async fn sync_training_settings(
         ftp_source = ?result.ftp.source,
         max_hr = result.profile.max_heart_rate_bpm,
         weight = ?result.weight,
+        // Whether the name changed, not the name itself.
+        name_synced = matches!(result.name, NameOutcome::Synced { .. }),
         power_zones = ?result.power_zones,
         heart_rate_zones = ?result.heart_rate_zones,
         "Synced training settings from Intervals.icu"
@@ -436,10 +452,10 @@ pub async fn sync_training_settings(
 
 /// Fold fetched training settings into the rider's profile and zones. Pure,
 /// so the rules are testable without a server: FTP and max HR always update,
-/// the weight when its sync is on, each zone set only when its toggle is on,
-/// and an imported set is marked `ZoneMode::Intervals` so a hand-edited
-/// (`Custom`) set stays recognizable. `settings` supplies the FTP source and
-/// the weight toggle.
+/// the weight and name when rider-profile sync is on, each zone set only when
+/// its toggle is on, and an imported set is marked `ZoneMode::Intervals` so a
+/// hand-edited (`Custom`) set stays recognizable. `settings` supplies the FTP
+/// source and the rider-profile toggle.
 fn apply_training_settings(
     mut profile: Profile,
     mut zones: TrainingZoneSettings,
@@ -449,7 +465,7 @@ fn apply_training_settings(
     let TrainingFetch {
         cycling,
         estimated_ftp,
-        weight,
+        rider,
     } = fetched;
     let ftp = cycling
         .resolve_ftp(settings.ftp_source, estimated_ftp)
@@ -467,18 +483,25 @@ fn apply_training_settings(
         profile.max_heart_rate_bpm = bpm;
         MaxHeartRateOutcome { bpm, previous_bpm }
     });
-    let weight = match weight {
-        _ if !settings.rider_weight => WeightOutcome::SyncOff,
-        None => WeightOutcome::NotFound,
-        Some(weight) => {
-            let previous_kg = profile.rider_weight_kg;
-            profile.rider_weight_kg = weight.kg;
-            WeightOutcome::Synced {
-                kg: weight.kg,
-                previous_kg,
-                source: weight.source,
-                date: weight.date,
-            }
+    // A rider profile fetched while the toggle is off is still not applied.
+    let (weight, name) = match rider.filter(|_| settings.rider_profile) {
+        None => (WeightOutcome::SyncOff, NameOutcome::SyncOff),
+        Some(RiderProfile { first_name, weight }) => {
+            let weight = weight.map_or(WeightOutcome::NotFound, |weight| {
+                let previous_kg = profile.rider_weight_kg;
+                profile.rider_weight_kg = weight.kg;
+                WeightOutcome::Synced {
+                    kg: weight.kg,
+                    previous_kg,
+                    source: weight.source,
+                    date: weight.date,
+                }
+            });
+            let name = first_name.map_or(NameOutcome::NotFound, |name| NameOutcome::Synced {
+                previous: std::mem::replace(&mut profile.name, name.clone()),
+                name,
+            });
+            (weight, name)
         }
     };
     let max_hr = profile.max_heart_rate_bpm;
@@ -516,6 +539,7 @@ fn apply_training_settings(
         ftp: ftp_outcome,
         max_heart_rate,
         weight,
+        name,
         power_zones,
         heart_rate_zones,
     })
@@ -583,12 +607,12 @@ mod training_sync_tests {
     use super::*;
     use crate::intervals::{CyclingSettings, RiderWeight};
 
-    /// Only the cycling settings fetched, no eFTP and no weight.
+    /// Only the cycling settings fetched, no eFTP and no rider profile.
     fn fetched(cycling: CyclingSettings) -> TrainingFetch {
         TrainingFetch {
             cycling,
             estimated_ftp: None,
-            weight: None,
+            rider: None,
         }
     }
 
@@ -724,8 +748,9 @@ mod training_sync_tests {
     }
 
     #[test]
-    fn syncs_the_rider_weight_unless_the_rider_keeps_their_own() {
+    fn syncs_the_rider_profile_unless_the_rider_keeps_their_own() {
         let profile = Profile {
+            name: "Rider".into(),
             rider_weight_kg: 75.0,
             ..Profile::default()
         };
@@ -734,18 +759,27 @@ mod training_sync_tests {
             source: WeightSource::Wellness,
             date: Some("2026-10-12".parse().unwrap()),
         };
-        let with_weight = |weight| TrainingFetch {
-            weight,
+        let with_rider = |first_name: Option<&str>, weight| TrainingFetch {
+            rider: Some(RiderProfile {
+                first_name: first_name.map(str::to_string),
+                weight,
+            }),
             ..fetched(settings())
         };
+        let apply = |fetched, settings| {
+            apply_training_settings(
+                profile.clone(),
+                TrainingZoneSettings::default(),
+                fetched,
+                settings,
+            )
+            .unwrap()
+        };
 
-        let result = apply_training_settings(
-            profile.clone(),
-            TrainingZoneSettings::default(),
-            with_weight(Some(logged)),
+        let result = apply(
+            with_rider(Some("Blake"), Some(logged)),
             IntervalsSyncSettings::default(),
-        )
-        .unwrap();
+        );
         assert_eq!(
             result.weight,
             WeightOutcome::Synced {
@@ -755,32 +789,35 @@ mod training_sync_tests {
                 date: logged.date,
             }
         );
+        assert_eq!(
+            result.name,
+            NameOutcome::Synced {
+                name: "Blake".into(),
+                previous: "Rider".into(),
+            }
+        );
         assert_eq!(result.profile.rider_weight_kg, 72.4);
+        assert_eq!(result.profile.name, "Blake");
 
-        // Intervals.icu has none: the local weight stays.
-        let result = apply_training_settings(
-            profile.clone(),
-            TrainingZoneSettings::default(),
-            with_weight(None),
-            IntervalsSyncSettings::default(),
-        )
-        .unwrap();
+        // Intervals.icu has neither: the local values stay.
+        let result = apply(with_rider(None, None), IntervalsSyncSettings::default());
         assert_eq!(result.weight, WeightOutcome::NotFound);
+        assert_eq!(result.name, NameOutcome::NotFound);
         assert_eq!(result.profile.rider_weight_kg, 75.0);
+        assert_eq!(result.profile.name, "Rider");
 
-        // Sync off: a weight fetched anyway is still not applied.
-        let result = apply_training_settings(
-            profile,
-            TrainingZoneSettings::default(),
-            with_weight(Some(logged)),
+        // Sync off: a profile fetched anyway is still not applied.
+        let result = apply(
+            with_rider(Some("Blake"), Some(logged)),
             IntervalsSyncSettings {
-                rider_weight: false,
+                rider_profile: false,
                 ..IntervalsSyncSettings::default()
             },
-        )
-        .unwrap();
+        );
         assert_eq!(result.weight, WeightOutcome::SyncOff);
+        assert_eq!(result.name, NameOutcome::SyncOff);
         assert_eq!(result.profile.rider_weight_kg, 75.0);
+        assert_eq!(result.profile.name, "Rider");
         // The FTP still syncs either way.
         assert_eq!(result.profile.ftp_watts, 280);
     }
@@ -921,7 +958,21 @@ mod training_sync_tests {
             serde_json::json!({ "status": "syncOff" })
         );
         assert_eq!(json["maxHeartRate"]["previousBpm"], 190);
-        assert_eq!(json["weight"], serde_json::json!({ "status": "notFound" }));
+        // No rider profile fetched: both are reported as off.
+        assert_eq!(json["weight"], serde_json::json!({ "status": "syncOff" }));
+        assert_eq!(json["name"], serde_json::json!({ "status": "syncOff" }));
+        assert_eq!(
+            serde_json::to_value(NameOutcome::Synced {
+                name: "Blake".into(),
+                previous: "Rider".into(),
+            })
+            .unwrap(),
+            serde_json::json!({ "status": "synced", "name": "Blake", "previous": "Rider" })
+        );
+        assert_eq!(
+            serde_json::to_value(NameOutcome::NotFound).unwrap(),
+            serde_json::json!({ "status": "notFound" })
+        );
 
         let synced = WeightOutcome::Synced {
             kg: 72.5,

@@ -2125,7 +2125,7 @@ export function SettingsPage({
         <div>
           <span className="label">INTERVALS.ICU</span>
           <h2>Intervals.icu</h2>
-          <p>Your planned workouts and workout library are mirrored here, read-only, and refreshed when blake.bike starts and whenever you press Sync now. Syncing training settings pulls your FTP and maximum heart rate from your cycling settings and, unless you turn it off, your weight; power and heart-rate zones are imported only when you turn them on in Training zones above.</p>
+          <p>Your planned workouts and workout library are mirrored here, read-only, and refreshed when blake.bike starts and whenever you press Sync now. Syncing training settings pulls your FTP and maximum heart rate from your cycling settings and, unless you turn it off, your weight and first name; power and heart-rate zones are imported only when you turn them on in Training zones above.</p>
           <span className={`integration-status ${intervalsConfigured ? "configured" : ""}`}>
             {!intervalsConfigured
               ? "API key not configured"
@@ -2182,12 +2182,12 @@ export function SettingsPage({
             <input
               type="checkbox"
               disabled={!intervalsConfigured || intervalsBusy !== null}
-              checked={intervalsStatus.settings.riderWeight}
-              onChange={(event) => void setMirrorSetting({ riderWeight: event.target.checked })}
+              checked={intervalsStatus.settings.riderProfile}
+              onChange={(event) => void setMirrorSetting({ riderProfile: event.target.checked })}
             />
             <span>
-              Sync rider weight
-              <small>Takes your newest Intervals.icu wellness weight from the last 90 days, the weight Intervals.icu uses for W/kg, or the weight in your Intervals.icu settings if you have not logged one. Turn this off to keep the weight you enter above.</small>
+              Sync rider profile (weight, name)
+              <small>Takes your newest Intervals.icu wellness weight from the last 90 days, the weight Intervals.icu uses for W/kg, or the weight in your Intervals.icu settings if you have not logged one, and your first name for the home-screen greeting. Turn this off to keep the weight and name you enter above.</small>
             </span>
           </label>
           <button

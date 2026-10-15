@@ -21,7 +21,7 @@ Conventions:
 
 ### Added
 
-- **Sync from Intervals.icu** now updates your rider weight too, which feeds the distance estimate and W/kg. It takes your newest Intervals.icu wellness weight from the last 90 days (the weight Intervals.icu itself uses for W/kg), or the weight in your Intervals.icu settings if you have not logged one. The result says which weight was used, from which day, and what it replaced. To keep the weight you enter by hand, turn off **Sync rider weight** in the Intervals.icu card.
+- **Sync from Intervals.icu** now updates your rider weight and first name too. The weight feeds the distance estimate and W/kg. It comes from your newest Intervals.icu wellness weight from the last 90 days (the weight Intervals.icu itself uses for W/kg), or from your Intervals.icu settings if you have not logged one. The name fills the home-screen greeting. The result says which weight was used, from which day, and what each value replaced. To keep the weight and name you enter by hand, turn off **Sync rider profile (weight, name)** in the Intervals.icu card.
 
 ## [0.5.2] - 2026-10-15
 

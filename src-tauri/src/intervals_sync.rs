@@ -16,7 +16,7 @@ use crate::{
     domain::{Workout, WorkoutOrigin},
     formats::import_zwo,
     intervals::{
-        CyclingSettings, FtpSource, IntervalsAthlete, IntervalsClient, IntervalsError, RiderWeight,
+        CyclingSettings, FtpSource, IntervalsAthlete, IntervalsClient, IntervalsError, RiderProfile,
     },
     storage::{IntervalsSyncSettings, Storage},
 };
@@ -143,15 +143,14 @@ pub struct TrainingFetch {
     pub cycling: CyclingSettings,
     /// The modeled eFTP; fetched only when it is the rider's FTP source.
     pub estimated_ftp: Option<u16>,
-    /// Fetched only when weight sync is on; `None` also when Intervals.icu
-    /// has no usable weight.
-    pub weight: Option<RiderWeight>,
+    /// The weight and first name; fetched only when rider-profile sync is on.
+    pub rider: Option<RiderProfile>,
 }
 
 /// Read what a training-settings sync needs, asking only for what the
 /// rider's settings use: the cycling settings always, the eFTP and the
-/// weight only when wanted. Any failed request fails the whole fetch, so a
-/// sync never writes half a result. `today` is the rider's local date.
+/// rider profile only when wanted. Any failed request fails the whole fetch,
+/// so a sync never writes half a result. `today` is the rider's local date.
 pub async fn fetch_training_settings(
     client: &IntervalsClient,
     athlete_id: &str,
@@ -166,15 +165,15 @@ pub async fn fetch_training_settings(
     } else {
         None
     };
-    let weight = if settings.rider_weight {
-        client.rider_weight(athlete_id, today).await?
+    let rider = if settings.rider_profile {
+        Some(client.rider_profile(athlete_id, today).await?)
     } else {
         None
     };
     Ok(TrainingFetch {
         cycling,
         estimated_ftp,
-        weight,
+        rider,
     })
 }
 
@@ -398,7 +397,7 @@ mod tests {
     use super::*;
     use crate::{
         intervals::{
-            WeightSource,
+            RiderWeight, WeightSource,
             test_support::{Route, json, serve_routes},
         },
         storage::IntervalsSyncState,
@@ -781,14 +780,17 @@ mod tests {
 
     const SPORT_SETTINGS: &str = r#"[{"types":["Ride","VirtualRide"],"ftp":280,"indoor_ftp":265}]"#;
 
-    fn training_routes(wellness: &str) -> Vec<Route> {
+    fn training_routes() -> Vec<Route> {
         vec![
             json("GET /api/v1/athlete/i1/sport-settings ", SPORT_SETTINGS),
             json("GET /api/v1/athlete/i1/mmp-model?", r#"{"ftp":301}"#),
-            json("GET /api/v1/athlete/i1/wellness?", wellness),
+            json(
+                "GET /api/v1/athlete/i1/wellness?",
+                r#"[{"id":"2026-10-13","weight":72.4}]"#,
+            ),
             json(
                 "GET /api/v1/athlete/i1 ",
-                r#"{"id":"i1","icu_weight":74.0}"#,
+                r#"{"id":"i1","firstname":"Blake","name":"Blake Peterman","icu_weight":74.0}"#,
             ),
         ]
     }
@@ -810,27 +812,28 @@ mod tests {
     #[tokio::test]
     async fn fetches_only_what_the_training_settings_ask_for() {
         let today: NaiveDate = "2026-10-14".parse().unwrap();
-        let fetch = |settings: IntervalsSyncSettings, wellness: &'static str, count: usize| async move {
-            let (base_url, server) = serve_routes(training_routes(wellness), count);
+        let fetch = |settings: IntervalsSyncSettings, count: usize| async move {
+            let (base_url, server) = serve_routes(training_routes(), count);
             let client = IntervalsClient::with_base_url("secret", &base_url).unwrap();
             let fetched = fetch_training_settings(&client, "i1", settings, today)
                 .await
                 .unwrap();
             (fetched, request_paths(server.join().unwrap()))
         };
-        let logged = r#"[{"id":"2026-10-13","weight":72.4}]"#;
 
-        // Defaults: indoor FTP, weight on, a recent wellness weight. No eFTP
-        // request and no athlete-settings request.
-        let (fetched, requests) = fetch(IntervalsSyncSettings::default(), logged, 2).await;
+        // Defaults: indoor FTP, rider profile on. No eFTP request.
+        let (fetched, requests) = fetch(IntervalsSyncSettings::default(), 3).await;
         assert_eq!(fetched.cycling.indoor_ftp, Some(265));
         assert_eq!(fetched.estimated_ftp, None);
         assert_eq!(
-            fetched.weight,
-            Some(RiderWeight {
-                kg: 72.4,
-                source: WeightSource::Wellness,
-                date: Some("2026-10-13".parse().unwrap()),
+            fetched.rider,
+            Some(RiderProfile {
+                first_name: Some("Blake".into()),
+                weight: Some(RiderWeight {
+                    kg: 72.4,
+                    source: WeightSource::Wellness,
+                    date: Some("2026-10-13".parse().unwrap()),
+                }),
             })
         );
         assert_eq!(
@@ -838,24 +841,26 @@ mod tests {
             [
                 "GET /api/v1/athlete/i1/sport-settings",
                 "GET /api/v1/athlete/i1/wellness",
+                "GET /api/v1/athlete/i1",
             ]
         );
 
-        // No logged weight: the athlete settings weight, one more request.
-        let (fetched, requests) = fetch(IntervalsSyncSettings::default(), "[]", 3).await;
-        assert_eq!(fetched.weight.unwrap().source, WeightSource::Settings);
-        assert_eq!(requests[2], "GET /api/v1/athlete/i1");
-
-        // Weight sync off and eFTP preferred: settings and the power model only.
+        // Rider profile off and eFTP preferred: settings and the power model only.
         let settings = IntervalsSyncSettings {
             ftp_source: FtpSource::EstimatedFtp,
-            rider_weight: false,
+            rider_profile: false,
             ..IntervalsSyncSettings::default()
         };
-        let (fetched, requests) = fetch(settings, logged, 2).await;
+        let (fetched, requests) = fetch(settings, 2).await;
         assert_eq!(fetched.estimated_ftp, Some(301));
-        assert_eq!(fetched.weight, None);
-        assert_eq!(requests[1], "GET /api/v1/athlete/i1/mmp-model");
+        assert_eq!(fetched.rider, None);
+        assert_eq!(
+            requests,
+            [
+                "GET /api/v1/athlete/i1/sport-settings",
+                "GET /api/v1/athlete/i1/mmp-model",
+            ]
+        );
     }
 
     #[tokio::test]

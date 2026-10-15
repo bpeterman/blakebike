@@ -123,8 +123,8 @@ export type IntervalsSyncSettings = {
   calendar: boolean;
   library: boolean;
   ftpSource: FtpSource;
-  /** Off keeps the rider weight entered by hand. */
-  riderWeight: boolean;
+  /** Off keeps the rider weight and name entered by hand. */
+  riderProfile: boolean;
 };
 
 /** Mirrors `IntervalsStatus` in intervals_sync.rs. */
@@ -141,7 +141,7 @@ export const disconnectedIntervalsStatus: IntervalsStatus = {
   configured: false,
   athleteId: null,
   athleteName: null,
-  settings: { calendar: true, library: true, ftpSource: "indoorFtp", riderWeight: true },
+  settings: { calendar: true, library: true, ftpSource: "indoorFtp", riderProfile: true },
   lastSyncedAt: null,
   lastError: null,
 };
@@ -585,6 +585,11 @@ export type WeightOutcome =
     }
   | { status: "syncOff" | "notFound" };
 
+/** The rider name's fate in a training-settings sync. Mirrors `NameOutcome` in commands.rs. */
+export type NameOutcome =
+  | { status: "synced"; name: string; previous: string }
+  | { status: "syncOff" | "notFound" };
+
 /** Mirrors `TrainingSyncResult` in commands.rs. */
 export type TrainingSyncResult = {
   profile: Profile;
@@ -593,6 +598,7 @@ export type TrainingSyncResult = {
   /** null when Intervals.icu has no max HR and the local value was kept. */
   maxHeartRate: { bpm: number; previousBpm: number } | null;
   weight: WeightOutcome;
+  name: NameOutcome;
   powerZones: ZoneSetOutcome;
   heartRateZones: ZoneSetOutcome;
 };
@@ -631,6 +637,17 @@ const describeWeight = (outcome: WeightOutcome, unit: Profile["weightUnit"]): st
   }
 };
 
+const describeName = (outcome: NameOutcome): string => {
+  switch (outcome.status) {
+    case "syncOff":
+      return "Name not synced (you keep your own)";
+    case "notFound":
+      return "Intervals.icu has no name; yours is unchanged";
+    case "synced":
+      return `Name ${outcome.name} (${outcome.name === outcome.previous ? "unchanged" : `was ${outcome.previous}`})`;
+  }
+};
+
 /** A YYYY-MM-DD local date as the rider's locale writes a short day, e.g. "Oct 12". */
 const formatDay = (date: string | null): string => {
   const parsed = new Date(`${date ?? ""}T00:00:00`);
@@ -658,7 +675,13 @@ export const describeTrainingSync = (result: TrainingSyncResult): string => {
         : `was ${result.maxHeartRate.previousBpm} bpm`;
     clauses.push(`Max HR ${result.maxHeartRate.bpm} bpm (${change})`);
   }
-  clauses.push(describeWeight(result.weight, result.profile.weightUnit));
+  // One toggle covers both, so "off" reads as one clause.
+  if (result.weight.status === "syncOff" && result.name.status === "syncOff") {
+    clauses.push("Weight and name not synced (you keep your own)");
+  } else {
+    clauses.push(describeWeight(result.weight, result.profile.weightUnit));
+    clauses.push(describeName(result.name));
+  }
   clauses.push(describeZoneSet("Power", result.powerZones));
   clauses.push(describeZoneSet("Heart-rate", result.heartRateZones));
   return clauses.join(" · ");
