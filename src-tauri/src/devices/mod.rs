@@ -237,7 +237,7 @@ pub struct DevicesSnapshot {
     pub sources: TelemetrySources,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScanError {
     pub message: String,
@@ -1023,23 +1023,18 @@ impl DeviceHub {
             }
         };
         match ble_result {
-            Err(message) if ant_found.is_empty() => {
-                tracing::error!(error = %message, "Scan failed");
-                self.set_scan_error(Some(ScanError {
-                    message: message.clone(),
-                    guidance: ble::platform_guidance(),
-                }));
+            Err(error) if ant_found.is_empty() => {
+                tracing::error!(error = %error.message, "Scan failed");
+                let message = error.message.clone();
+                self.set_scan_error(Some(error));
                 Err(message)
             }
             ble_result => {
                 let found = match ble_result {
                     Ok(found) => found,
-                    Err(message) => {
-                        tracing::warn!(error = %message, "Bluetooth scan unavailable; keeping ANT results");
-                        self.set_scan_error(Some(ScanError {
-                            message,
-                            guidance: ble::platform_guidance(),
-                        }));
+                    Err(error) => {
+                        tracing::warn!(error = %error.message, "Bluetooth scan unavailable; keeping ANT results");
+                        self.set_scan_error(Some(error));
                         Vec::new()
                     }
                 };
@@ -1157,14 +1152,14 @@ impl DeviceHub {
                         ..seen
                     }
                 }
-                Err(error) => {
-                    slot.progress("error", "Device not found", Some(error.clone()));
+                Err(ScanError { message, guidance }) => {
+                    slot.progress("error", "Device not found", Some(message.clone()));
                     slot.set_state(DeviceState::Error {
-                        message: error.clone(),
-                        guidance: "Wake the device (spin the crank, wear the strap, pedal the trainer) and try again.".into(),
+                        message: message.clone(),
+                        guidance,
                     })
                     .await;
-                    return Err(error);
+                    return Err(message);
                 }
             }
         } else {
