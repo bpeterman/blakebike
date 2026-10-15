@@ -19,6 +19,14 @@ Conventions:
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-10-15
+
+Scanning tells you when Bluetooth is off or blake.bike isn't allowed to use it, instead of showing an empty list.
+
+### Fixed
+
+- A scan with Bluetooth turned off, or with blake.bike denied Bluetooth permission in macOS, used to find nothing and say nothing. The Devices screen now says which it is and how to fix it (Control Center, or System Settings → Privacy & Security → Bluetooth), and picks up the change on the next scan.
+
 ## [0.5.0] - 2026-09-20
 
 Pick which Intervals.icu FTP your power zones sync from.
