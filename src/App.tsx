@@ -24,6 +24,7 @@ import {
   Info,
   Library,
   Pause,
+  Percent,
   Play,
   Plus,
   Scale,
@@ -1486,6 +1487,9 @@ export function Ride({
     if (field.metric === "wattsPerKilogram") {
       return `${displayedWeight(profile.riderWeightKg, profile.weightUnit)} ${profile.weightUnit} rider`;
     }
+    if (field.metric === "ftpPercent" || field.metric === "targetFtpPercent") {
+      return profile.ftpWatts > 0 ? `of ${profile.ftpWatts} W FTP` : "Set your FTP in Settings";
+    }
     if (field.aggregate !== "current") return null;
     if (field.metric === "power" || field.metric === "cadence" || field.metric === "heartRate") {
       return sourceNote(telemetry.sources?.[field.metric]);
@@ -1926,11 +1930,13 @@ const rideFieldIcons: Record<RideMetric, typeof Activity> = {
   heartRate: HeartPulse,
   speed: Gauge,
   wattsPerKilogram: Scale,
+  ftpPercent: Percent,
   distance: Route,
   energy: Flame,
   calories: Flame,
   time: Timer,
   targetPower: Target,
+  targetFtpPercent: Target,
 };
 
 function displayedWeight(kg: number, unit: Profile["weightUnit"]) {
