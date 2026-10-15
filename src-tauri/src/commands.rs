@@ -1349,6 +1349,11 @@ pub fn skip_interval(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
+pub fn mark_lap(state: State<'_, AppState>) -> Result<(), String> {
+    state.runner.mark_lap()
+}
+
+#[tauri::command]
 pub async fn stop_workout(state: State<'_, AppState>) -> Result<(), String> {
     state.runner.stop().await
 }

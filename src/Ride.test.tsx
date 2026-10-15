@@ -34,6 +34,8 @@ const runner: RunnerState = {
   sessionId: "session",
   workoutName: "Free Ride",
   elapsedSeconds: 30,
+  movingSeconds: 30,
+  wallClockSeconds: 30,
   totalSeconds: null,
   intervalIndex: 0,
   intervalElapsedSeconds: 30,
@@ -42,7 +44,9 @@ const runner: RunnerState = {
   plannedTargetWatts: null,
   manualErg: true,
   overrideActive: false,
+  workoutComplete: false,
   biasPercent: 100,
+  laps: [],
 };
 
 const telemetry: Telemetry = {
@@ -213,7 +217,7 @@ describe("Ride charts", () => {
   });
 
   it("shows pace-and-progress fields, hiding time remaining on an open-ended ride", () => {
-    const freeRide = { ...runner, elapsedSeconds: 125, distanceMeters: 5_000 };
+    const freeRide = { ...runner, elapsedSeconds: 125, movingSeconds: 125, wallClockSeconds: 125, distanceMeters: 5_000 };
     const { container, rerender } = render(
       <Ride
         workouts={[]}
@@ -267,6 +271,34 @@ describe("Ride charts", () => {
     expect(container.querySelector('[data-ride-field="time:ride:remaining"]')).toHaveTextContent("7:55");
   });
 
+  it("holds elapsed through a pause while total time keeps counting", () => {
+    const { container } = render(
+      <Ride
+        workouts={[]}
+        selectedWorkout={null}
+        setSelectedWorkout={vi.fn()}
+        connected
+        onConnect={vi.fn()}
+        runner={{ ...runner, status: "paused", movingSeconds: 1_510, wallClockSeconds: 1_745 }}
+        telemetry={telemetry}
+        telemetryHistory={[telemetry]}
+        powerSmoothing="instant"
+        onPowerSmoothing={vi.fn()}
+        sourcePreferences={defaultSourcePreferences}
+        onSourcePreference={vi.fn()}
+        hub={hub}
+        profile={profile}
+        trainingZones={defaultTrainingZoneSettings}
+        displayPreferences={screenWith("time:ride:total", "time:ride:wallClock")}
+        perform={async () => undefined}
+      />,
+    );
+    expect(container.querySelector('[data-ride-field="time:ride:total"]')).toHaveTextContent("ELAPSED25:10");
+    expect(container.querySelector('[data-ride-field="time:ride:wallClock"]')).toHaveTextContent(
+      "TOTAL TIME29:05",
+    );
+  });
+
   it("shows a dash for average power before any ride time", () => {
     const { container } = render(
       <Ride
@@ -300,6 +332,8 @@ describe("Ride charts", () => {
       sessionId: "session",
       workoutName: structuredWorkout.name,
       elapsedSeconds: 70,
+      movingSeconds: 70,
+      wallClockSeconds: 70,
       totalSeconds: 150,
       intervalIndex: 1,
       intervalElapsedSeconds: 10,
@@ -308,7 +342,9 @@ describe("Ride charts", () => {
       plannedTargetWatts: 200,
       manualErg: false,
       overrideActive: false,
+      workoutComplete: false,
       biasPercent: 100,
+      laps: [],
     };
     const commonProps = {
       workouts: [structuredWorkout],
@@ -349,7 +385,11 @@ describe("Ride charts", () => {
     expect(timeline?.nextElementSibling).toBe(controls);
     expect(controls?.nextElementSibling).toBe(powerChart);
     expect(screen.queryByRole("button", { name: "Pause" })).not.toBeInTheDocument();
-    expect(screen.getByLabelText("Workout bias")).toBeInTheDocument();
+    // Reset bias leads the stepper so − / % / + stay pinned right; at 100% it only holds its space.
+    const biasStepper = screen.getByLabelText("Workout bias");
+    expect([...biasStepper.children].map((node) => node.textContent)).toEqual(["Reset bias", "Bias", "−", "100%", "+"]);
+    expect(screen.queryByRole("button", { name: "Reset bias" })).not.toBeInTheDocument();
+    expect(biasStepper.firstElementChild).toBeDisabled();
 
     const pausedRunner: RunnerState = {
       ...structuredRunner,
@@ -362,7 +402,80 @@ describe("Ride charts", () => {
     expect(screen.getByText("0:20")).toBeInTheDocument();
 
     rerender(<Ride {...commonProps} runner={{ ...structuredRunner, overrideActive: true, targetPowerWatts: 225 }} />);
-    expect(screen.getByRole("button", { name: "Reset override · 200 W" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Back to plan · 200 W" })).toBeInTheDocument();
+
+    rerender(<Ride {...commonProps} runner={{ ...structuredRunner, biasPercent: 105 }} />);
+    expect(screen.getByLabelText("Workout bias").firstElementChild).toBe(screen.getByRole("button", { name: "Reset bias" }));
+    expect(screen.getByRole("button", { name: "Reset bias" })).toBeEnabled();
+  });
+
+  it("shows a finished workout as complete while the ride carries on as a free ride", () => {
+    const freeRiding: RunnerState = {
+      status: "running",
+      sessionId: "session",
+      workoutName: structuredWorkout.name,
+      elapsedSeconds: 200,
+      movingSeconds: 200,
+      wallClockSeconds: 200,
+      totalSeconds: 150,
+      laps: [],
+      intervalIndex: 5,
+      intervalElapsedSeconds: 50,
+      distanceMeters: 0,
+      targetPowerWatts: 100,
+      plannedTargetWatts: null,
+      manualErg: true,
+      overrideActive: false,
+      workoutComplete: true,
+      biasPercent: 100,
+    };
+    const perform = vi.fn(async () => undefined);
+    const { container } = render(
+      <Ride
+        workouts={[structuredWorkout]}
+        selectedWorkout={structuredWorkout.id}
+        setSelectedWorkout={vi.fn()}
+        connected
+        onConnect={vi.fn()}
+        runner={freeRiding}
+        telemetry={telemetry}
+        telemetryHistory={[telemetry]}
+        powerSmoothing="instant"
+        onPowerSmoothing={vi.fn()}
+        sourcePreferences={defaultSourcePreferences}
+        onSourcePreference={vi.fn()}
+        hub={hub}
+        profile={profile}
+        trainingZones={defaultTrainingZoneSettings}
+        displayPreferences={defaultRideDisplayPreferences}
+        perform={perform}
+      />,
+    );
+
+    const notice = screen.getByText("Workout complete · free riding").closest(".notice");
+    expect(notice).toHaveAttribute("role", "status");
+    expect(notice).toHaveTextContent("manual ERG at 100 W");
+    // Every block reads as done; nothing is left to skip or bias.
+    expect(screen.getByRole("heading", { name: "Workout complete" })).toBeInTheDocument();
+    const timelineBlocks = [...container.querySelectorAll<SVGPolygonElement>(".workout-timeline polygon[data-state]")];
+    expect(timelineBlocks.map((block) => block.dataset.state)).toEqual([
+      "completed", "completed", "completed", "completed", "completed",
+    ]);
+    expect(
+      [...container.querySelectorAll(".timeline-countdowns strong")].map((node) => node.textContent),
+    ).toEqual(["0:50", "2:30"]);
+    expect(screen.queryByRole("button", { name: "Skip block" })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Workout bias")).not.toBeInTheDocument();
+    expect(screen.getByText("Workout complete · free riding · manual ERG")).toBeInTheDocument();
+    expect(container.querySelector(".manual-erg-stepper input")).toHaveValue(100);
+    expect(screen.getByText("+0:50")).toBeInTheDocument();
+
+    // Skip and bias keys do nothing; the arrows still steer manual ERG.
+    fireEvent.keyDown(window, { key: "s" });
+    fireEvent.keyDown(window, { key: "ArrowUp", shiftKey: true });
+    expect(perform).not.toHaveBeenCalled();
+    fireEvent.keyDown(window, { key: "ArrowUp" });
+    expect(perform).toHaveBeenCalledWith(expect.any(Function), "adjust manual power");
   });
 
   it("labels timeline blocks with biased targets and durations that follow the bias", () => {
@@ -371,6 +484,8 @@ describe("Ride charts", () => {
       sessionId: "session",
       workoutName: structuredWorkout.name,
       elapsedSeconds: 70,
+      movingSeconds: 70,
+      wallClockSeconds: 70,
       totalSeconds: 150,
       intervalIndex: 1,
       intervalElapsedSeconds: 10,
@@ -379,7 +494,9 @@ describe("Ride charts", () => {
       plannedTargetWatts: 200,
       manualErg: false,
       overrideActive: false,
+      workoutComplete: false,
       biasPercent: 100,
+      laps: [],
     };
     const commonProps = {
       workouts: [structuredWorkout],
@@ -500,6 +617,49 @@ describe("Ride charts", () => {
     expect(screen.getByRole("tab", { name: "Ride" })).toHaveAttribute("aria-selected", "true");
     fireEvent.keyDown(window, { key: "ArrowRight" });
     expect(slots()).toEqual([["speed:ride:current", "4"]]);
+  });
+
+  it("shows the lap timer and marks laps from its button and the L key", () => {
+    const perform = vi.fn<(action: () => Promise<unknown>, label?: string) => Promise<void>>(
+      async () => undefined,
+    );
+    const { container } = render(
+      <Ride
+        workouts={[]}
+        selectedWorkout={null}
+        setSelectedWorkout={vi.fn()}
+        connected
+        onConnect={vi.fn()}
+        runner={{ ...runner, elapsedSeconds: 50, movingSeconds: 50, laps: [{ elapsedSeconds: 20, timestampMs: 500 }] }}
+        telemetry={telemetry}
+        telemetryHistory={[telemetry]}
+        powerSmoothing="instant"
+        onPowerSmoothing={vi.fn()}
+        sourcePreferences={defaultSourcePreferences}
+        onSourcePreference={vi.fn()}
+        hub={hub}
+        profile={profile}
+        trainingZones={defaultTrainingZoneSettings}
+        displayPreferences={{
+          version: 3,
+          screens: [
+            {
+              id: "drills",
+              name: "Drills",
+              items: [{ kind: "lapTimer", timer: { mode: "manual", workSeconds: 30, restSeconds: 30 } }],
+            },
+          ],
+        }}
+        perform={perform}
+      />,
+    );
+    expect(container.querySelector("[data-ride-lap-timer]")).toHaveAttribute("data-span", "4");
+    expect(screen.getByLabelText("Lap time")).toHaveTextContent("0:30");
+    expect(screen.getByText("Lap 2")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Lap" }));
+    fireEvent.keyDown(window, { key: "l" });
+    expect(perform.mock.calls.map((call) => call[1])).toEqual(["mark lap", "mark lap"]);
   });
 
   it("shows no screen tabs when there is only one screen", () => {

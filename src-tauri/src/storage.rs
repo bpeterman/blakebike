@@ -13,8 +13,8 @@ use crate::{
     devices::{CalibrationRecord, KnownDevice, SourcePreferences},
     distance::estimate_distance,
     domain::{
-        DistanceSource, DistanceUnit, PlannedWorkout, Profile, SessionDetail, SessionSummary,
-        Telemetry, WeightUnit, Workout, WorkoutOrigin,
+        DistanceSource, DistanceUnit, LapMark, PlannedWorkout, Profile, SessionDetail,
+        SessionSummary, Telemetry, WeightUnit, Workout, WorkoutOrigin,
     },
     intervals::{FtpSource, IntervalsAthlete},
 };
@@ -156,7 +156,7 @@ const RIDE_PANELS: [&str; 6] = [
 /// Every field a rider can put on a screen, as `metric:scope:aggregate`.
 /// Mirrors the table built in `src/rideFields.ts`; a field missing from here
 /// is dropped on load, so the two lists have to agree.
-const RIDE_FIELDS: [&str; 33] = [
+const RIDE_FIELDS: [&str; 40] = [
     "power:ride:current",
     "power:ride:average",
     "power:ride:max",
@@ -180,16 +180,23 @@ const RIDE_FIELDS: [&str; 33] = [
     "wattsPerKilogram:ride:current",
     "wattsPerKilogram:ride:average",
     "wattsPerKilogram:interval:average",
+    "ftpPercent:ride:current",
+    "ftpPercent:ride:average",
+    "ftpPercent:ride:max",
+    "ftpPercent:interval:average",
+    "ftpPercent:interval:max",
     "energy:ride:total",
     "energy:interval:total",
     "calories:ride:total",
     "calories:interval:total",
     "time:ride:total",
     "time:ride:remaining",
+    "time:ride:wallClock",
     "time:interval:total",
     "time:interval:remaining",
     "distance:ride:total",
     "targetPower:ride:current",
+    "targetFtpPercent:ride:current",
 ];
 
 const MAX_RIDE_SCREENS: usize = 8;
@@ -206,10 +213,60 @@ pub enum RideScreenItem {
     },
     #[serde(rename_all = "camelCase")]
     Panel { panel: String },
+    /// Laps are ride-wide, so a screen holds at most one lap timer.
+    #[serde(rename_all = "camelCase")]
+    LapTimer {
+        #[serde(default)]
+        timer: LapTimerSettings,
+    },
 }
 
 fn one_span() -> u8 {
     1
+}
+
+/// How a lap timer card is set up. Mirrors `LapTimerSettings` in
+/// `src/lapTimer.ts`, including the bounds `normalized` holds it to.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct LapTimerSettings {
+    /// `manual` or `countdown`; kept as text so a mode from a newer version
+    /// falls back to manual instead of losing the whole layout.
+    pub mode: String,
+    pub work_seconds: i64,
+    pub rest_seconds: i64,
+}
+
+const LAP_TIMER_MODES: [&str; 2] = ["manual", "countdown"];
+const LAP_TIMER_WORK_SECONDS: (i64, i64) = (5, 3_600);
+const LAP_TIMER_REST_SECONDS: (i64, i64) = (0, 3_600);
+
+impl Default for LapTimerSettings {
+    fn default() -> Self {
+        Self {
+            mode: "manual".into(),
+            work_seconds: 30,
+            rest_seconds: 30,
+        }
+    }
+}
+
+impl LapTimerSettings {
+    fn normalized(self) -> Self {
+        Self {
+            mode: if LAP_TIMER_MODES.contains(&self.mode.as_str()) {
+                self.mode
+            } else {
+                Self::default().mode
+            },
+            work_seconds: self
+                .work_seconds
+                .clamp(LAP_TIMER_WORK_SECONDS.0, LAP_TIMER_WORK_SECONDS.1),
+            rest_seconds: self
+                .rest_seconds
+                .clamp(LAP_TIMER_REST_SECONDS.0, LAP_TIMER_REST_SECONDS.1),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -284,6 +341,7 @@ fn default_screens() -> Vec<RideScreen> {
                 field("energy:ride:total", 1),
                 field("calories:ride:total", 1),
                 field("power:interval:average", 1),
+                field("ftpPercent:ride:current", 1),
                 field("heartRate:ride:average", 1),
                 panel("heartRateChart"),
                 panel("timeInZone"),
@@ -377,7 +435,7 @@ impl RideDisplayPreferences {
         Self::default()
     }
 
-    /// Drops fields and panels this version does not know, screens with
+    /// Drops slots this version does not know, screens with
     /// nothing left on them, and anything past the caps. Mirrors
     /// `normalizeRideDisplayPreferences` in `src/rideScreens.ts`.
     fn normalized(self) -> Self {
@@ -406,6 +464,7 @@ impl RideDisplayPreferences {
                         }
                         format!("panel:{panel}")
                     }
+                    RideScreenItem::LapTimer { .. } => "lapTimer".to_owned(),
                 };
                 if keys.contains(&key) {
                     continue;
@@ -415,6 +474,9 @@ impl RideDisplayPreferences {
                     RideScreenItem::Field { field, span } => RideScreenItem::Field {
                         field,
                         span: if [1, 2, 4].contains(&span) { span } else { 1 },
+                    },
+                    RideScreenItem::LapTimer { timer } => RideScreenItem::LapTimer {
+                        timer: timer.normalized(),
                     },
                     panel => panel,
                 });
@@ -570,6 +632,13 @@ impl Storage {
                 );
                 CREATE INDEX IF NOT EXISTS telemetry_session_idx
                   ON telemetry_samples(session_id, timestamp_ms);
+                CREATE TABLE IF NOT EXISTS session_laps (
+                  session_id TEXT NOT NULL,
+                  elapsed_seconds INTEGER NOT NULL,
+                  timestamp_ms INTEGER NOT NULL,
+                  PRIMARY KEY(session_id, elapsed_seconds),
+                  FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+                );
                 CREATE TABLE IF NOT EXISTS settings (
                   key TEXT PRIMARY KEY,
                   value_json TEXT NOT NULL
@@ -1281,6 +1350,33 @@ impl Storage {
         transaction.commit().map_err(|error| error.to_string())
     }
 
+    /// Save the rider's lap marks. A retried write of the same mark replaces
+    /// it, so the recorder can safely send a batch again.
+    pub fn record_laps(&self, session_id: Uuid, laps: &[LapMark]) -> Result<(), String> {
+        if laps.is_empty() {
+            return Ok(());
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        {
+            let mut statement = transaction
+                .prepare_cached(
+                    "INSERT OR REPLACE INTO session_laps(session_id, elapsed_seconds, timestamp_ms)
+                     VALUES(?1, ?2, ?3)",
+                )
+                .map_err(|error| error.to_string())?;
+            let session = session_id.to_string();
+            for lap in laps {
+                statement
+                    .execute(params![session, lap.elapsed_seconds, lap.timestamp_ms])
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        transaction.commit().map_err(|error| error.to_string())
+    }
+
     pub fn finish_session(&self, summary: &SessionSummary) -> Result<(), String> {
         self.connection()?
             .execute(
@@ -1491,7 +1587,27 @@ impl Storage {
                     .map_err(|error| error.to_string())
             })
             .collect::<Result<Vec<Telemetry>, String>>()?;
-        Ok(Some(SessionDetail { summary, samples }))
+        let mut statement = connection
+            .prepare(
+                "SELECT elapsed_seconds, timestamp_ms FROM session_laps
+                 WHERE session_id = ?1 ORDER BY elapsed_seconds",
+            )
+            .map_err(|error| error.to_string())?;
+        let laps = statement
+            .query_map([id.to_string()], |row| {
+                Ok(LapMark {
+                    elapsed_seconds: row.get(0)?,
+                    timestamp_ms: row.get(1)?,
+                })
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<LapMark>, _>>()
+            .map_err(|error| error.to_string())?;
+        Ok(Some(SessionDetail {
+            summary,
+            samples,
+            laps,
+        }))
     }
 }
 
@@ -2060,6 +2176,79 @@ mod tests {
                 span: 1,
             }]
         );
+    }
+
+    #[test]
+    fn a_lap_timer_round_trips_and_is_held_to_its_bounds() {
+        let storage = Storage::in_memory().unwrap();
+        let mut display = RideDisplayPreferences::default();
+        display.screens[0].items.push(RideScreenItem::LapTimer {
+            timer: LapTimerSettings {
+                mode: "countdown".into(),
+                work_seconds: 40,
+                rest_seconds: 20,
+            },
+        });
+        storage.save_ride_display_preferences(&display).unwrap();
+        assert_eq!(storage.ride_display_preferences().unwrap(), display);
+
+        // An unknown mode falls back to manual, lengths are clamped, and a
+        // second timer on the same screen is dropped.
+        storage
+            .save_setting(
+                RIDE_DISPLAY_PREFERENCES_KEY,
+                &serde_json::json!({
+                    "version": 3,
+                    "screens": [{
+                        "id": "drills",
+                        "name": "Drills",
+                        "items": [
+                            { "kind": "lapTimer", "timer": { "mode": "tabata", "workSeconds": 1, "restSeconds": -4 } },
+                            { "kind": "lapTimer", "timer": { "mode": "countdown", "workSeconds": 30, "restSeconds": 30 } },
+                            { "kind": "lapTimer" }
+                        ]
+                    }]
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            storage.ride_display_preferences().unwrap().screens[0].items,
+            vec![RideScreenItem::LapTimer {
+                timer: LapTimerSettings {
+                    mode: "manual".into(),
+                    work_seconds: 5,
+                    rest_seconds: 0,
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn lap_marks_are_saved_with_the_ride_and_go_with_it() {
+        let storage = Storage::in_memory().unwrap();
+        let session = storage.start_session(None, "Drills", 84.0).unwrap();
+        let first = LapMark {
+            elapsed_seconds: 60,
+            timestamp_ms: 1_700_000_060_000,
+        };
+        let second = LapMark {
+            elapsed_seconds: 95,
+            timestamp_ms: 1_700_000_100_000,
+        };
+        storage.record_laps(session.id, &[second]).unwrap();
+        // A retried batch repeats a mark; it is stored once.
+        storage.record_laps(session.id, &[first, second]).unwrap();
+        assert_eq!(
+            storage.session(session.id).unwrap().unwrap().laps,
+            vec![first, second]
+        );
+        storage.delete_session(session.id).unwrap();
+        let orphans: u32 = storage
+            .reader()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM session_laps", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(orphans, 0);
     }
 
     #[test]

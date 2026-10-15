@@ -1,4 +1,7 @@
 import { describe, expect, it } from "vitest";
+// The Rust default layout, read as text so the two languages can be compared.
+import storageSource from "../src-tauri/src/storage.rs?raw";
+import { rideFieldKey } from "./rideFields";
 import {
   MAX_RIDE_SCREENS,
   defaultRideDisplayPreferences,
@@ -20,6 +23,41 @@ const field = (
   }) as RideScreenItem;
 
 describe("ride screens", () => {
+  it("keeps one lap timer per screen and holds its drill to sensible lengths", () => {
+    const normalized = normalizeRideDisplayPreferences({
+      version: 3,
+      screens: [
+        {
+          id: "drills",
+          name: "Drills",
+          items: [
+            { kind: "lapTimer", timer: { mode: "countdown", workSeconds: 2.4, restSeconds: -10 } },
+            { kind: "lapTimer", timer: { mode: "manual", workSeconds: 30, restSeconds: 30 } },
+            field("cadence"),
+          ],
+        },
+      ],
+    });
+    expect(normalized.screens[0].items).toEqual([
+      { kind: "lapTimer", timer: { mode: "countdown", workSeconds: 5, restSeconds: 0 } },
+      field("cadence"),
+    ]);
+  });
+
+  it("drops slot kinds from a newer version", () => {
+    const normalized = normalizeRideDisplayPreferences({
+      version: 3,
+      screens: [
+        {
+          id: "ride",
+          name: "Ride",
+          items: [{ kind: "hologram" } as unknown as RideScreenItem, field("power")],
+        },
+      ],
+    });
+    expect(normalized.screens[0].items).toEqual([field("power")]);
+  });
+
   it("ships screens a rider can ride with out of the box", () => {
     expect(defaultRideDisplayPreferences.screens.map((screen) => screen.name)).toEqual([
       "Ride",
@@ -34,6 +72,51 @@ describe("ride screens", () => {
         screen.items.some((item) => item.kind === "panel" && item.panel === "deviceStats"),
       ),
     ).toBe(false);
+  });
+
+  it("ships the same default layout as the Rust side", () => {
+    // Each screen as `field:key:span` / `panel:id` lines, in order.
+    const body = storageSource.match(/fn default_screens\(\)[\s\S]*?\n}\n/)?.[0] ?? "";
+    const rust = [...body.matchAll(/items: vec!\[([\s\S]*?)\]/g)].map(([, items]) =>
+      [...items.matchAll(/field\("([^"]+)", (\d)\)|panel\("([^"]+)"\)/g)].map(
+        ([, key, span, panel]) => (panel === undefined ? `field:${key}:${span}` : `panel:${panel}`),
+      ),
+    );
+    expect(rust).toEqual(
+      defaultRideDisplayPreferences.screens.map((screen) =>
+        screen.items.map((item) =>
+          item.kind === "field"
+            ? `field:${rideFieldKey(item.field)}:${item.span}`
+            : item.kind === "panel"
+              ? `panel:${item.panel}`
+              : item.kind,
+        ),
+      ),
+    );
+  });
+
+  it("leaves a saved layout as the rider built it, %FTP or not", () => {
+    // New default fields reach riders who never arranged their screens, and
+    // nobody else: a stored layout is read back as stored.
+    const before = {
+      version: 3,
+      screens: [{ id: "mine", name: "Mine", items: [field("power"), field("cadence")] }],
+    };
+    expect(migrateRideDisplayPreferences(before).screens[0].items).toEqual([
+      field("power"),
+      field("cadence"),
+    ]);
+    const withPercent = {
+      version: 3,
+      screens: [
+        {
+          id: "mine",
+          name: "Mine",
+          items: [field("ftpPercent", "interval", "average", 2), field("targetFtpPercent")],
+        },
+      ],
+    };
+    expect(migrateRideDisplayPreferences(withPercent)).toEqual(withPercent);
   });
 
   it("drops what it cannot show and never leaves the rider screenless", () => {
