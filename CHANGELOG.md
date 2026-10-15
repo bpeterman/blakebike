@@ -19,6 +19,10 @@ Conventions:
 
 ## [Unreleased]
 
+### Fixed
+
+- Dropdown chevrons now show in the app itself. Its security policy was blocking the small built-in images they are drawn with, so 0.6.0 showed plain boxes.
+
 ## [0.6.0] - 2026-10-15
 
 Lap timer for drills, %FTP fields, editable repeats, and workouts that roll into a free ride when they finish.
