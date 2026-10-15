@@ -387,6 +387,23 @@ textarea { min-height: 70px; resize: vertical; }
 .detail-metrics { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin: 20px 0 8px; padding: 14px; border-radius: 9px; background: #222620; }
 .distance-note { margin: 0 0 14px; color: #7f887a; font-size: 11px; }
 .detail-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 9px; }
+/* Hover readout for every chart (ChartTooltip.tsx). Its colours come from
+   chartTooltipTheme.ts, where they are tested for contrast; this is layout only. */
+.chart-tooltip {
+  display: grid;
+  gap: 4px;
+  padding: 8px 12px;
+  border: 1px solid;
+  border-radius: 9px;
+  box-shadow: 0 14px 40px rgba(0,0,0,.5);
+  font-size: 13px;
+  white-space: nowrap;
+}
+.chart-tooltip-title { font-size: 12px; font-variant-numeric: tabular-nums; }
+.chart-tooltip-row { display: flex; align-items: center; gap: 8px; }
+.chart-tooltip-swatch { flex: none; width: 10px; height: 10px; border-radius: 3px; }
+.chart-tooltip-value { margin-left: auto; padding-left: 8px; font-weight: 650; font-variant-numeric: tabular-nums; }
+
 .history-charts { display: grid; gap: 4px; }
 .history-charts h3 { margin: 12px 0 0; font-size: 14px; }
 

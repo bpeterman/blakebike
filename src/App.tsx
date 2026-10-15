@@ -57,6 +57,8 @@ import {
   summarizeRange,
   useChartRangeDrag,
 } from "./chartRange";
+import { ChartTooltip } from "./ChartTooltip";
+import { chartTooltipBarCursor, chartTooltipLineCursor } from "./chartTooltipTheme";
 import {
   formatReleaseDate,
   releaseFor,
@@ -2357,20 +2359,6 @@ type ChartDomain = [number | string, number | string];
 const powerDomain: ChartDomain = [0, "dataMax + 50"];
 const heartRateDomain: ChartDomain = ["dataMin - 10", "dataMax + 10"];
 
-// Recharts' default tooltip is a white box; on the dark theme the lime and
-// pink series values were unreadable on it. Match the modal surface instead
-// and let each series keep its own color for the value.
-const chartTooltipContentStyle = {
-  background: "#1b1f1a",
-  border: "1px solid #373d34",
-  borderRadius: 9,
-  boxShadow: "0 14px 40px rgba(0,0,0,.5)",
-  padding: "8px 12px",
-} as const;
-const chartTooltipLabelStyle = { color: "#c9d0c3", fontSize: 12, marginBottom: 4 } as const;
-const chartTooltipItemStyle = { fontSize: 13, padding: 0 } as const;
-const chartTooltipCursor = { stroke: "#6b7566", strokeWidth: 1 } as const;
-
 const formatChartTime = (value: unknown) =>
   formatDuration(Math.max(0, Math.round(Number(value) / 1000)));
 
@@ -2420,12 +2408,13 @@ const SessionAreaChart = memo(function SessionAreaChart({
           />
           <YAxis width={42} domain={domain} />
           <Tooltip
-            labelFormatter={formatChartTime}
-            formatter={(value) => [`${value ?? "—"} ${unit}`, name]}
-            contentStyle={chartTooltipContentStyle}
-            labelStyle={chartTooltipLabelStyle}
-            itemStyle={chartTooltipItemStyle}
-            cursor={chartTooltipCursor}
+            content={
+              <ChartTooltip
+                formatTitle={formatChartTime}
+                formatRow={(entry) => ({ color, name, value: `${entry.value ?? "—"} ${unit}` })}
+              />
+            }
+            cursor={chartTooltipLineCursor}
           />
           {selection && (
             <ReferenceArea
@@ -2499,6 +2488,9 @@ const TimeInZoneChart = memo(function TimeInZoneChart({
     seconds: Math.round(seconds[index] ?? 0),
     fill: zoneColorAt(index),
   }));
+  // The bars are coloured per cell, so Recharts gives the tooltip no series
+  // colour; look the zone's colour up by the hovered category instead.
+  const zoneColorByName = new Map(data.map((entry) => [entry.name, entry.fill]));
   return (
     <div className="card zone-chart">
       <div className="chart-heading"><div><span className="label">TIME IN ZONE</span><h3>{title}</h3></div></div>
@@ -2507,11 +2499,16 @@ const TimeInZoneChart = memo(function TimeInZoneChart({
           <XAxis type="number" hide />
           <YAxis type="category" dataKey="name" width={58} tick={{ fontSize: 10 }} />
           <Tooltip
-            formatter={(value) => [formatDuration(Number(value)), "Time"]}
-            contentStyle={chartTooltipContentStyle}
-            labelStyle={chartTooltipLabelStyle}
-            itemStyle={chartTooltipItemStyle}
-            cursor={{ fill: "rgba(255,255,255,.06)" }}
+            content={
+              <ChartTooltip
+                formatRow={(entry, label) => ({
+                  color: zoneColorByName.get(String(label)) ?? zoneColorAt(0),
+                  name: "Time",
+                  value: formatDuration(Number(entry.value)),
+                })}
+              />
+            }
+            cursor={chartTooltipBarCursor}
           />
           <Bar dataKey="seconds" radius={[0, 4, 4, 0]} isAnimationActive={false}>
             {data.map((entry) => <Cell key={entry.name} fill={entry.fill} />)}
