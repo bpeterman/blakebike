@@ -121,7 +121,9 @@ pub enum Authorization {
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     NotApplicable,
     /// The rider hasn't answered the permission prompt yet.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     NotDetermined,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Allowed,
     /// Denied by the rider, or restricted by a device-management profile.
     Denied,
