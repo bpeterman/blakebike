@@ -252,12 +252,13 @@ p { color: #8d9587; font-size: 13px; }
 .plan-line .plan-note { flex: 1; min-width: 160px; }
 .plan-line .text-button { padding: 0; font-size: 11px; }
 .plan-line .override-reset { min-height: 30px; padding: 0 10px; border-color: #617732; color: #d8eea6; background: #242c1d; }
-.bias-stepper { display: inline-flex; align-items: center; gap: 6px; }
+.bias-stepper { display: inline-flex; align-items: center; gap: 6px; margin-left: auto; }
 .bias-stepper > span { color: #768071; font-size: 9px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
 .bias-stepper button.secondary { min-width: 30px; height: 28px; padding: 0 8px; font-size: 15px; line-height: 1; }
 .bias-stepper strong { min-width: 46px; color: #e9eee4; font-size: 14px; text-align: center; font-variant-numeric: tabular-nums; }
 .bias-stepper strong.active { color: #c8ff32; }
-.bias-reset { width: 34px; justify-content: start; }
+.bias-reset { white-space: nowrap; }
+/* Hidden rather than removed, so it keeps its own width and the − / % / + controls never shift. */
 .bias-reset.placeholder { visibility: hidden; }
 .metric-control { margin-left: auto; }
 .metric-control-group { display: grid; gap: 7px; }

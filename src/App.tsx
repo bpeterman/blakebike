@@ -1585,14 +1585,11 @@ export function Ride({
             </span>
             {overrideActive && (
               <button type="button" className="secondary override-reset" disabled={runner.status !== "running"} onClick={() => void backToPlan()}>
-                Reset override{plannedTarget !== null ? ` · ${plannedTarget} W` : ""}
+                Back to plan{plannedTarget !== null ? ` · ${plannedTarget} W` : ""}
               </button>
             )}
+            {/* Reset bias leads so the − / % / + controls stay pinned at the right edge; at 100% it keeps its space hidden. */}
             <div className="bias-stepper" aria-label="Workout bias">
-              <span>Bias</span>
-              <button type="button" className="secondary" onClick={() => void adjustBias(-BIAS_STEP_PERCENT)}>−</button>
-              <strong className={biasPercent === 100 ? "" : "active"}>{biasPercent}%</strong>
-              <button type="button" className="secondary" onClick={() => void adjustBias(BIAS_STEP_PERCENT)}>+</button>
               <button
                 type="button"
                 className={biasPercent === 100 ? "text-button bias-reset placeholder" : "text-button bias-reset"}
@@ -1601,8 +1598,12 @@ export function Ride({
                 tabIndex={biasPercent === 100 ? -1 : 0}
                 onClick={() => void perform(() => api.setBiasPercent(100), "reset workout bias")}
               >
-                Reset
+                Reset bias
               </button>
+              <span>Bias</span>
+              <button type="button" className="secondary" onClick={() => void adjustBias(-BIAS_STEP_PERCENT)}>−</button>
+              <strong className={biasPercent === 100 ? "" : "active"}>{biasPercent}%</strong>
+              <button type="button" className="secondary" onClick={() => void adjustBias(BIAS_STEP_PERCENT)}>+</button>
             </div>
           </div>
         )}
